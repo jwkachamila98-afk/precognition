@@ -53,6 +53,7 @@ class WorkflowController:
     def __init__(
         self,
         foresee_steps: int = 60,
+        foresee_duration_sec: float = 2.0,
         wait_user_timeout: float = 3.0,
         execution_max_steps: int = 90,
         auto_advance: bool = True,
@@ -60,6 +61,7 @@ class WorkflowController:
         voice_guidance_enabled: bool = True
     ) -> None:
         self.foresee_steps = foresee_steps
+        self.foresee_duration_sec = foresee_duration_sec
         self.wait_user_timeout = wait_user_timeout
         self.execution_max_steps = execution_max_steps
         self.auto_advance = auto_advance
@@ -161,12 +163,17 @@ class WorkflowController:
             self.transition_to(ExecutionPhase.IDLE)
 
     def step_foresee(self) -> bool:
-        """Step foreseen ghost rollout. Returns True when 60 steps complete."""
+        """Advance foreseen ghost rollout by elapsed wall-clock time (not call count),
+        so the preview always plays back at its intended real-time duration regardless
+        of how often step_foresee() happens to be invoked (e.g. server frame throughput
+        under network/GPU load). Returns True once the rollout duration has elapsed."""
         if self._phase != ExecutionPhase.FORESEEING:
             return False
 
-        self._step_index += 1
-        if self._step_index >= self.foresee_steps:
+        elapsed = time.time() - self._phase_start_time
+        frac = min(1.0, elapsed / max(self.foresee_duration_sec, 0.01))
+        self._step_index = int(frac * self.foresee_steps)
+        if frac >= 1.0:
             if self.auto_advance:
                 self.transition_to(ExecutionPhase.WAIT_USER)
             return True

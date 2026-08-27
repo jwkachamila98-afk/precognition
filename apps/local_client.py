@@ -268,9 +268,15 @@ class LocalVisualizer:
         self,
         frame: np.ndarray,
         trajectory: Optional[ForeseenTrajectory],
-        step_override: Optional[int] = None
+        step_override: Optional[int] = None,
+        real_poses: Optional[List[HandPose]] = None
     ) -> int:
-        """Render animated holographic Foreseen Ghost Hand rollout with particle comets."""
+        """Render animated holographic Foreseen Ghost Hand rollout with particle comets.
+
+        Re-anchored every frame to the real, live wrist position (real_poses) so the
+        ghost visibly grows out of and tracks the user's actual hand, rather than a
+        fixed 3D position baked in whenever the trajectory was generated server-side
+        (which may be stale or based on a frame where the hand wasn't yet visible)."""
         if not self.show_foreseen_ghost or trajectory is None or not trajectory.waypoints:
             return 0
 
@@ -279,10 +285,16 @@ class LocalVisualizer:
         step_idx = (step_override if step_override is not None else self.anim_frame_idx) % num_steps
         current_wp: ForeseenWaypoint = trajectory.waypoints[step_idx]
 
+        offset = np.zeros(2, dtype=np.float32)
+        if real_poses:
+            real_wrist_2d = real_poses[0].keypoints_2d[0]
+            ghost_origin_2d = trajectory.waypoints[0].hand_keypoints_2d[0]
+            offset = real_wrist_2d - ghost_origin_2d
+
         # 1. Shimmering Trajectory Comet Ribbon
         trail_pts = []
         for wp in trajectory.waypoints:
-            u, v = wp.hand_keypoints_2d[0]
+            u, v = wp.hand_keypoints_2d[0] + offset
             trail_pts.append((int(np.clip(u, 0, w - 1)), int(np.clip(v, 0, h - 1))))
 
         if len(trail_pts) > 1:
@@ -296,7 +308,7 @@ class LocalVisualizer:
                 cv2.line(frame, trail_pts[i], trail_pts[i + 1], trail_color, 1 + int(alpha_frac * 2), lineType=cv2.LINE_AA)
 
         # 2. Holographic Dotted Ghost Hand Pose
-        ghost_kpts_2d = current_wp.hand_keypoints_2d
+        ghost_kpts_2d = current_wp.hand_keypoints_2d + offset
         ghost_color = (255, 235, 100) # Bright Ice Cyan
 
         for u, v in HAND_CONNECTIONS:
@@ -310,7 +322,7 @@ class LocalVisualizer:
             cv2.circle(frame, pt, 3, (255, 255, 255), -1, lineType=cv2.LINE_AA)
 
         wrist_pt = (int(np.clip(ghost_kpts_2d[0, 0], 0, w - 1)), int(np.clip(ghost_kpts_2d[0, 1], 0, h - 1)))
-        cv2.putText(frame, f"HOLOGRAM tau_ref [{step_idx + 1}/60]", (wrist_pt[0] - 60, wrist_pt[1] - 14),
+        cv2.putText(frame, f"HOLOGRAM tau_ref [{step_idx + 1}/{num_steps}]", (wrist_pt[0] - 60, wrist_pt[1] - 14),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.38, ghost_color, 1, cv2.LINE_AA)
 
         return step_idx + 1
@@ -901,6 +913,8 @@ class LocalClientRunner:
         self._network_latency_ms = 0.0
         self._network_got_first_response = False
         self._last_announced_phase: Optional[ExecutionPhase] = None
+        self._last_phase_for_anim: Optional[ExecutionPhase] = None
+        self._foresee_anim_start: Optional[float] = None
         self._remote_snapshot = {
             "poses": [], "bboxes": [], "affordance_map": None, "foreseen_traj": None,
             "depth_heatmap": None, "gripper_cmd": 0.0, "residuals": None, "reward_score": 0.0,
@@ -1434,8 +1448,28 @@ class LocalClientRunner:
                 self.visualizer.draw_3d_bounding_boxes(frame, bboxes)
                 self.visualizer.draw_affordance_hotspots(frame, affordance_map)
                 
-                step_idx_to_draw = self.workflow.step_index if workflow_phase == ExecutionPhase.FORESEEING else None
-                foreseen_step = self.visualizer.draw_foreseen_ghost_trajectory(frame, foreseen_traj, step_override=step_idx_to_draw)
+                # Time-based (not call-count-based) animation progress, computed the same
+                # way for both modes so a slow server round-trip can't freeze the ghost
+                # hand mid-pose - see WorkflowController.step_foresee for the server-side
+                # equivalent fix.
+                if workflow_phase != self._last_phase_for_anim:
+                    self._last_phase_for_anim = workflow_phase
+                    if workflow_phase == ExecutionPhase.FORESEEING:
+                        self._foresee_anim_start = time.time()
+
+                step_idx_to_draw: Optional[int] = None
+                if foreseen_traj is not None and foreseen_traj.waypoints:
+                    num_wp = len(foreseen_traj.waypoints)
+                    if workflow_phase == ExecutionPhase.FORESEEING and self._foresee_anim_start is not None:
+                        duration = getattr(foreseen_traj, "duration", 2.0) or 2.0
+                        elapsed = time.time() - self._foresee_anim_start
+                        step_idx_to_draw = min(int((elapsed / duration) * num_wp), num_wp - 1)
+                    elif workflow_phase in (ExecutionPhase.WAIT_USER, ExecutionPhase.USER_EXECUTING, ExecutionPhase.ADAPTING):
+                        step_idx_to_draw = num_wp - 1  # hold the final grasp/lift pose as a reference
+
+                foreseen_step = self.visualizer.draw_foreseen_ghost_trajectory(
+                    frame, foreseen_traj, step_override=step_idx_to_draw, real_poses=poses
+                )
                 self.visualizer.draw_depth_pip(frame, depth_heatmap)
                 
                 # Render Stage Banner

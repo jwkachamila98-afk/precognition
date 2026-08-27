@@ -124,9 +124,15 @@ class WSInferenceServer:
                 # Only re-parse (and re-trigger the workflow) when the intent text actually
                 # changes - critical when intent_parser is a real LLM backend, since a raw
                 # intent call every single frame would be both wasteful and far too slow.
+                # Run it in an executor: parse_intent() makes a blocking HTTP call to Ollama,
+                # and calling that directly would stall the entire asyncio event loop (freezing
+                # every connected client's video/telemetry) for the full LLM latency.
                 if frame_msg.intent != self._last_intent:
                     self._last_intent = frame_msg.intent
-                    parsed_intent = self.intent_parser.parse_intent(frame_msg.intent)
+                    loop = asyncio.get_event_loop()
+                    parsed_intent = await loop.run_in_executor(
+                        None, self.intent_parser.parse_intent, frame_msg.intent
+                    )
                     self._cached_parsed_intent = parsed_intent
                     target_label = parsed_intent.target_object if parsed_intent.is_active else "none"
                     self.workflow.trigger_intent(target_label)

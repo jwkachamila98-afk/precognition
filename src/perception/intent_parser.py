@@ -159,6 +159,18 @@ class MockLLMIntentParser(IntentParserABC):
                 if extracted not in ("it", "object", "item", "something", "up", "the", "and", "target", "standby"):
                     target_obj = extracted
 
+        # Final fallback: a short (1-2 word) bare noun phrase with no wrapping verb at
+        # all (e.g. just saying "wine glass" into the mic) becomes the target itself,
+        # rather than being silently dropped as "none". Capped at 2 words since every
+        # COCO-80 class name/alias is at most two words - longer phrases are far more
+        # likely to be noise/garbled transcription than a real object name.
+        if target_obj == "none":
+            stripped = re.sub(r"[^\w\s]", "", transcript_lower).strip()
+            words = stripped.split()
+            filler_words = {"please", "can", "you", "give", "me", "to", "for", "a", "an", "the"}
+            if 1 <= len(words) <= 2 and not (set(words) & filler_words):
+                target_obj = stripped
+
         # 2. Action Type Extraction
         action_type = "reach_and_grasp"
         for act_key, canonical_act in self.KNOWN_ACTIONS.items():

@@ -21,7 +21,9 @@ from src.transport.ws_client import WSStreamingClient
 
 
 def test_workflow_controller_transitions():
-    wf = WorkflowController(foresee_steps=10, wait_user_timeout=0.1, execution_max_steps=10, auto_advance=True)
+    # step_foresee() advances by elapsed wall-clock time (not call count), so a real
+    # rollout duration is used here and driven past completion with a short sleep.
+    wf = WorkflowController(foresee_steps=10, foresee_duration_sec=0.05, wait_user_timeout=0.1, execution_max_steps=10, auto_advance=True)
     assert wf.current_phase == ExecutionPhase.IDLE
 
     # Trigger intent
@@ -30,8 +32,8 @@ def test_workflow_controller_transitions():
     assert wf.phase_progress == 0.0
 
     # Step through foresee phase
-    for _ in range(10):
-        wf.step_foresee()
+    time.sleep(0.06)
+    wf.step_foresee()
 
     assert wf.current_phase == ExecutionPhase.WAIT_USER
     time.sleep(0.12)
