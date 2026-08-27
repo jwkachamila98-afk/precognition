@@ -161,8 +161,15 @@ class WSInferenceServer:
                     )
                     affordance_dict = affordance_map.to_dict()
 
+                    # Continuously replan from the CURRENT real hand pose (receding-horizon
+                    # style) rather than generating one fixed trajectory the user must then
+                    # chase - the ghost should follow the hand, not the other way around.
+                    # Regenerated every frame while actively guiding a grasp.
                     start_pose = hand_poses[0] if hand_poses else None
-                    if self._cached_foreseen_traj is None or self.workflow.current_phase == ExecutionPhase.FORESEEING:
+                    live_guidance_phase = self.workflow.current_phase in (
+                        ExecutionPhase.FORESEEING, ExecutionPhase.USER_EXECUTING
+                    )
+                    if self._cached_foreseen_traj is None or live_guidance_phase:
                         self._cached_foreseen_traj = self.trajectory_diffusion.generate_foreseen_rollout(
                             start_hand_pose=start_pose,
                             target_object=target_box,

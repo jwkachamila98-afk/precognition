@@ -68,6 +68,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger("LocalClient")
 
+# Short lookahead into the continuously-replanned foreseen trajectory used to render
+# the "current" ghost hand pose - roughly 12/60 * 2.0s duration ~= 0.4s ahead of the
+# real hand's current position, rather than playing the full trajectory as an animation.
+GHOST_LOOKAHEAD_STEPS = 12
+
 # Preset intent prompts for cycling via keypress 'i'
 PRESET_INTENTS = [
     "idle",
@@ -143,6 +148,10 @@ class LocalVisualizer:
         # real hand is briefly not detected, so the ghost doesn't jump back to its raw
         # stale position.
         self._ghost_transform = (np.eye(2, dtype=np.float32), np.zeros(2, dtype=np.float32))
+        # Exponentially-smoothed rendered ghost hand pose. The underlying trajectory
+        # only refreshes once per server round-trip (~250-400ms), so without smoothing
+        # the ghost would visibly teleport to a new pose each update instead of gliding.
+        self._smoothed_ghost_kpts: Optional[np.ndarray] = None
 
     def _rounded_panel_mask(self, w: int, h: int, radius: int):
         """Build (and cache) an anti-aliased rounded-rect alpha mask + border contour."""
@@ -351,6 +360,7 @@ class LocalVisualizer:
         step_override: Optional[int] = None,
         real_poses: Optional[List[HandPose]] = None,
         target_bbox: Optional[BoundingBox3D] = None,
+        label: str = "NEXT-STEP GUIDE",
     ) -> int:
         """Render animated holographic Foreseen Ghost Hand rollout with particle comets
         and a ghost afterimage of the target object.
@@ -361,6 +371,7 @@ class LocalVisualizer:
         rather than a fixed pose baked in whenever the trajectory was generated
         server-side (which may be stale or from a frame where the hand wasn't visible)."""
         if not self.show_foreseen_ghost or trajectory is None or not trajectory.waypoints:
+            self._smoothed_ghost_kpts = None
             return 0
 
         h, w = frame.shape[:2]
@@ -399,8 +410,14 @@ class LocalVisualizer:
                 )
                 cv2.line(frame, trail_pts[i], trail_pts[i + 1], trail_color, 1 + int(alpha_frac * 2), lineType=cv2.LINE_AA)
 
-        # 2. Holographic Dotted Ghost Hand Pose
-        ghost_kpts_2d = xf(current_wp.hand_keypoints_2d)
+        # 2. Holographic Dotted Ghost Hand Pose, smoothed toward the latest replanned
+        # target so it glides continuously rather than snapping on each server update.
+        target_kpts_2d = xf(current_wp.hand_keypoints_2d)
+        if self._smoothed_ghost_kpts is None or self._smoothed_ghost_kpts.shape != target_kpts_2d.shape:
+            self._smoothed_ghost_kpts = target_kpts_2d.copy()
+        else:
+            self._smoothed_ghost_kpts = self._smoothed_ghost_kpts + 0.35 * (target_kpts_2d - self._smoothed_ghost_kpts)
+        ghost_kpts_2d = self._smoothed_ghost_kpts
         ghost_color = (255, 235, 100) # Bright Ice Cyan
 
         for u, v in HAND_CONNECTIONS:
@@ -414,7 +431,7 @@ class LocalVisualizer:
             cv2.circle(frame, pt, 3, (255, 255, 255), -1, lineType=cv2.LINE_AA)
 
         wrist_pt = (int(np.clip(ghost_kpts_2d[0, 0], 0, w - 1)), int(np.clip(ghost_kpts_2d[0, 1], 0, h - 1)))
-        cv2.putText(frame, f"HOLOGRAM tau_ref [{step_idx + 1}/{num_steps}]", (wrist_pt[0] - 60, wrist_pt[1] - 14),
+        cv2.putText(frame, label, (wrist_pt[0] - 60, wrist_pt[1] - 14),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.38, ghost_color, 1, cv2.LINE_AA)
 
         return step_idx + 1
@@ -1030,8 +1047,6 @@ class LocalClientRunner:
         self._network_latency_ms = 0.0
         self._network_got_first_response = False
         self._last_announced_phase: Optional[ExecutionPhase] = None
-        self._last_phase_for_anim: Optional[ExecutionPhase] = None
-        self._foresee_anim_start: Optional[float] = None
         self._remote_snapshot = {
             "poses": [], "bboxes": [], "affordance_map": None, "foreseen_traj": None,
             "depth_heatmap": None, "gripper_cmd": 0.0, "residuals": None, "reward_score": 0.0,
@@ -1565,28 +1580,26 @@ class LocalClientRunner:
                 self.visualizer.draw_3d_bounding_boxes(frame, bboxes)
                 self.visualizer.draw_affordance_hotspots(frame, affordance_map)
                 
-                # Time-based (not call-count-based) animation progress, computed the same
-                # way for both modes so a slow server round-trip can't freeze the ghost
-                # hand mid-pose - see WorkflowController.step_foresee for the server-side
-                # equivalent fix.
-                if workflow_phase != self._last_phase_for_anim:
-                    self._last_phase_for_anim = workflow_phase
-                    if workflow_phase == ExecutionPhase.FORESEEING:
-                        self._foresee_anim_start = time.time()
-
+                # The server continuously replans the trajectory from wherever the real
+                # hand currently is while actively guiding a grasp (see ws_server.py) -
+                # the ghost follows the hand, not the other way around. So render a
+                # short near-term lookahead into whatever's the LATEST plan (a "here's
+                # where to move next" nudge), not a long fixed animation played back
+                # over elapsed time - that would fight the server's own continuous
+                # replanning and drift away from the real hand.
                 step_idx_to_draw: Optional[int] = None
+                ghost_label = "NEXT-STEP GUIDE"
                 if foreseen_traj is not None and foreseen_traj.waypoints:
                     num_wp = len(foreseen_traj.waypoints)
-                    if workflow_phase == ExecutionPhase.FORESEEING and self._foresee_anim_start is not None:
-                        duration = getattr(foreseen_traj, "duration", 2.0) or 2.0
-                        elapsed = time.time() - self._foresee_anim_start
-                        step_idx_to_draw = min(int((elapsed / duration) * num_wp), num_wp - 1)
-                    elif workflow_phase in (ExecutionPhase.WAIT_USER, ExecutionPhase.USER_EXECUTING, ExecutionPhase.ADAPTING):
-                        step_idx_to_draw = num_wp - 1  # hold the final grasp/lift pose as a reference
+                    if workflow_phase in (ExecutionPhase.FORESEEING, ExecutionPhase.WAIT_USER, ExecutionPhase.USER_EXECUTING):
+                        step_idx_to_draw = min(GHOST_LOOKAHEAD_STEPS, num_wp - 1)
+                    elif workflow_phase == ExecutionPhase.ADAPTING:
+                        step_idx_to_draw = num_wp - 1  # episode just ended - show the final grasp/lift pose as reference
+                        ghost_label = "FINAL POSE REFERENCE"
 
                 foreseen_step = self.visualizer.draw_foreseen_ghost_trajectory(
                     frame, foreseen_traj, step_override=step_idx_to_draw, real_poses=poses,
-                    target_bbox=bboxes[0] if bboxes else None
+                    target_bbox=bboxes[0] if bboxes else None, label=ghost_label
                 )
                 self.visualizer.draw_depth_pip(frame, depth_heatmap)
                 
