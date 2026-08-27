@@ -1,0 +1,12 @@
+# Intel Mac CPU-friendly dependencies for Visuomotor Hand Policy Architecture
+# Excludes CUDA, TensorRT, and heavy GPU frameworks to ensure 30+ FPS on 8GB RAM
+
+numpy>=1.24.0,<2.0.0
+opencv-python>=4.8.0
+websockets>=12.0
+pyyaml>=6.0
+pydantic>=2.0.0
+rerun-sdk>=0.15.0
+mediapipe>=0.10.0
+pytest>=7.0.0
+pytest-asyncio>=0.21.0

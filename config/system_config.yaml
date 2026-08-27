@@ -1,0 +1,52 @@
+# System Configuration for Visuomotor Hand Policy Architecture
+# Phase 3: Client-Server Architecture, Physics Simulation, & Foreseen Trajectory Rollout
+
+system:
+  # Mode options: 'mock_local' (standalone CPU on Mac) | 'mock_remote' (streams to ws_server.py)
+  mode: "mock_local"
+  # Intent string: set to 'idle' or 'none' for clean standby, or an action like 'foresee me picking this remote control'
+  intent: "idle"
+  log_level: "INFO"
+  seed: 42
+
+camera:
+  device_id: 0
+  width: 640
+  height: 480
+  fps: 30
+  # If true or if webcam fails to open, automatically fall back to synthetic camera frames
+  use_synthetic_if_unavailable: true
+
+network:
+  server_host: "127.0.0.1"
+  server_port: 8765
+  compression_format: "jpeg"
+  compression_quality: 80
+  timeout_seconds: 5.0
+  reconnect_interval_seconds: 2.0
+
+perception:
+  hand_tracker:
+    # Options: 'mediapipe' (live camera tracking) | 'mock' (synthetic kinematic generation)
+    tracker_type: "mediapipe"
+    max_hands: 2
+    confidence_threshold: 0.5
+    mano_pose_dims: 48
+    mano_shape_dims: 10
+    num_keypoints: 21
+  depth_estimator:
+    min_depth_meters: 0.2
+    max_depth_meters: 2.5
+    output_width: 320
+    output_height: 240
+  scene_parser:
+    num_points: 400
+
+visualization:
+  window_name: "Visuomotor Hand Policy - Local Client (Intel Mac CPU)"
+  show_fps: true
+  draw_skeleton: true
+  draw_depth_inset: true
+  draw_bounding_box: true
+  depth_inset_scale: 0.28
+  rerun_enabled: false

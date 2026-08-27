@@ -1,0 +1,64 @@
+# Multi-stage Dockerfile for Visuomotor Hand Policy Server (Cloud GPU / RunPod / Lambda Labs / AWS EC2)
+FROM nvidia/cuda:12.2.0-devel-ubuntu22.04 AS base
+
+# Avoid interactive prompts during apt install
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+ENV CUDA_HOME=/usr/local/cuda
+ENV PATH=${CUDA_HOME}/bin:${PATH}
+ENV LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}
+
+# Install system dependencies, Python 3.10, and OpenGL for MuJoCo/OpenCV
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.10 \
+    python3.10-dev \
+    python3.10-distutils \
+    python3-pip \
+    build-essential \
+    cmake \
+    git \
+    curl \
+    ca-certificates \
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender-dev \
+    libosmesa6-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set default python alias
+RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.10 1 \
+    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1
+
+# Upgrade pip
+RUN python -m pip install --no-cache-dir --upgrade pip setuptools wheel
+
+WORKDIR /workspace/Precognition
+
+# Copy requirements and install core Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Install Cloud GPU Acceleration Libraries: PyTorch CUDA, JAX with CUDA, TensorRT, and MuJoCo
+RUN pip install --no-cache-dir \
+    torch torchvision --index-url https://download.pytorch.org/whl/cu121 \
+    "jax[cuda12_pip]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html \
+    tensorrt>=10.0.0 \
+    mujoco>=3.1.0 \
+    h5py>=3.10.0
+
+# Copy application source code
+COPY . .
+
+# Grant execute permissions to startup script
+RUN chmod +x deploy/run_cloud_server.sh
+
+# Expose WebSocket inference port
+EXPOSE 8765
+
+# Default healthcheck
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+    CMD python3 -c "import socket; s = socket.socket(); s.connect(('127.0.0.1', 8765)); s.close()" || exit 1
+
+ENTRYPOINT ["/bin/bash", "deploy/run_cloud_server.sh"]

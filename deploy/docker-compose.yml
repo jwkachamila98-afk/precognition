@@ -1,0 +1,33 @@
+version: "3.8"
+
+services:
+  visuomotor-server:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.server
+    image: visuomotor-hand-policy-server:latest
+    container_name: visuomotor-inference-backend
+    restart: unless-stopped
+    ports:
+      - "8765:8765"
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics
+      - PYTHONUNBUFFERED=1
+      - PORT=8765
+      - HOST=0.0.0.0
+    volumes:
+      - ../logs:/workspace/Precognition/logs
+      - ../config:/workspace/Precognition/config
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket; s = socket.socket(); s.connect(('127.0.0.1', 8765)); s.close()\""]
+      interval: 15s
+      timeout: 5s
+      retries: 3
