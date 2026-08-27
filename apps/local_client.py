@@ -287,10 +287,10 @@ class LocalVisualizer:
         bx2 = bx1 + banner_w
         by2 = by1 + banner_h
 
-        # Frosted glass background
-        overlay = frame.copy()
-        cv2.rectangle(overlay, (bx1, by1), (bx2, by2), PALETTE["dark_glass_bg"], -1)
-        cv2.addWeighted(overlay, 0.85, frame, 0.15, 0, frame)
+        # Fast ROI frosted glass blending (avoids full-frame memory copies)
+        sub_overlay = frame[by1:by2, bx1:bx2].copy()
+        cv2.rectangle(sub_overlay, (0, 0), (banner_w, banner_h), PALETTE["dark_glass_bg"], -1)
+        cv2.addWeighted(sub_overlay, 0.85, frame[by1:by2, bx1:bx2], 0.15, 0, frame[by1:by2, bx1:bx2])
 
         t = time.time()
         pulse = 0.5 + 0.5 * np.sin(t * 8.0)
@@ -354,9 +354,10 @@ class LocalVisualizer:
         px2 = px1 + panel_w
         py2 = py1 + panel_h
 
-        overlay = frame.copy()
-        cv2.rectangle(overlay, (px1, py1), (px2, py2), PALETTE["dark_glass_bg"], -1)
-        cv2.addWeighted(overlay, 0.90, frame, 0.10, 0, frame)
+        # Fast ROI frosted glass blending
+        sub_overlay = frame[py1:py2, px1:px2].copy()
+        cv2.rectangle(sub_overlay, (0, 0), (panel_w, panel_h), PALETTE["dark_glass_bg"], -1)
+        cv2.addWeighted(sub_overlay, 0.90, frame[py1:py2, px1:px2], 0.10, 0, frame[py1:py2, px1:px2])
         cv2.rectangle(frame, (px1, py1), (px2, py2), PALETTE["cyan_electric"], 1)
 
         cv2.putText(frame, "CO-ADAPTATION BENCHMARK", (px1 + 12, py1 + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.40, PALETTE["cyan_electric"], 1, cv2.LINE_AA)
@@ -498,9 +499,10 @@ class LocalVisualizer:
         x2 = w - 10
         y2 = y1 + dock_h
 
-        overlay = frame.copy()
-        cv2.rectangle(overlay, (x1, y1), (x2, y2), PALETTE["dark_glass_bg"], -1)
-        cv2.addWeighted(overlay, 0.84, frame, 0.16, 0, frame)
+        # Fast ROI frosted glass blending
+        sub_overlay = frame[y1:y2, x1:x2].copy()
+        cv2.rectangle(sub_overlay, (0, 0), (dock_w, dock_h), PALETTE["dark_glass_bg"], -1)
+        cv2.addWeighted(sub_overlay, 0.84, frame[y1:y2, x1:x2], 0.16, 0, frame[y1:y2, x1:x2])
         cv2.rectangle(frame, (x1, y1), (x2, y2), PALETTE["glass_border"], 1)
         
         # Header Top Accent

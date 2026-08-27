@@ -29,8 +29,8 @@ perception:
   hand_tracker:
     # Options: 'mediapipe' (live camera tracking) | 'mock' (synthetic kinematic generation)
     tracker_type: "mediapipe"
-    max_hands: 2
-    confidence_threshold: 0.5
+    max_hands: 1
+    confidence_threshold: 0.45
     mano_pose_dims: 48
     mano_shape_dims: 10
     num_keypoints: 21
