@@ -115,17 +115,17 @@ class WorkflowController:
 
     def _phase_instruction(self, phase: ExecutionPhase) -> Optional[str]:
         """Compose the spoken instruction announced on entering a given phase."""
-        target = self._target_label if self._target_label not in ("none", "") else "the object"
+        target = self._target_label.replace("_", " ") if self._target_label not in ("none", "") else "an object"
         if phase == ExecutionPhase.IDLE:
-            return "Standby. Tell me what to pick up."
+            return "Standby. Say what to pick up, for example wine glass."
         elif phase == ExecutionPhase.FORESEEING:
-            return f"Foreseeing how to grasp the {target}."
+            return f"Watch the ghost hand. Planning how to grasp the {target}."
         elif phase == ExecutionPhase.WAIT_USER:
-            return "Ready when you are. Go ahead and move your hand."
+            return "Your turn. Move your hand to match the ghost, then press C when ready."
         elif phase == ExecutionPhase.USER_EXECUTING:
-            return "Tracking your motion now."
+            return f"Go. Reach for the {target} now, following the ghost hand."
         elif phase == ExecutionPhase.ADAPTING:
-            return "Got it. Adjusting based on what I saw."
+            return "Comparing your motion to the plan now."
         return None
 
     def transition_to(self, new_phase: ExecutionPhase) -> None:

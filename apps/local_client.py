@@ -14,6 +14,7 @@ Supported Modes:
 import argparse
 import asyncio
 import collections
+import math
 import threading
 import logging
 import sys
@@ -137,6 +138,11 @@ class LocalVisualizer:
         self._last_tick = time.perf_counter()
         self.anim_frame_idx = 0
         self._panel_cache: dict = {}
+        # Rotation+scale+translation mapping the ghost trajectory's baked-in starting
+        # pose onto the user's real, live hand pose. Persists across frames where the
+        # real hand is briefly not detected, so the ghost doesn't jump back to its raw
+        # stale position.
+        self._ghost_transform = (np.eye(2, dtype=np.float32), np.zeros(2, dtype=np.float32))
 
     def _rounded_panel_mask(self, w: int, h: int, radius: int):
         """Build (and cache) an anti-aliased rounded-rect alpha mask + border contour."""
@@ -264,19 +270,96 @@ class LocalVisualizer:
             cv2.putText(frame, f"MANO {pose.side.value[:1].upper()}:{pose.confidence*100:.0f}%", 
                         (bx + 8, by + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 255, 255), 1, cv2.LINE_AA)
 
+    @staticmethod
+    def _compute_similarity_transform(
+        src_p0: np.ndarray, src_p1: np.ndarray, dst_p0: np.ndarray, dst_p1: np.ndarray
+    ) -> tuple:
+        """2D rotation+scale+translation mapping the (src_p0 -> src_p1) frame onto the
+        (dst_p0 -> dst_p1) frame. Used to retarget the ghost hand's baked-in wrist ->
+        middle-MCP segment onto the real hand's, so the ghost starts at the same
+        position AND orientation as the real hand, not just the same point."""
+        v_src = src_p1 - src_p0
+        v_dst = dst_p1 - dst_p0
+        len_src = float(np.linalg.norm(v_src))
+        len_dst = float(np.linalg.norm(v_dst))
+        if len_src < 1e-3 or len_dst < 1e-3:
+            return np.eye(2, dtype=np.float32), (dst_p0 - src_p0).astype(np.float32)
+
+        scale = float(np.clip(len_dst / len_src, 0.4, 2.5))
+        angle = math.atan2(v_dst[1], v_dst[0]) - math.atan2(v_src[1], v_src[0])
+        cos_a, sin_a = math.cos(angle), math.sin(angle)
+        R = np.array([[cos_a, -sin_a], [sin_a, cos_a]], dtype=np.float32) * scale
+        t = dst_p0 - R @ src_p0
+        return R.astype(np.float32), t.astype(np.float32)
+
+    @staticmethod
+    def _project_3d(p3d: np.ndarray, w: int, h: int) -> np.ndarray:
+        """Project a 3D camera-frame point to 2D pixels using the same default pinhole
+        intrinsics convention used throughout this project (BoundingBox3D.project_to_2d,
+        MockTrajectoryDiffusion._project_2d) when no calibrated intrinsics are available."""
+        fx = fy = 0.8 * w
+        cx, cy = w / 2.0, h / 2.0
+        z = max(float(p3d[2]), 0.1)
+        return np.array([fx * p3d[0] / z + cx, fy * p3d[1] / z + cy], dtype=np.float32)
+
+    def _draw_ghost_object_afterimage(
+        self,
+        frame: np.ndarray,
+        trajectory: ForeseenTrajectory,
+        step_idx: int,
+        xf,
+        target_bbox: BoundingBox3D,
+    ) -> None:
+        """Ghost afterimage of the object being picked up, following the trajectory's
+        own object_pose per waypoint - which is already kinematically consistent (static
+        until contact, then rigidly attached to the hand through the lift), not a
+        separate free-floating animation."""
+        h, w = frame.shape[:2]
+        depth = max(float(target_bbox.center[2]), 0.1)
+        px_w = max(10, int(0.8 * w * float(target_bbox.size[0]) / depth))
+        px_h = max(10, int(0.8 * w * float(target_bbox.size[1]) / depth))
+
+        trail_span = 24
+        trail_steps = sorted(set(range(max(0, step_idx - trail_span), step_idx, 4)) | {step_idx})
+
+        overlay = frame.copy()
+        for s in trail_steps:
+            wp = trajectory.waypoints[s]
+            center = xf(self._project_3d(wp.object_pose[:3], w, h)[None, :])[0]
+            cx_i, cy_i = int(np.clip(center[0], 0, w - 1)), int(np.clip(center[1], 0, h - 1))
+            age = (step_idx - s) / float(trail_span)
+            in_contact = float(np.max(wp.contact_state)) > 0.5
+            color = (0, 210, 255) if in_contact else (150, 210, 255)
+            cv2.ellipse(overlay, (cx_i, cy_i), (px_w // 2, px_h // 2), 0, 0, 360, color, -1, cv2.LINE_AA)
+            if s != step_idx:
+                cv2.addWeighted(overlay, 0.30 * (1.0 - age), frame, 1.0 - 0.30 * (1.0 - age), 0, dst=frame)
+                overlay = frame.copy()
+
+        # Crisp outline + label on the current step
+        wp = trajectory.waypoints[step_idx]
+        center = xf(self._project_3d(wp.object_pose[:3], w, h)[None, :])[0]
+        cx_i, cy_i = int(np.clip(center[0], 0, w - 1)), int(np.clip(center[1], 0, h - 1))
+        cv2.ellipse(frame, (cx_i, cy_i), (px_w // 2, px_h // 2), 0, 0, 360, (0, 235, 255), 2, cv2.LINE_AA)
+        label = target_bbox.label.replace("_", " ")
+        cv2.putText(frame, label, (cx_i - px_w // 2, cy_i - px_h // 2 - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.34, (0, 235, 255), 1, cv2.LINE_AA)
+
     def draw_foreseen_ghost_trajectory(
         self,
         frame: np.ndarray,
         trajectory: Optional[ForeseenTrajectory],
         step_override: Optional[int] = None,
-        real_poses: Optional[List[HandPose]] = None
+        real_poses: Optional[List[HandPose]] = None,
+        target_bbox: Optional[BoundingBox3D] = None,
     ) -> int:
-        """Render animated holographic Foreseen Ghost Hand rollout with particle comets.
+        """Render animated holographic Foreseen Ghost Hand rollout with particle comets
+        and a ghost afterimage of the target object.
 
-        Re-anchored every frame to the real, live wrist position (real_poses) so the
-        ghost visibly grows out of and tracks the user's actual hand, rather than a
-        fixed 3D position baked in whenever the trajectory was generated server-side
-        (which may be stale or based on a frame where the hand wasn't yet visible)."""
+        Re-anchored every frame to the real, live hand pose (position AND orientation,
+        via a 2D similarity transform from wrist -> middle-MCP) so the ghost visibly
+        starts at the same spot and angle as the real hand and tracks it continuously,
+        rather than a fixed pose baked in whenever the trajectory was generated
+        server-side (which may be stale or from a frame where the hand wasn't visible)."""
         if not self.show_foreseen_ghost or trajectory is None or not trajectory.waypoints:
             return 0
 
@@ -285,17 +368,26 @@ class LocalVisualizer:
         step_idx = (step_override if step_override is not None else self.anim_frame_idx) % num_steps
         current_wp: ForeseenWaypoint = trajectory.waypoints[step_idx]
 
-        offset = np.zeros(2, dtype=np.float32)
-        if real_poses:
-            real_wrist_2d = real_poses[0].keypoints_2d[0]
-            ghost_origin_2d = trajectory.waypoints[0].hand_keypoints_2d[0]
-            offset = real_wrist_2d - ghost_origin_2d
+        if real_poses and len(real_poses[0].keypoints_2d) > 9:
+            real_kpts = real_poses[0].keypoints_2d
+            ghost_kpts0 = trajectory.waypoints[0].hand_keypoints_2d
+            self._ghost_transform = self._compute_similarity_transform(
+                ghost_kpts0[0], ghost_kpts0[9], real_kpts[0], real_kpts[9]
+            )
+        R, t = self._ghost_transform
+
+        def xf(pts_2d: np.ndarray) -> np.ndarray:
+            return pts_2d @ R.T + t
+
+        # 0. Ghost object afterimage (drawn first, underneath the hand)
+        if target_bbox is not None:
+            self._draw_ghost_object_afterimage(frame, trajectory, step_idx, xf, target_bbox)
 
         # 1. Shimmering Trajectory Comet Ribbon
-        trail_pts = []
-        for wp in trajectory.waypoints:
-            u, v = wp.hand_keypoints_2d[0] + offset
-            trail_pts.append((int(np.clip(u, 0, w - 1)), int(np.clip(v, 0, h - 1))))
+        trail_pts_raw = xf(np.stack([wp.hand_keypoints_2d[0] for wp in trajectory.waypoints]))
+        trail_pts = [
+            (int(np.clip(u, 0, w - 1)), int(np.clip(v, 0, h - 1))) for u, v in trail_pts_raw
+        ]
 
         if len(trail_pts) > 1:
             for i in range(len(trail_pts) - 1):
@@ -308,7 +400,7 @@ class LocalVisualizer:
                 cv2.line(frame, trail_pts[i], trail_pts[i + 1], trail_color, 1 + int(alpha_frac * 2), lineType=cv2.LINE_AA)
 
         # 2. Holographic Dotted Ghost Hand Pose
-        ghost_kpts_2d = current_wp.hand_keypoints_2d + offset
+        ghost_kpts_2d = xf(current_wp.hand_keypoints_2d)
         ghost_color = (255, 235, 100) # Bright Ice Cyan
 
         for u, v in HAND_CONNECTIONS:
@@ -386,6 +478,31 @@ class LocalVisualizer:
             cv2.circle(frame, (bx1 + 18, by1 + 16), 3, PALETTE["text_dim"], -1, cv2.LINE_AA)
             msg = "Standby - press 'i' or talk ('v')"
             cv2.putText(frame, msg, (bx1 + 30, by1 + 21), cv2.FONT_HERSHEY_SIMPLEX, 0.36, PALETTE["text_dim"], 1, cv2.LINE_AA)
+
+    def draw_instruction_bar(self, frame: np.ndarray, phase: ExecutionPhase, target_label: str = "") -> None:
+        """Large, unmissable bottom-center bar stating exactly what to do right now,
+        in plain language - separate from the compact top-of-frame status banner."""
+        h, w = frame.shape[:2]
+        target = target_label.replace("_", " ") if target_label and target_label.lower() not in ("none", "") else "an object"
+
+        messages = {
+            ExecutionPhase.IDLE: ("STANDBY", "Hold 'v' or SPACE and say what to pick up, e.g. \"wine glass\"", PALETTE["text_dim"]),
+            ExecutionPhase.FORESEEING: ("PREVIEWING", f"Watch the ghost hand plan how to grab the {target}...", PALETTE["amber_gold"]),
+            ExecutionPhase.WAIT_USER: ("YOUR TURN", "Move your hand to match the ghost, then press 'c' when ready", PALETTE["cyan_electric"]),
+            ExecutionPhase.USER_EXECUTING: ("GO", f"Reach for the {target} now - follow the ghost hand", PALETTE["neon_green"]),
+            ExecutionPhase.ADAPTING: ("LEARNING", "Comparing your motion to the plan...", PALETTE["neon_violet"]),
+        }
+        title, body, color = messages.get(phase, messages[ExecutionPhase.IDLE])
+
+        bar_w = min(600, w - 32)
+        bar_h = 56
+        bx1 = (w - bar_w) // 2
+        by1 = h - bar_h - 16
+        bx2, by2 = bx1 + bar_w, by1 + bar_h
+
+        self._glass_panel(frame, bx1, by1, bx2, by2, alpha=0.85, radius=16, border_color=color)
+        cv2.putText(frame, title, (bx1 + 18, by1 + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.46, color, 1, cv2.LINE_AA)
+        cv2.putText(frame, body, (bx1 + 18, by1 + 44), cv2.FONT_HERSHEY_SIMPLEX, 0.38, PALETTE["text_white"], 1, cv2.LINE_AA)
 
     def draw_coadaptation_panel(
         self,
@@ -1468,7 +1585,8 @@ class LocalClientRunner:
                         step_idx_to_draw = num_wp - 1  # hold the final grasp/lift pose as a reference
 
                 foreseen_step = self.visualizer.draw_foreseen_ghost_trajectory(
-                    frame, foreseen_traj, step_override=step_idx_to_draw, real_poses=poses
+                    frame, foreseen_traj, step_override=step_idx_to_draw, real_poses=poses,
+                    target_bbox=bboxes[0] if bboxes else None
                 )
                 self.visualizer.draw_depth_pip(frame, depth_heatmap)
                 
@@ -1480,6 +1598,11 @@ class LocalClientRunner:
                     step_idx=self.workflow.step_index,
                     discrepancy_norm=discrepancy_norm,
                     episode_report=self.last_episode_report
+                )
+                self.visualizer.draw_instruction_bar(
+                    frame=frame,
+                    phase=workflow_phase,
+                    target_label=(parsed_intent_resp.target_object if parsed_intent_resp else self.intent)
                 )
 
                 # Render Co-Adaptation Benchmark Panel
