@@ -66,7 +66,7 @@ def main() -> None:
         config_path = PROJECT_ROOT / config_path
 
     app_config = AppConfig.from_yaml(config_path)
-    host = args.host or app_config.network.server_host
+    host = args.host or "0.0.0.0"
     port = args.port or app_config.network.server_port
 
     logger.info("Initializing Phase 8 perception, LLM intent reasoning, robot hardware, and co-adaptation analytics...")

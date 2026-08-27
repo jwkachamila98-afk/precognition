@@ -137,7 +137,7 @@ def launch_pod(
     mutation = f"""
     mutation {{
         podFindAndDeployOnDemand(input: {{
-            cloudType: ALL,
+            cloudType: SECURE,
             gpuCount: 1,
             volumeInGb: 20,
             containerDiskInGb: 20,
@@ -148,7 +148,7 @@ def launch_pod(
             imageName: "{image_name}",
             ports: "8765/http,8765/tcp,22/tcp",
             volumeMountPath: "/workspace",
-            dockerArgs: "bash -c 'git clone https://github.com/your-repo/Precognition.git /workspace/Precognition || true && cd /workspace/Precognition && pip install -r requirements.txt && python apps/remote_server.py --port 8765'"
+            dockerArgs: "bash -c 'mkdir -p /workspace/Precognition && (git clone https://github.com/jwkachamila98-afk/precognition.git /workspace/Precognition || (cd /workspace/Precognition && git pull)) ; cd /workspace/Precognition ; pip install websockets opencv-python-headless mediapipe scipy pyyaml certifi ; python apps/remote_server.py --port 8765 ; sleep infinity'"
         }}) {{
             id
             imageName
