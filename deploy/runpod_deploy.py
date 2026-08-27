@@ -24,7 +24,7 @@ import urllib.request
 import urllib.error
 from typing import Any, Dict, List, Optional
 
-DEFAULT_API_KEY = os.environ.get("RUNPOD_API_KEY", "***REMOVED-RUNPOD-API-KEY***")
+DEFAULT_API_KEY = os.environ.get("RUNPOD_API_KEY")
 GRAPHQL_URL = "https://api.runpod.io/graphql"
 
 
