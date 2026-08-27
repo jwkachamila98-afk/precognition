@@ -3,7 +3,7 @@
 Runs an async WebSocket server on port 8765, executing the full Phase 8 visuomotor pipeline:
 - MockHandTracker / MediaPipeHandTracker
 - MockDepthEstimator
-- MockLLMIntentParser (Structured semantic schema grounding)
+- StructuredLLMIntentParser (real local LLM via Ollama, rule-based fallback per-request)
 - WorkflowController (Staged Foresee-then-Execute state machine)
 - MockSceneParser (Grounded 3D bounding boxes)
 - MockAffordanceExtractor (Contact probability maps)
@@ -21,6 +21,7 @@ import asyncio
 import logging
 import signal
 import sys
+import urllib.request
 from pathlib import Path
 import numpy as np
 
@@ -30,7 +31,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from config.config_parser import AppConfig
-from src.perception.intent_parser import MockLLMIntentParser
+from src.perception.intent_parser import StructuredLLMIntentParser
 from src.mocks.mock_hand_tracker import MockHandTracker
 from src.mocks.mock_depth_estimator import MockDepthEstimator
 from src.mocks.mock_scene_parser import MockSceneParser
@@ -110,7 +111,21 @@ def main() -> None:
             )
         )
 
-    intent_parser = MockLLMIntentParser()
+    # --- Intent parsing: real local LLM (Ollama) -> rule-based parser per-request fallback ---
+    ollama_url = "http://localhost:11434/api/generate"
+    ollama_model = "llama3.2:1b"
+    try:
+        probe = urllib.request.urlopen("http://localhost:11434/api/tags", timeout=2.0)
+        probe.read()
+        logger.info(f"RemoteServer: Ollama reachable. Using StructuredLLMIntentParser ({ollama_model}).")
+    except Exception as e:
+        logger.warning(
+            f"RemoteServer: Ollama not reachable at startup ({e}). StructuredLLMIntentParser "
+            "will fall back to the rule-based parser per-request until it comes up."
+        )
+    intent_parser = StructuredLLMIntentParser(
+        endpoint_url=ollama_url, model_name=ollama_model, timeout=8.0
+    )
 
     # --- Object detection: GPU YOLO -> CPU MediaPipe EfficientDet -> mock canned bbox ---
     scene_parser = None

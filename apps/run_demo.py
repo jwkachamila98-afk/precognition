@@ -122,7 +122,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Unified Demo Launcher for Visuomotor Hand Policy")
     parser.add_argument("--mode", type=str, choices=["mock_remote", "mock_local"], default="mock_remote", help="Execution mode (default: mock_remote)")
     parser.add_argument("--server-url", type=str, default=None, help="Remote WebSocket server URL (e.g. ws://<CLOUD_GPU_IP>:8765)")
-    parser.add_argument("--voice", type=str, choices=["mock", "whisper"], default="mock", help="Audio transcriber engine")
+    parser.add_argument("--voice", type=str, choices=["mock", "whisper"], default="whisper", help="Audio transcriber engine")
     parser.add_argument("--tracker", type=str, choices=["mediapipe", "mock"], default="mediapipe", help="Hand tracker backend")
     parser.add_argument("--profile", action="store_true", help="Enable terminal latency profiling breakdown")
     parser.add_argument("--record", action="store_true", help="Enable automatic dataset session recording")

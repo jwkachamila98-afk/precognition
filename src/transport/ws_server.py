@@ -84,6 +84,7 @@ class WSInferenceServer:
         self._is_running = False
         self._last_action = np.zeros(7, dtype=np.float32)
         self._last_intent = ""
+        self._cached_parsed_intent = self.intent_parser.parse_intent("")
         self._cached_foreseen_traj = None
         self._last_client_time = time.time()
 
@@ -119,14 +120,18 @@ class WSInferenceServer:
                 hand_poses = self.hand_tracker.estimate(image)
                 depth_map = self.depth_estimator.estimate_depth(image)
 
-                # 2. Perception: Structured Intent Parsing
-                parsed_intent = self.intent_parser.parse_intent(frame_msg.intent)
-
-                # 3. Check for Intent Change & Trigger Workflow
+                # 2. Perception: Structured Intent Parsing & Change Detection.
+                # Only re-parse (and re-trigger the workflow) when the intent text actually
+                # changes - critical when intent_parser is a real LLM backend, since a raw
+                # intent call every single frame would be both wasteful and far too slow.
                 if frame_msg.intent != self._last_intent:
                     self._last_intent = frame_msg.intent
+                    parsed_intent = self.intent_parser.parse_intent(frame_msg.intent)
+                    self._cached_parsed_intent = parsed_intent
                     target_label = parsed_intent.target_object if parsed_intent.is_active else "none"
                     self.workflow.trigger_intent(target_label)
+                else:
+                    parsed_intent = self._cached_parsed_intent
 
                 # 4. Perception: Grounded 3D Scene Parsing
                 parsed_scene = self.scene_parser.parse_scene(

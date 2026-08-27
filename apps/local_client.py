@@ -18,10 +18,15 @@ import logging
 import sys
 import time
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, List, Optional
 from urllib.parse import urlparse
 import cv2
 import numpy as np
+try:
+    import sounddevice as sd
+    SOUNDDEVICE_AVAILABLE = True
+except (ImportError, OSError):
+    SOUNDDEVICE_AVAILABLE = False
 
 # Ensure project root is in sys.path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -720,6 +725,7 @@ class LocalVisualizer:
         ("b", "3D Box"),
         ("d", "Depth PIP"),
         ("s", "Screenshot"),
+        ("z", "Fullscreen"),
         ("q/ESC", "Quit"),
     ]
 
@@ -828,7 +834,11 @@ class LocalClientRunner:
         self.speaker: SpeechSynthesizerABC = SystemSpeaker()
         self.workflow = WorkflowController(
             foresee_steps=60, wait_user_timeout=2.0, auto_advance=True,
-            speaker=self.speaker, voice_guidance_enabled=True
+            # In remote mode the server owns the authoritative phase; the client announces
+            # phase changes itself from the server's snapshot (see _network_step), so the
+            # local WorkflowController must stay silent to avoid double/conflicting speech.
+            speaker=(self.speaker if self.mode != "mock_remote" else None),
+            voice_guidance_enabled=True
         )
         self.robot = MockRobotHardware(dof=7)
         self.checkpoint_manager = PolicyCheckpointManager()
@@ -842,6 +852,8 @@ class LocalClientRunner:
 
         self.cap = None
         self.is_synthetic_camera = False
+        self._audio_stream: Optional["sd.InputStream"] = None
+        self._is_fullscreen = False
 
         selected_tracker = tracker_type or config.perception.hand_tracker.tracker_type
         self.use_mediapipe = (selected_tracker == "mediapipe") and MEDIAPIPE_AVAILABLE
@@ -879,6 +891,22 @@ class LocalClientRunner:
             compression_quality=config.network.compression_quality,
             timeout=config.network.timeout_seconds
         )
+
+        # Decoupled network state: the render/input loop never blocks on the WS round-trip.
+        # A background task streams frames and updates this snapshot whenever a fresh
+        # response lands; the render loop always draws the latest known snapshot instead.
+        self._network_inflight = False
+        self._network_task: Optional[asyncio.Task] = None
+        self._network_latency_ms = 0.0
+        self._network_got_first_response = False
+        self._last_announced_phase: Optional[ExecutionPhase] = None
+        self._remote_snapshot = {
+            "poses": [], "bboxes": [], "affordance_map": None, "foreseen_traj": None,
+            "depth_heatmap": None, "gripper_cmd": 0.0, "residuals": None, "reward_score": 0.0,
+            "discrepancy_norm": 0.0, "buffer_steps": 0, "parsed_intent": None,
+            "workflow_phase": ExecutionPhase.IDLE, "phase_progress": 0.0,
+            "benchmark_summary": None,
+        }
 
     def toggle_voice_mode(self) -> None:
         """Toggle Push-To-Talk voice listening / transcription."""
@@ -958,6 +986,17 @@ class LocalClientRunner:
             saved_path = self.recorder.start_recording(width=width, height=height, fps=self.config.camera.fps)
             logger.info(f"Session recording started at: {saved_path}")
 
+    def toggle_fullscreen(self) -> None:
+        """Toggle the visualizer window between windowed (resizable) and true fullscreen."""
+        window_name = self.config.visualization.window_name
+        self._is_fullscreen = not self._is_fullscreen
+        cv2.setWindowProperty(
+            window_name,
+            cv2.WND_PROP_FULLSCREEN,
+            cv2.WINDOW_FULLSCREEN if self._is_fullscreen else cv2.WINDOW_NORMAL,
+        )
+        logger.info(f"Visualizer window: {'FULLSCREEN' if self._is_fullscreen else 'windowed'}")
+
     def toggle_tracker(self) -> None:
         """Toggle between MediaPipe live tracker and synthetic mock."""
         if not MEDIAPIPE_AVAILABLE:
@@ -978,6 +1017,82 @@ class LocalClientRunner:
         if isinstance(self.active_tracker, MediaPipeHandTracker):
             return "MEDIAPIPE (LIVE)"
         return "MOCK (SYNTHETIC)"
+
+    async def _network_step(self, frame: np.ndarray, frame_id: int, intent: str, control_command: Optional[str]) -> None:
+        """Background WS round-trip. Never awaited by the render loop directly - it only
+        ever reads the latest completed snapshot, so a slow/laggy server cannot stall FPS
+        or starve keyboard input polling."""
+        t0 = time.perf_counter()
+        try:
+            response = await self.ws_client.send_frame(
+                frame, frame_id, intent=intent, control_command=control_command
+            )
+        except Exception as e:
+            logger.warning(f"Network step failed: {e}")
+            response = None
+        finally:
+            self._network_inflight = False
+
+        if response is None:
+            return
+
+        self._network_got_first_response = True
+        self._network_latency_ms = (time.perf_counter() - t0) * 1000.0
+
+        try:
+            workflow_phase = ExecutionPhase(response.workflow_phase)
+        except ValueError:
+            workflow_phase = ExecutionPhase.IDLE
+
+        parsed_scene = response.get_parsed_scene()
+        rep = response.get_episode_report()
+        if rep:
+            self.last_episode_report = rep
+
+        self._remote_snapshot.update({
+            "poses": response.get_hand_poses(),
+            "bboxes": parsed_scene.bounding_boxes if parsed_scene else [],
+            "affordance_map": response.get_affordance_map(),
+            "foreseen_traj": response.get_foreseen_trajectory(),
+            "depth_heatmap": response.decode_depth_heatmap(),
+            "gripper_cmd": response.gripper_action,
+            "residuals": response.policy_residuals,
+            "reward_score": response.reward_score,
+            "discrepancy_norm": response.discrepancy_norm,
+            "buffer_steps": response.buffer_step_count,
+            "parsed_intent": response.get_parsed_intent(),
+            "workflow_phase": workflow_phase,
+            "phase_progress": response.phase_progress,
+            "benchmark_summary": response.benchmark_summary or self._remote_snapshot["benchmark_summary"],
+        })
+
+    def _audio_callback(self, indata: np.ndarray, frames: int, time_info: Any, status: Any) -> None:
+        """sounddevice callback (runs on its own thread). Forwards raw PCM only while
+        the transcriber is actively listening; WhisperTranscriber buffers it under a lock."""
+        if status:
+            logger.debug(f"Audio input status: {status}")
+        if self.transcriber.is_listening:
+            self.transcriber.transcribe_stream(indata.copy().tobytes())
+
+    def setup_microphone(self) -> None:
+        """Open a persistent microphone input stream feeding the transcriber, so
+        push-to-talk voice intent capture actually has real audio to transcribe."""
+        if not SOUNDDEVICE_AVAILABLE:
+            logger.warning("sounddevice is not installed; voice intent capture will use canned fallback text.")
+            return
+        try:
+            sample_rate = getattr(self.transcriber, "sample_rate", 16000)
+            self._audio_stream = sd.InputStream(
+                samplerate=sample_rate,
+                channels=1,
+                dtype="int16",
+                callback=self._audio_callback,
+            )
+            self._audio_stream.start()
+            logger.info(f"Microphone input stream opened at {sample_rate} Hz for voice intent capture.")
+        except Exception as e:
+            logger.warning(f"Could not open microphone input stream ({e}). Voice intent capture will use canned fallback text.")
+            self._audio_stream = None
 
     def setup_camera(self) -> None:
         """Initialize physical camera with AVFoundation on macOS or fallback to synthetic."""
@@ -1018,6 +1133,8 @@ class LocalClientRunner:
     async def run(self) -> None:
         """Main application execution loop."""
         self.setup_camera()
+        self.setup_microphone()
+        cv2.namedWindow(self.config.visualization.window_name, cv2.WINDOW_NORMAL)
         self.robot.connect()
         if self.server_url:
             mode_str = f"REMOTE CLOUD GPU ({self.server_url})"
@@ -1202,48 +1319,54 @@ class LocalClientRunner:
                         latency_ms = (time.perf_counter() - t0) * 1000.0
 
                 elif self.mode == "mock_remote":
-                    # Stage 7: WebSocket Serialization & Network Transport
-                    with self.profiler.profile("6. WebSocket Transport"):
-                        t0 = time.perf_counter()
-                        response = await self.ws_client.send_frame(
-                            frame, frame_id, intent=self.intent, control_command=self._control_cmd_to_send
-                        )
-                        latency_ms = (time.perf_counter() - t0) * 1000.0
-
-                    if response:
-                        srv_poses = response.get_hand_poses()
-                        if isinstance(self.active_tracker, MediaPipeHandTracker):
-                            local_poses = self.active_tracker.estimate(frame)
-                            poses = local_poses if local_poses else srv_poses
-                        else:
-                            poses = srv_poses
-                        depth_heatmap = response.decode_depth_heatmap()
-                        gripper_cmd = response.gripper_action
-                        residuals = response.policy_residuals
-                        reward_score = response.reward_score
-                        discrepancy_norm = response.discrepancy_norm
-                        buffer_steps = response.buffer_step_count
-                        parsed_scene = response.get_parsed_scene()
-                        if parsed_scene:
-                            bboxes = parsed_scene.bounding_boxes
-                        parsed_intent_resp = response.get_parsed_intent() or self.current_parsed_intent
-                        affordance_map = response.get_affordance_map()
-                        foreseen_traj = response.get_foreseen_trajectory()
-                        try:
-                            workflow_phase = ExecutionPhase(response.workflow_phase)
-                        except ValueError:
-                            workflow_phase = ExecutionPhase.IDLE
-                        phase_progress = response.phase_progress
-                        rep = response.get_episode_report()
-                        if rep:
-                            self.last_episode_report = rep
-                        if response.benchmark_summary:
-                            benchmark_summary = response.benchmark_summary
+                    # Stage 7: Network transport runs in the background so a slow/laggy
+                    # server round-trip never blocks rendering or keyboard polling.
+                    # The live local tracker still runs every frame for a responsive
+                    # skeleton overlay, independent of network latency.
+                    if isinstance(self.active_tracker, MediaPipeHandTracker):
+                        local_poses = self.active_tracker.estimate(frame)
+                        poses = local_poses if local_poses else self._remote_snapshot["poses"]
                     else:
-                        cv2.putText(frame, f"AWAITING WS SERVER ({self.config.network.server_host}:{self.config.network.server_port})...", 
+                        poses = self._remote_snapshot["poses"]
+
+                    if not self._network_inflight:
+                        self._network_inflight = True
+                        self._network_task = asyncio.create_task(
+                            self._network_step(frame.copy(), frame_id, self.intent, self._control_cmd_to_send)
+                        )
+                        self._control_cmd_to_send = None
+
+                    latency_ms = self._network_latency_ms
+                    snap = self._remote_snapshot
+                    bboxes = snap["bboxes"]
+                    affordance_map = snap["affordance_map"]
+                    foreseen_traj = snap["foreseen_traj"]
+                    depth_heatmap = snap["depth_heatmap"]
+                    gripper_cmd = snap["gripper_cmd"]
+                    residuals = snap["residuals"]
+                    reward_score = snap["reward_score"]
+                    discrepancy_norm = snap["discrepancy_norm"]
+                    buffer_steps = snap["buffer_steps"]
+                    parsed_intent_resp = snap["parsed_intent"] or self.current_parsed_intent
+                    workflow_phase = snap["workflow_phase"]
+                    phase_progress = snap["phase_progress"]
+                    if snap["benchmark_summary"]:
+                        benchmark_summary = snap["benchmark_summary"]
+
+                    # The server's workflow controller is headless (no speakers on the GPU
+                    # pod), so the client announces phase changes locally instead.
+                    if workflow_phase != self._last_announced_phase:
+                        self._last_announced_phase = workflow_phase
+                        if self.workflow.voice_guidance_enabled:
+                            instruction = self.workflow._phase_instruction(workflow_phase)
+                            if instruction:
+                                self.speaker.speak(instruction)
+
+                    if not self._network_got_first_response:
+                        cv2.putText(frame, f"CONNECTING TO {self.server_url or self.config.network.server_host}...",
                                     (30, frame.shape[0] // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA)
 
-                # Reset one-shot command
+                # Reset one-shot command (only relevant for mock_local, which sends none)
                 self._control_cmd_to_send = None
 
                 # Session Recording
@@ -1371,6 +1494,8 @@ class LocalClientRunner:
                     screenshot_name = f"snapshot_frame_{frame_id}_{int(time.time())}.png"
                     cv2.imwrite(screenshot_name, frame)
                     logger.info(f"Saved screenshot to {screenshot_name}")
+                elif key == ord("z"): # Toggle fullscreen
+                    self.toggle_fullscreen()
 
                 # Maintain 30 FPS yielding to asyncio
                 elapsed = time.perf_counter() - t_frame_start
@@ -1379,6 +1504,11 @@ class LocalClientRunner:
                 await asyncio.sleep(sleep_time)
 
         finally:
+            if self._network_task is not None and not self._network_task.done():
+                self._network_task.cancel()
+            if self._audio_stream is not None:
+                self._audio_stream.stop()
+                self._audio_stream.close()
             if self.recorder.is_recording:
                 self.recorder.stop_recording()
             if self.cap:
@@ -1394,7 +1524,7 @@ def main() -> None:
     parser.add_argument("--config", type=str, default="config/system_config.yaml", help="Path to system_config.yaml")
     parser.add_argument("--mode", type=str, choices=["mock_local", "mock_remote", "mock", "remote"], default=None, help="Execution mode (mock_local | mock_remote)")
     parser.add_argument("--tracker", type=str, choices=["mediapipe", "mock"], default=None, help="Hand tracker type")
-    parser.add_argument("--transcriber", type=str, choices=["mock", "whisper"], default="mock", help="Audio transcriber engine")
+    parser.add_argument("--transcriber", type=str, choices=["mock", "whisper"], default="whisper", help="Audio transcriber engine")
     parser.add_argument("--intent", type=str, default=None, help="Natural language intent string")
     parser.add_argument("--device", type=int, default=None, help="Camera device index")
     parser.add_argument("--profile", action="store_true", help="Enable detailed component latency breakdown profiling to console")

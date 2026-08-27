@@ -189,6 +189,7 @@ When running the visualizer HUD (`apps/local_client.py` or `apps/run_demo.py`), 
 | **`b`** | **3D Bounding Box** | Toggle 3D oriented object bounding wireframe |
 | **`d`** | **Depth Inset** | Toggle metric depth picture-in-picture (PIP) inset |
 | **`s`** | **Screenshot** | Save timestamped PNG snapshot to disk |
+| **`z`** | **Fullscreen** | Toggle the visualizer window between windowed and true fullscreen |
 | **`q`** / `ESC` | **Quit** | Gracefully disconnect and exit application |
 
 ---
