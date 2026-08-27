@@ -14,6 +14,7 @@ Supported Modes:
 import argparse
 import asyncio
 import collections
+import threading
 import logging
 import sys
 import time
@@ -1076,22 +1077,51 @@ class LocalClientRunner:
 
     def setup_microphone(self) -> None:
         """Open a persistent microphone input stream feeding the transcriber, so
-        push-to-talk voice intent capture actually has real audio to transcribe."""
+        push-to-talk voice intent capture actually has real audio to transcribe.
+
+        Opening a CoreAudio input stream can block indefinitely on macOS while an
+        unresolved microphone-permission prompt sits behind the process (e.g. no
+        foreground window to attach it to) - so this runs in a worker thread with a
+        hard timeout instead of calling sd.InputStream() directly on the main thread.
+        """
         if not SOUNDDEVICE_AVAILABLE:
             logger.warning("sounddevice is not installed; voice intent capture will use canned fallback text.")
             return
-        try:
-            sample_rate = getattr(self.transcriber, "sample_rate", 16000)
-            self._audio_stream = sd.InputStream(
-                samplerate=sample_rate,
-                channels=1,
-                dtype="int16",
-                callback=self._audio_callback,
+
+        result: dict = {}
+
+        def _open_stream() -> None:
+            try:
+                sample_rate = getattr(self.transcriber, "sample_rate", 16000)
+                stream = sd.InputStream(
+                    samplerate=sample_rate,
+                    channels=1,
+                    dtype="int16",
+                    callback=self._audio_callback,
+                )
+                stream.start()
+                result["stream"] = stream
+                result["sample_rate"] = sample_rate
+            except Exception as e:
+                result["error"] = e
+
+        opener = threading.Thread(target=_open_stream, daemon=True)
+        opener.start()
+        opener.join(timeout=5.0)
+
+        if opener.is_alive():
+            logger.warning(
+                "Microphone input stream did not open within 5s (likely blocked on an "
+                "unresolved permission prompt - check System Settings > Privacy & Security > "
+                "Microphone). Continuing without live voice capture; grant access and restart "
+                "to enable it."
             )
-            self._audio_stream.start()
-            logger.info(f"Microphone input stream opened at {sample_rate} Hz for voice intent capture.")
-        except Exception as e:
-            logger.warning(f"Could not open microphone input stream ({e}). Voice intent capture will use canned fallback text.")
+            self._audio_stream = None
+        elif "stream" in result:
+            self._audio_stream = result["stream"]
+            logger.info(f"Microphone input stream opened at {result['sample_rate']} Hz for voice intent capture.")
+        else:
+            logger.warning(f"Could not open microphone input stream ({result.get('error')}). Voice intent capture will use canned fallback text.")
             self._audio_stream = None
 
     def setup_camera(self) -> None:
