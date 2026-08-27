@@ -48,3 +48,6 @@ snapshot_*.png
 .DS_Store
 .AppleDouble
 .LSOverride
+
+# Downloaded/cached ML model weights
+config/models/

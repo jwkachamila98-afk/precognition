@@ -702,6 +702,47 @@ class LocalVisualizer:
         cv2.line(frame, (x1 + 12, y1 + 350), (x2 - 12, y1 + 350), (40, 50, 65), 1)
         cv2.putText(frame, "'h':Collapse | 'c':Step | 'm':Stats", (x1 + 10, y1 + 366), cv2.FONT_HERSHEY_SIMPLEX, 0.29, PALETTE["text_dim"], 1, cv2.LINE_AA)
 
+    # Ordered to match the README hotkey cheat sheet.
+    HOTKEY_LEGEND = [
+        ("ENTER/c", "Step Phase"),
+        ("h", "Telemetry"),
+        ("m", "Co-Adapt"),
+        ("k / ^S", "Save Ckpt"),
+        ("l / ^L", "Load Ckpt"),
+        ("x / ^R", "Reset"),
+        ("v/SPACE", "Voice PTT"),
+        ("g", "Voice Guide"),
+        ("i", "Cycle Intent"),
+        ("p", "Toggle Adapt"),
+        ("r", "Record"),
+        ("f", "Ghost Hand"),
+        ("t", "Toggle Tracker"),
+        ("b", "3D Box"),
+        ("d", "Depth PIP"),
+        ("s", "Screenshot"),
+        ("q/ESC", "Quit"),
+    ]
+
+    def draw_hotkey_panel(self, frame: np.ndarray, top_y: int) -> None:
+        """Render the always-on hotkey cheat sheet docked below the glance card on the right side."""
+        h, w = frame.shape[:2]
+        panel_w = 218
+        line_h = 14
+        panel_h = 26 + line_h * len(self.HOTKEY_LEGEND) + 8
+        x1 = w - panel_w - 10
+        y1 = top_y
+        x2 = w - 10
+        y2 = y1 + panel_h
+
+        self._glass_panel(frame, x1, y1, x2, y2, alpha=0.80, radius=14)
+        cv2.putText(frame, "HOTKEYS", (x1 + 12, y1 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.36, PALETTE["cyan_electric"], 1, cv2.LINE_AA)
+        cv2.line(frame, (x1 + 12, y1 + 28), (x2 - 12, y1 + 28), (40, 50, 65), 1)
+
+        for idx, (key, action) in enumerate(self.HOTKEY_LEGEND):
+            row_y = y1 + 44 + idx * line_h
+            cv2.putText(frame, key, (x1 + 12, row_y), cv2.FONT_HERSHEY_SIMPLEX, 0.32, PALETTE["amber_gold"], 1, cv2.LINE_AA)
+            cv2.putText(frame, action, (x1 + 84, row_y), cv2.FONT_HERSHEY_SIMPLEX, 0.32, PALETTE["text_white"], 1, cv2.LINE_AA)
+
 
 class SyntheticCamera:
     """Generates synthetic animated RGB video frames when webcam is inaccessible."""
@@ -1280,6 +1321,11 @@ class LocalClientRunner:
                     recorded_frames=self.recorder.frame_count,
                     robot_connected=self.robot.is_connected
                 )
+
+                # Always-on hotkey cheat sheet, docked below the glance card (skipped when the
+                # full telemetry dock is expanded, since it already fills the right column).
+                if not self.visualizer.show_telemetry_detail:
+                    self.visualizer.draw_hotkey_panel(frame, top_y=100)
 
                 # Display frame window
                 cv2.imshow(self.config.visualization.window_name, frame)

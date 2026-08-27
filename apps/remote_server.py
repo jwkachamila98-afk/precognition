@@ -90,9 +90,20 @@ def main() -> None:
         )
     )
     intent_parser = MockLLMIntentParser()
-    scene_parser = MockSceneParser(
-        num_points=app_config.perception.scene_parser.num_points
-    )
+    try:
+        from src.perception.object_detector import MediaPipeObjectDetector
+        from src.perception.live_scene_parser import LiveSceneParser
+        object_detector = MediaPipeObjectDetector(score_threshold=0.35)
+        scene_parser = LiveSceneParser(
+            object_detector=object_detector,
+            num_points=app_config.perception.scene_parser.num_points
+        )
+        logger.info("RemoteServer: Using live MediaPipeObjectDetector-backed LiveSceneParser (real object recognition).")
+    except Exception as e:
+        logger.warning(f"Live object detector initialization fallback: {e}")
+        scene_parser = MockSceneParser(
+            num_points=app_config.perception.scene_parser.num_points
+        )
     affordance_extractor = MockAffordanceExtractor()
     trajectory_diffusion = MockTrajectoryDiffusion()
     discrepancy_engine = DiscrepancyEngine()
