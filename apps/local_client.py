@@ -1205,7 +1205,9 @@ class LocalClientRunner:
                     # Stage 7: WebSocket Serialization & Network Transport
                     with self.profiler.profile("6. WebSocket Transport"):
                         t0 = time.perf_counter()
-                        response = await self.ws_client.send_frame(frame, frame_id, intent=self.intent)
+                        response = await self.ws_client.send_frame(
+                            frame, frame_id, intent=self.intent, control_command=self._control_cmd_to_send
+                        )
                         latency_ms = (time.perf_counter() - t0) * 1000.0
 
                     if response:

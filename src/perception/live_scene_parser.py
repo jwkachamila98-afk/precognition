@@ -52,6 +52,8 @@ _NOUN_RE = re.compile(
     r"(?:pick\s+up|grasp|grab|take|get|reach\s+for|lift|hold)\s+(?:the\s+|a\s+|an\s+|this\s+)?([a-zA-Z-]+)"
 )
 
+_SPATIAL_REF_RE = re.compile(r"\b(?:near|by|beside|next\s+to|under|on|in\s+front\s+of)\b")
+
 
 class LiveSceneParser(SceneParserABC):
     """
@@ -69,11 +71,15 @@ class LiveSceneParser(SceneParserABC):
             return None
         intent_clean = intent.lower()
 
+        # Truncate at spatial-reference prepositions ("near the keyboard", "by the handle")
+        # so an incidental landmark isn't mistaken for the actual grasp target.
+        primary_span = _SPATIAL_REF_RE.split(intent_clean, maxsplit=1)[0]
+
         for key in _INTENT_TO_COCO:
-            if key in intent_clean:
+            if key in primary_span:
                 return key
 
-        match = _NOUN_RE.search(intent_clean)
+        match = _NOUN_RE.search(primary_span)
         if match:
             noun = match.group(1).strip()
             if noun not in ("it", "object", "item", "something", "up"):

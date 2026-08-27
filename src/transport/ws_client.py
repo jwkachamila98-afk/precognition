@@ -88,7 +88,8 @@ class WSStreamingClient:
         self,
         image: np.ndarray,
         frame_id: int,
-        intent: str = "foresee me picking this remote control"
+        intent: str = "foresee me picking this remote control",
+        control_command: Optional[str] = None
     ) -> Optional[InferenceResponse]:
         """
         Compress frame to JPEG, transmit over WebSocket with intent metadata, and await response.
@@ -110,7 +111,8 @@ class WSStreamingClient:
                 width=w,
                 height=h,
                 intent=intent,
-                compression="jpeg"
+                compression="jpeg",
+                control_command=control_command
             )
 
             # Transmit frame request
