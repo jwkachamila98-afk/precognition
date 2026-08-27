@@ -70,40 +70,77 @@ def main() -> None:
     port = args.port or app_config.network.server_port
 
     logger.info("Initializing Phase 8 perception, LLM intent reasoning, robot hardware, and co-adaptation analytics...")
-    try:
-        from src.perception.mediapipe_tracker import MediaPipeHandTracker, MEDIAPIPE_AVAILABLE
-        if MEDIAPIPE_AVAILABLE and args.tracker == "mediapipe":
-            hand_tracker = MediaPipeHandTracker()
-            logger.info("RemoteServer: Using live MediaPipeHandTracker.")
-        else:
-            hand_tracker = MockHandTracker()
-            logger.info("RemoteServer: Using MockHandTracker.")
-    except Exception as e:
-        logger.warning(f"MediaPipe initialization fallback: {e}")
+
+    # --- Hand tracking: Tasks API (works on any mediapipe version) -> legacy solutions API -> mock ---
+    hand_tracker = None
+    if args.tracker == "mediapipe":
+        try:
+            from src.perception.mediapipe_tasks_hand_tracker import MediaPipeTasksHandTracker
+            hand_tracker = MediaPipeTasksHandTracker()
+            logger.info("RemoteServer: Using live MediaPipeTasksHandTracker (real hand tracking).")
+        except Exception as e:
+            logger.warning(f"MediaPipe Tasks hand tracker initialization failed: {e}")
+            try:
+                from src.perception.mediapipe_tracker import MediaPipeHandTracker, MEDIAPIPE_AVAILABLE
+                if MEDIAPIPE_AVAILABLE:
+                    hand_tracker = MediaPipeHandTracker()
+                    logger.info("RemoteServer: Using live MediaPipeHandTracker (legacy solutions API).")
+            except Exception as e2:
+                logger.warning(f"Legacy MediaPipe hand tracker initialization also failed: {e2}")
+    if hand_tracker is None:
         hand_tracker = MockHandTracker()
-    depth_estimator = MockDepthEstimator(
-        min_depth=app_config.perception.depth_estimator.min_depth_meters,
-        max_depth=app_config.perception.depth_estimator.max_depth_meters,
-        target_shape=(
-            app_config.perception.depth_estimator.output_height,
-            app_config.perception.depth_estimator.output_width
-        )
-    )
-    intent_parser = MockLLMIntentParser()
+        logger.warning("RemoteServer: Falling back to MockHandTracker (no real hand tracking available).")
+
+    # --- Depth: real MiDaS monocular depth on GPU -> mock synthetic depth ---
     try:
-        from src.perception.object_detector import MediaPipeObjectDetector
+        from src.perception.midas_depth_estimator import MiDaSDepthEstimator
+        depth_estimator = MiDaSDepthEstimator(
+            min_depth=app_config.perception.depth_estimator.min_depth_meters,
+            max_depth=app_config.perception.depth_estimator.max_depth_meters,
+        )
+        logger.info("RemoteServer: Using live MiDaSDepthEstimator (real monocular depth).")
+    except Exception as e:
+        logger.warning(f"MiDaS depth estimator initialization fallback: {e}")
+        depth_estimator = MockDepthEstimator(
+            min_depth=app_config.perception.depth_estimator.min_depth_meters,
+            max_depth=app_config.perception.depth_estimator.max_depth_meters,
+            target_shape=(
+                app_config.perception.depth_estimator.output_height,
+                app_config.perception.depth_estimator.output_width
+            )
+        )
+
+    intent_parser = MockLLMIntentParser()
+
+    # --- Object detection: GPU YOLO -> CPU MediaPipe EfficientDet -> mock canned bbox ---
+    scene_parser = None
+    try:
+        from src.perception.yolo_object_detector import YoloObjectDetector
         from src.perception.live_scene_parser import LiveSceneParser
-        object_detector = MediaPipeObjectDetector(score_threshold=0.35)
+        object_detector = YoloObjectDetector(model_name="yolov8s.pt", conf_threshold=0.30)
         scene_parser = LiveSceneParser(
             object_detector=object_detector,
             num_points=app_config.perception.scene_parser.num_points
         )
-        logger.info("RemoteServer: Using live MediaPipeObjectDetector-backed LiveSceneParser (real object recognition).")
+        logger.info("RemoteServer: Using live YoloObjectDetector-backed LiveSceneParser (real GPU object recognition).")
     except Exception as e:
-        logger.warning(f"Live object detector initialization fallback: {e}")
+        logger.warning(f"YOLO object detector initialization failed: {e}")
+        try:
+            from src.perception.object_detector import MediaPipeObjectDetector
+            from src.perception.live_scene_parser import LiveSceneParser
+            object_detector = MediaPipeObjectDetector(score_threshold=0.30)
+            scene_parser = LiveSceneParser(
+                object_detector=object_detector,
+                num_points=app_config.perception.scene_parser.num_points
+            )
+            logger.info("RemoteServer: Using live MediaPipeObjectDetector-backed LiveSceneParser (real CPU object recognition).")
+        except Exception as e2:
+            logger.warning(f"MediaPipe object detector initialization also failed: {e2}")
+    if scene_parser is None:
         scene_parser = MockSceneParser(
             num_points=app_config.perception.scene_parser.num_points
         )
+        logger.warning("RemoteServer: Falling back to MockSceneParser (no real object recognition available).")
     affordance_extractor = MockAffordanceExtractor()
     trajectory_diffusion = MockTrajectoryDiffusion()
     discrepancy_engine = DiscrepancyEngine()
