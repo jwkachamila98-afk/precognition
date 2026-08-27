@@ -129,15 +129,16 @@ def launch_pod(
     gpu_type: str = "NVIDIA GeForce RTX 3080",
     image_name: str = "runpod/pytorch:2.1.0-py3.10-cuda11.8.0-devel-ubuntu22.04",
     pod_name: str = "visuomotor-server-gpu",
-    api_key: str = DEFAULT_API_KEY
+    api_key: str = DEFAULT_API_KEY,
+    cloud_type: str = "SECURE"
 ) -> None:
     """Provision a new GPU instance on RunPod with port 8765 exposed."""
-    print(f"[*] Requesting GPU pod launch on RunPod ({gpu_type})...")
-    
+    print(f"[*] Requesting GPU pod launch on RunPod ({gpu_type}, {cloud_type} cloud)...")
+
     mutation = f"""
     mutation {{
         podFindAndDeployOnDemand(input: {{
-            cloudType: SECURE,
+            cloudType: {cloud_type},
             gpuCount: 1,
             volumeInGb: 20,
             containerDiskInGb: 20,
@@ -196,6 +197,7 @@ def main() -> None:
     parser_launch.add_argument("--gpu", type=str, default="NVIDIA GeForce RTX 3080", help="GPU Type ID (e.g. 'NVIDIA GeForce RTX 3080', 'NVIDIA RTX A4000')")
     parser_launch.add_argument("--image", type=str, default="runpod/pytorch:2.1.0-py3.10-cuda11.8.0-devel-ubuntu22.04", help="Docker image")
     parser_launch.add_argument("--name", type=str, default="visuomotor-server-gpu", help="Pod name")
+    parser_launch.add_argument("--cloud-type", type=str, choices=["SECURE", "COMMUNITY"], default="SECURE", help="RunPod cloud tier (COMMUNITY has broader GPU availability)")
     parser_launch.add_argument("--api-key", type=str, default=DEFAULT_API_KEY, help="RunPod API Key")
 
     # terminate
@@ -212,7 +214,8 @@ def main() -> None:
             gpu_type=args.gpu,
             image_name=args.image,
             pod_name=args.name,
-            api_key=args.api_key
+            api_key=args.api_key,
+            cloud_type=args.cloud_type
         )
     elif args.command == "terminate":
         terminate_pod(args.pod, args.api_key)

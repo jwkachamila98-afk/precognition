@@ -7,6 +7,7 @@ from enum import Enum
 from typing import List, Optional
 import numpy as np
 
+from src.audio.text_to_speech import SpeechSynthesizerABC
 from src.perception.hand_tracker import HandPose
 from src.simulation.trajectory_generator import ForeseenTrajectory
 
@@ -54,12 +55,16 @@ class WorkflowController:
         foresee_steps: int = 60,
         wait_user_timeout: float = 3.0,
         execution_max_steps: int = 90,
-        auto_advance: bool = True
+        auto_advance: bool = True,
+        speaker: Optional[SpeechSynthesizerABC] = None,
+        voice_guidance_enabled: bool = True
     ) -> None:
         self.foresee_steps = foresee_steps
         self.wait_user_timeout = wait_user_timeout
         self.execution_max_steps = execution_max_steps
         self.auto_advance = auto_advance
+        self.speaker = speaker
+        self.voice_guidance_enabled = voice_guidance_enabled
 
         self._phase = ExecutionPhase.IDLE
         self._step_index = 0
@@ -106,6 +111,21 @@ class WorkflowController:
             target_label=self._target_label
         )
 
+    def _phase_instruction(self, phase: ExecutionPhase) -> Optional[str]:
+        """Compose the spoken instruction announced on entering a given phase."""
+        target = self._target_label if self._target_label not in ("none", "") else "the object"
+        if phase == ExecutionPhase.IDLE:
+            return "Standby. Tell me what to pick up."
+        elif phase == ExecutionPhase.FORESEEING:
+            return f"Foreseeing how to grasp the {target}."
+        elif phase == ExecutionPhase.WAIT_USER:
+            return "Ready when you are. Go ahead and move your hand."
+        elif phase == ExecutionPhase.USER_EXECUTING:
+            return "Tracking your motion now."
+        elif phase == ExecutionPhase.ADAPTING:
+            return "Got it. Adjusting based on what I saw."
+        return None
+
     def transition_to(self, new_phase: ExecutionPhase) -> None:
         """Explicitly switch state machine phase."""
         if new_phase == self._phase:
@@ -123,6 +143,11 @@ class WorkflowController:
             self.recorded_physical_poses.clear()
 
         logger.info(f"Workflow State Transition: [{old_phase.value}] -> [{new_phase.value}]")
+
+        if self.speaker is not None and self.voice_guidance_enabled:
+            instruction = self._phase_instruction(new_phase)
+            if instruction:
+                self.speaker.speak(instruction)
 
     def trigger_intent(self, target_label: str, foreseen_traj: Optional[ForeseenTrajectory] = None) -> None:
         """Trigger workflow start upon new voice/text intent."""

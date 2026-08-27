@@ -34,6 +34,7 @@ from src.perception.scene_parser import BoundingBox3D, ParsedScene
 from src.perception.mediapipe_tracker import MediaPipeHandTracker, MEDIAPIPE_AVAILABLE
 from src.perception.intent_parser import IntentParserABC, MockLLMIntentParser, ParsedIntent
 from src.audio.speech_to_text import AudioTranscriberABC, MockTranscriber, WhisperTranscriber
+from src.audio.text_to_speech import SpeechSynthesizerABC, SystemSpeaker
 from src.simulation.trajectory_generator import AffordanceMap, ForeseenTrajectory, ForeseenWaypoint
 from src.policy.discrepancy import DiscrepancyEngine, DiscrepancyState, EpisodeDiscrepancyReport
 from src.policy.workflow_state import ExecutionPhase, WorkflowController
@@ -125,9 +126,50 @@ class LocalVisualizer:
         self.show_bounding_box = config.visualization.draw_bounding_box
         self.show_foreseen_ghost = True
         self.show_analytics_panel = False
+        self.show_telemetry_detail = False
         self.fps_history = collections.deque(maxlen=30)
         self._last_tick = time.perf_counter()
         self.anim_frame_idx = 0
+        self._panel_cache: dict = {}
+
+    def _rounded_panel_mask(self, w: int, h: int, radius: int):
+        """Build (and cache) an anti-aliased rounded-rect alpha mask + border contour."""
+        key = (w, h, radius)
+        cached = self._panel_cache.get(key)
+        if cached is not None:
+            return cached
+        r = max(0, min(radius, w // 2, h // 2))
+        mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.rectangle(mask, (r, 0), (w - r, h), 255, -1)
+        cv2.rectangle(mask, (0, r), (w, h - r), 255, -1)
+        for cx, cy in [(r, r), (w - r, r), (r, h - r), (w - r, h - r)]:
+            cv2.circle(mask, (cx, cy), r, 255, -1)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        mask_f = (mask.astype(np.float32) / 255.0)[:, :, None]
+        result = (mask_f, contours)
+        self._panel_cache[key] = result
+        return result
+
+    def _glass_panel(
+        self,
+        frame: np.ndarray,
+        x1: int, y1: int, x2: int, y2: int,
+        alpha: float = 0.80,
+        radius: int = 14,
+        border_color: Optional[tuple] = None,
+    ) -> None:
+        """Blend a soft rounded-corner frosted glass card onto the frame in place."""
+        h, w = frame.shape[:2]
+        x1, y1, x2, y2 = max(0, x1), max(0, y1), min(w, x2), min(h, y2)
+        pw, ph = x2 - x1, y2 - y1
+        if pw <= 0 or ph <= 0:
+            return
+        roi = frame[y1:y2, x1:x2]
+        mask_f, contours = self._rounded_panel_mask(pw, ph, radius)
+        glass = np.full_like(roi, PALETTE["dark_glass_bg"])
+        blended = cv2.addWeighted(glass, alpha, roi, 1 - alpha, 0)
+        roi[:] = (blended * mask_f + roi * (1 - mask_f)).astype(np.uint8)
+        cv2.drawContours(roi, contours, -1, border_color or PALETTE["glass_border"], 1, lineType=cv2.LINE_AA)
 
     def update_fps(self) -> float:
         now = time.perf_counter()
@@ -287,36 +329,30 @@ class LocalVisualizer:
         bx2 = bx1 + banner_w
         by2 = by1 + banner_h
 
-        # Fast ROI frosted glass blending (avoids full-frame memory copies)
-        sub_overlay = frame[by1:by2, bx1:bx2].copy()
-        cv2.rectangle(sub_overlay, (0, 0), (banner_w, banner_h), PALETTE["dark_glass_bg"], -1)
-        cv2.addWeighted(sub_overlay, 0.85, frame[by1:by2, bx1:bx2], 0.15, 0, frame[by1:by2, bx1:bx2])
+        self._glass_panel(frame, bx1, by1, bx2, by2, alpha=0.82, radius=16)
 
         t = time.time()
         pulse = 0.5 + 0.5 * np.sin(t * 8.0)
 
         if phase == ExecutionPhase.FORESEEING:
-            cv2.rectangle(frame, (bx1, by1), (bx2, by2), PALETTE["amber_gold"], 1)
-            cv2.circle(frame, (bx1 + 16, by1 + 16), int(4 + 2 * pulse), PALETTE["amber_gold"], -1, cv2.LINE_AA)
-            msg = f"[1/3] FORESEEING ROLLOUT  •  {int(progress*100)}%"
-            cv2.putText(frame, msg, (bx1 + 28, by1 + 21), cv2.FONT_HERSHEY_SIMPLEX, 0.38, PALETTE["amber_gold"], 1, cv2.LINE_AA)
+            cv2.circle(frame, (bx1 + 18, by1 + 16), int(4 + 2 * pulse), PALETTE["amber_gold"], -1, cv2.LINE_AA)
+            msg = f"Foreseeing rollout  -  {int(progress*100)}%"
+            cv2.putText(frame, msg, (bx1 + 30, by1 + 21), cv2.FONT_HERSHEY_SIMPLEX, 0.38, PALETTE["amber_gold"], 1, cv2.LINE_AA)
 
         elif phase == ExecutionPhase.WAIT_USER:
-            cv2.rectangle(frame, (bx1, by1), (bx2, by2), PALETTE["cyan_electric"], 1)
-            cv2.circle(frame, (bx1 + 16, by1 + 16), 5, PALETTE["cyan_electric"], -1, cv2.LINE_AA)
-            msg = "READY: PRESS 'c' TO EXECUTE MOTION"
-            cv2.putText(frame, msg, (bx1 + 28, by1 + 21), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (255, 255, 255), 1, cv2.LINE_AA)
+            cv2.circle(frame, (bx1 + 18, by1 + 16), 5, PALETTE["cyan_electric"], -1, cv2.LINE_AA)
+            msg = "Ready - press 'c' to execute"
+            cv2.putText(frame, msg, (bx1 + 30, by1 + 21), cv2.FONT_HERSHEY_SIMPLEX, 0.36, PALETTE["text_white"], 1, cv2.LINE_AA)
 
         elif phase == ExecutionPhase.USER_EXECUTING:
-            cv2.rectangle(frame, (bx1, by1), (bx2, by2), PALETTE["neon_green"], 1)
-            cv2.circle(frame, (bx1 + 16, by1 + 16), int(4 + 2 * pulse), PALETTE["neon_green"], -1, cv2.LINE_AA)
-            msg = f"[2/3] TRACKING EXECUTION  •  {int(progress*100)}%"
-            cv2.putText(frame, msg, (bx1 + 28, by1 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.36, PALETTE["neon_green"], 1, cv2.LINE_AA)
+            cv2.circle(frame, (bx1 + 18, by1 + 16), int(4 + 2 * pulse), PALETTE["neon_green"], -1, cv2.LINE_AA)
+            msg = f"Tracking execution  -  {int(progress*100)}%"
+            cv2.putText(frame, msg, (bx1 + 30, by1 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.36, PALETTE["neon_green"], 1, cv2.LINE_AA)
 
             # High precision alignment bar
-            bar_x = bx1 + 28
+            bar_x = bx1 + 30
             bar_y = by1 + 24
-            bar_w = banner_w - 42
+            bar_w = banner_w - 46
             bar_h = 3
             cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (40, 50, 60), -1)
             fill_w = int(bar_w * np.clip(1.0 - (discrepancy_norm / 0.10), 0.0, 1.0))
@@ -324,16 +360,14 @@ class LocalVisualizer:
                 cv2.rectangle(frame, (bar_x, bar_y), (bar_x + fill_w, bar_y + bar_h), PALETTE["neon_green"], -1)
 
         elif phase == ExecutionPhase.ADAPTING or episode_report is not None:
-            cv2.rectangle(frame, (bx1, by1), (bx2, by2), PALETTE["neon_violet"], 1)
-            cv2.circle(frame, (bx1 + 16, by1 + 16), 5, PALETTE["neon_violet"], -1, cv2.LINE_AA)
+            cv2.circle(frame, (bx1 + 18, by1 + 16), 5, PALETTE["neon_violet"], -1, cv2.LINE_AA)
             rew = episode_report.episode_reward if episode_report else 0.0
-            msg = f"[3/3] RESIDUAL ADAPTED ({rew:+.2f} R)"
-            cv2.putText(frame, msg, (bx1 + 28, by1 + 21), cv2.FONT_HERSHEY_SIMPLEX, 0.36, PALETTE["neon_violet"], 1, cv2.LINE_AA)
+            msg = f"Adapted  -  {rew:+.2f} reward"
+            cv2.putText(frame, msg, (bx1 + 30, by1 + 21), cv2.FONT_HERSHEY_SIMPLEX, 0.36, PALETTE["neon_violet"], 1, cv2.LINE_AA)
         else:
-            cv2.rectangle(frame, (bx1, by1), (bx2, by2), PALETTE["glass_border"], 1)
-            cv2.circle(frame, (bx1 + 16, by1 + 16), 3, (120, 130, 145), -1, cv2.LINE_AA)
-            msg = "STANDBY  •  PRESS 'i' OR TALK ('v')"
-            cv2.putText(frame, msg, (bx1 + 28, by1 + 21), cv2.FONT_HERSHEY_SIMPLEX, 0.36, PALETTE["text_dim"], 1, cv2.LINE_AA)
+            cv2.circle(frame, (bx1 + 18, by1 + 16), 3, PALETTE["text_dim"], -1, cv2.LINE_AA)
+            msg = "Standby - press 'i' or talk ('v')"
+            cv2.putText(frame, msg, (bx1 + 30, by1 + 21), cv2.FONT_HERSHEY_SIMPLEX, 0.36, PALETTE["text_dim"], 1, cv2.LINE_AA)
 
     def draw_coadaptation_panel(
         self,
@@ -354,13 +388,9 @@ class LocalVisualizer:
         px2 = px1 + panel_w
         py2 = py1 + panel_h
 
-        # Fast ROI frosted glass blending
-        sub_overlay = frame[py1:py2, px1:px2].copy()
-        cv2.rectangle(sub_overlay, (0, 0), (panel_w, panel_h), PALETTE["dark_glass_bg"], -1)
-        cv2.addWeighted(sub_overlay, 0.90, frame[py1:py2, px1:px2], 0.10, 0, frame[py1:py2, px1:px2])
-        cv2.rectangle(frame, (px1, py1), (px2, py2), PALETTE["cyan_electric"], 1)
+        self._glass_panel(frame, px1, py1, px2, py2, alpha=0.86, radius=16, border_color=PALETTE["cyan_electric"])
 
-        cv2.putText(frame, "CO-ADAPTATION BENCHMARK", (px1 + 12, py1 + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.40, PALETTE["cyan_electric"], 1, cv2.LINE_AA)
+        cv2.putText(frame, "Co-Adaptation", (px1 + 14, py1 + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.42, PALETTE["cyan_electric"], 1, cv2.LINE_AA)
 
         if not benchmark_summary or benchmark_summary.get("total_trials", 0) == 0:
             cv2.putText(frame, "No trials recorded yet.", (px1 + 12, py1 + 55), cv2.FONT_HERSHEY_SIMPLEX, 0.36, PALETTE["text_dim"], 1, cv2.LINE_AA)
@@ -489,78 +519,153 @@ class LocalVisualizer:
         recorded_frames: int = 0,
         robot_connected: bool = True
     ) -> None:
-        """Render cyber-sleek frosted glass telemetry dock tucked strictly along the right edge."""
+        """Render the status HUD: a minimal glance card by default, or the full
+        telemetry dock when expanded via 'h'."""
+        if self.show_telemetry_detail:
+            self._draw_telemetry_expanded(
+                frame=frame, fps=fps, tracker_name=tracker_name, workflow_phase=workflow_phase,
+                parsed_intent=parsed_intent, voice_status=voice_status, latency_ms=latency_ms,
+                poses=poses, gripper_cmd=gripper_cmd, reward_score=reward_score,
+                discrepancy_norm=discrepancy_norm, adaptation_active=adaptation_active,
+                is_recording=is_recording, recorded_frames=recorded_frames, robot_connected=robot_connected,
+            )
+        else:
+            self._draw_telemetry_compact(
+                frame=frame, fps=fps, latency_ms=latency_ms, workflow_phase=workflow_phase,
+                parsed_intent=parsed_intent, poses=poses, is_recording=is_recording,
+                recorded_frames=recorded_frames,
+            )
+
+    def _draw_telemetry_compact(
+        self,
+        frame: np.ndarray,
+        fps: float,
+        latency_ms: float,
+        workflow_phase: ExecutionPhase,
+        parsed_intent: Optional[ParsedIntent],
+        poses: Optional[List[HandPose]],
+        is_recording: bool,
+        recorded_frames: int,
+    ) -> None:
+        """Minimal glance card - just health, stage, and target. No walls of text."""
+        h, w = frame.shape[:2]
+        card_w, card_h = 208, 80
+        x1 = w - card_w - 10
+        y1 = 10
+        x2, y2 = x1 + card_w, y1 + card_h
+
+        self._glass_panel(frame, x1, y1, x2, y2, alpha=0.80, radius=14)
+
+        phase_colors = {
+            ExecutionPhase.IDLE: PALETTE["text_dim"],
+            ExecutionPhase.FORESEEING: PALETTE["amber_gold"],
+            ExecutionPhase.WAIT_USER: PALETTE["text_white"],
+            ExecutionPhase.USER_EXECUTING: PALETTE["neon_green"],
+            ExecutionPhase.ADAPTING: PALETTE["neon_violet"],
+        }
+        p_col = phase_colors.get(workflow_phase, PALETTE["text_dim"])
+
+        cv2.circle(frame, (x1 + 16, y1 + 22), 4, p_col, -1, cv2.LINE_AA)
+        stage_label = workflow_phase.value.replace("_", " ").title()
+        cv2.putText(frame, stage_label, (x1 + 28, y1 + 26), cv2.FONT_HERSHEY_SIMPLEX, 0.40, PALETTE["text_white"], 1, cv2.LINE_AA)
+
+        fps_col = PALETTE["neon_green"] if fps >= 20 else PALETTE["amber_gold"]
+        hand_pct = f"{poses[0].confidence*100:.0f}%" if poses else "-"
+        cv2.circle(frame, (x1 + 16, y1 + 44), 3, fps_col, -1, cv2.LINE_AA)
+        cv2.putText(frame, f"{fps:4.1f} fps  -  {latency_ms:3.0f} ms  -  hand {hand_pct}",
+                    (x1 + 26, y1 + 48), cv2.FONT_HERSHEY_SIMPLEX, 0.31, PALETTE["text_dim"], 1, cv2.LINE_AA)
+
+        target_obj = parsed_intent.target_object if parsed_intent and parsed_intent.is_active else None
+        if target_obj:
+            cv2.putText(frame, f"target - {target_obj[:18]}", (x1 + 16, y1 + 66),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.32, PALETTE["amber_gold"], 1, cv2.LINE_AA)
+        elif is_recording:
+            cv2.circle(frame, (x1 + 18, y1 + 62), 3, PALETTE["laser_red"], -1, cv2.LINE_AA)
+            cv2.putText(frame, f"rec - {recorded_frames} frames", (x1 + 26, y1 + 66),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.31, PALETTE["laser_red"], 1, cv2.LINE_AA)
+        else:
+            cv2.putText(frame, "'h' details  -  'i' intent", (x1 + 16, y1 + 66),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.28, PALETTE["text_dim"], 1, cv2.LINE_AA)
+
+    def _draw_telemetry_expanded(
+        self,
+        frame: np.ndarray,
+        fps: float,
+        tracker_name: str,
+        workflow_phase: ExecutionPhase,
+        parsed_intent: Optional[ParsedIntent],
+        voice_status: str,
+        latency_ms: float,
+        poses: Optional[List[HandPose]],
+        gripper_cmd: float,
+        reward_score: float,
+        discrepancy_norm: float,
+        adaptation_active: bool,
+        is_recording: bool,
+        recorded_frames: int,
+        robot_connected: bool,
+    ) -> None:
+        """Full telemetry dock, sized to its content - opt-in detail view (press 'h')."""
         h, w = frame.shape[:2]
 
         dock_w = 225
-        dock_h = h - 20
+        dock_h = 372
         x1 = w - dock_w - 10
         y1 = 10
         x2 = w - 10
         y2 = y1 + dock_h
 
-        # Fast ROI frosted glass blending
-        sub_overlay = frame[y1:y2, x1:x2].copy()
-        cv2.rectangle(sub_overlay, (0, 0), (dock_w, dock_h), PALETTE["dark_glass_bg"], -1)
-        cv2.addWeighted(sub_overlay, 0.84, frame[y1:y2, x1:x2], 0.16, 0, frame[y1:y2, x1:x2])
-        cv2.rectangle(frame, (x1, y1), (x2, y2), PALETTE["glass_border"], 1)
-        
-        # Header Top Accent
-        cv2.line(frame, (x1, y1), (x2, y1), PALETTE["cyan_electric"], 2)
+        self._glass_panel(frame, x1, y1, x2, y2, alpha=0.84, radius=16)
 
         # 1. Title & Status
-        cv2.putText(frame, "PRECOGNITION", (x1 + 10, y1 + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.42, PALETTE["cyan_electric"], 1, cv2.LINE_AA)
-        
+        cv2.putText(frame, "PRECOGNITION", (x1 + 12, y1 + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.42, PALETTE["cyan_electric"], 1, cv2.LINE_AA)
+
         # Status Pill: FPS & Latency
         fps_col = PALETTE["neon_green"] if fps >= 20 else PALETTE["amber_gold"]
-        cv2.circle(frame, (x1 + 14, y1 + 40), 4, fps_col, -1)
-        cv2.putText(frame, f"LIVE {fps:4.1f} FPS | {latency_ms:3.0f}ms", (x1 + 24, y1 + 44), cv2.FONT_HERSHEY_SIMPLEX, 0.34, (240, 245, 255), 1, cv2.LINE_AA)
+        cv2.circle(frame, (x1 + 16, y1 + 42), 4, fps_col, -1)
+        cv2.putText(frame, f"{fps:4.1f} fps  -  {latency_ms:3.0f} ms", (x1 + 26, y1 + 46), cv2.FONT_HERSHEY_SIMPLEX, 0.34, PALETTE["text_white"], 1, cv2.LINE_AA)
 
         # Divider 1
-        cv2.line(frame, (x1 + 10, y1 + 54), (x2 - 10, y1 + 54), (40, 50, 65), 1)
+        cv2.line(frame, (x1 + 12, y1 + 58), (x2 - 12, y1 + 58), (40, 50, 65), 1)
 
         # 2. Stage & Intent
         phase_colors = {
             ExecutionPhase.IDLE: PALETTE["text_dim"],
             ExecutionPhase.FORESEEING: PALETTE["amber_gold"],
-            ExecutionPhase.WAIT_USER: (255, 255, 255),
+            ExecutionPhase.WAIT_USER: PALETTE["text_white"],
             ExecutionPhase.USER_EXECUTING: PALETTE["neon_green"],
             ExecutionPhase.ADAPTING: PALETTE["neon_violet"]
         }
         p_col = phase_colors.get(workflow_phase, PALETTE["text_dim"])
-        cv2.putText(frame, f"STAGE: {workflow_phase.value}", (x1 + 10, y1 + 72), cv2.FONT_HERSHEY_SIMPLEX, 0.35, p_col, 1, cv2.LINE_AA)
+        cv2.putText(frame, f"stage - {workflow_phase.value}", (x1 + 12, y1 + 76), cv2.FONT_HERSHEY_SIMPLEX, 0.35, p_col, 1, cv2.LINE_AA)
 
-        # Intent
         target_obj = parsed_intent.target_object if parsed_intent and parsed_intent.is_active else "standby"
-        cv2.putText(frame, f"TARGET: {target_obj.upper()[:14]}", (x1 + 10, y1 + 90), cv2.FONT_HERSHEY_SIMPLEX, 0.35, PALETTE["amber_gold"], 1, cv2.LINE_AA)
+        cv2.putText(frame, f"target - {target_obj[:16]}", (x1 + 12, y1 + 94), cv2.FONT_HERSHEY_SIMPLEX, 0.35, PALETTE["amber_gold"], 1, cv2.LINE_AA)
 
-        # Voice Push-To-Talk
         v_color = PALETTE["cyan_electric"] if voice_status == "LISTENING" else PALETTE["text_dim"]
-        v_label = "VOICE: LISTENING..." if voice_status == "LISTENING" else "VOICE: TALK ['v']"
-        cv2.putText(frame, v_label, (x1 + 10, y1 + 108), cv2.FONT_HERSHEY_SIMPLEX, 0.33, v_color, 1, cv2.LINE_AA)
+        v_label = "voice - listening..." if voice_status == "LISTENING" else "voice - talk ['v']"
+        cv2.putText(frame, v_label, (x1 + 12, y1 + 112), cv2.FONT_HERSHEY_SIMPLEX, 0.33, v_color, 1, cv2.LINE_AA)
 
         # Divider 2
-        cv2.line(frame, (x1 + 10, y1 + 120), (x2 - 10, y1 + 120), (40, 50, 65), 1)
+        cv2.line(frame, (x1 + 12, y1 + 124), (x2 - 12, y1 + 124), (40, 50, 65), 1)
 
         # 3. Telemetry & Policy Residuals
-        cv2.putText(frame, "◈ RESIDUAL ADAPTATION", (x1 + 10, y1 + 138), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (180, 200, 220), 1, cv2.LINE_AA)
-        
-        adapt_str = "ONLINE PPO ['p']" if adaptation_active else "PAUSED ['p']"
+        cv2.putText(frame, "Residual Adaptation", (x1 + 12, y1 + 142), cv2.FONT_HERSHEY_SIMPLEX, 0.35, PALETTE["text_dim"], 1, cv2.LINE_AA)
+
+        adapt_str = "online ['p']" if adaptation_active else "paused ['p']"
         adapt_col = PALETTE["neon_green"] if adaptation_active else PALETTE["laser_red"]
-        cv2.putText(frame, f"LEARNING: {adapt_str}", (x1 + 10, y1 + 156), cv2.FONT_HERSHEY_SIMPLEX, 0.32, adapt_col, 1, cv2.LINE_AA)
+        cv2.putText(frame, f"learning - {adapt_str}", (x1 + 12, y1 + 160), cv2.FONT_HERSHEY_SIMPLEX, 0.32, adapt_col, 1, cv2.LINE_AA)
 
-        # Step Reward
         r_col = PALETTE["neon_green"] if reward_score > 0.5 else (PALETTE["amber_gold"] if reward_score > 0.0 else PALETTE["laser_red"])
-        cv2.putText(frame, f"REWARD R_t: {reward_score:+0.2f}", (x1 + 10, y1 + 176), cv2.FONT_HERSHEY_SIMPLEX, 0.34, r_col, 1, cv2.LINE_AA)
+        cv2.putText(frame, f"reward - {reward_score:+0.2f}", (x1 + 12, y1 + 180), cv2.FONT_HERSHEY_SIMPLEX, 0.34, r_col, 1, cv2.LINE_AA)
 
-        # Trajectory Discrepancy
-        cv2.putText(frame, f"ERROR D_traj: {discrepancy_norm:.4f}", (x1 + 10, y1 + 196), cv2.FONT_HERSHEY_SIMPLEX, 0.34, (240, 245, 255), 1, cv2.LINE_AA)
+        cv2.putText(frame, f"error - {discrepancy_norm:.4f}", (x1 + 12, y1 + 200), cv2.FONT_HERSHEY_SIMPLEX, 0.34, PALETTE["text_white"], 1, cv2.LINE_AA)
 
         # Gripper Actuator Progress Bar
-        cv2.putText(frame, "GRIPPER:", (x1 + 10, y1 + 218), cv2.FONT_HERSHEY_SIMPLEX, 0.34, PALETTE["text_white"], 1, cv2.LINE_AA)
-        bar_x = x1 + 75
-        bar_y = y1 + 209
-        bar_w = dock_w - 95
+        cv2.putText(frame, "gripper", (x1 + 12, y1 + 222), cv2.FONT_HERSHEY_SIMPLEX, 0.34, PALETTE["text_white"], 1, cv2.LINE_AA)
+        bar_x = x1 + 70
+        bar_y = y1 + 213
+        bar_w = dock_w - 92
         bar_h = 10
         cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (35, 45, 55), -1)
         fill_w = int(bar_w * np.clip(gripper_cmd, 0.0, 1.0))
@@ -569,35 +674,33 @@ class LocalVisualizer:
         cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), PALETTE["glass_border"], 1)
 
         # Divider 3
-        cv2.line(frame, (x1 + 10, y1 + 230), (x2 - 10, y1 + 230), (40, 50, 65), 1)
+        cv2.line(frame, (x1 + 12, y1 + 234), (x2 - 12, y1 + 234), (40, 50, 65), 1)
 
         # 4. Hardware & Vision Sensor Status
-        cv2.putText(frame, "◈ HARDWARE & SENSORS", (x1 + 10, y1 + 248), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (180, 200, 220), 1, cv2.LINE_AA)
+        cv2.putText(frame, "Hardware & Sensors", (x1 + 12, y1 + 252), cv2.FONT_HERSHEY_SIMPLEX, 0.35, PALETTE["text_dim"], 1, cv2.LINE_AA)
 
-        rob_str = "ROBOT: 7-DOF [OK]" if robot_connected else "ROBOT: OFFLINE"
-        cv2.putText(frame, rob_str, (x1 + 10, y1 + 266), cv2.FONT_HERSHEY_SIMPLEX, 0.33, PALETTE["neon_green"] if robot_connected else PALETTE["laser_red"], 1, cv2.LINE_AA)
+        rob_str = "robot - 7-DOF ok" if robot_connected else "robot - offline"
+        cv2.putText(frame, rob_str, (x1 + 12, y1 + 270), cv2.FONT_HERSHEY_SIMPLEX, 0.33, PALETTE["neon_green"] if robot_connected else PALETTE["laser_red"], 1, cv2.LINE_AA)
 
-        # Tracker Name
-        track_disp = "MEDIAPIPE (LIVE)" if "MEDIAPIPE" in tracker_name else "MOCK SYNTHETIC"
-        cv2.putText(frame, f"TRACK: {track_disp}", (x1 + 10, y1 + 284), cv2.FONT_HERSHEY_SIMPLEX, 0.32, PALETTE["cyan_electric"], 1, cv2.LINE_AA)
+        track_disp = "mediapipe (live)" if "MEDIAPIPE" in tracker_name else "mock synthetic"
+        cv2.putText(frame, f"track - {track_disp}", (x1 + 12, y1 + 288), cv2.FONT_HERSHEY_SIMPLEX, 0.32, PALETTE["cyan_electric"], 1, cv2.LINE_AA)
 
-        # Hand Pose Status
         if poses and len(poses) > 0:
             p = poses[0]
-            cv2.putText(frame, f"HAND: TRACKED ({p.confidence*100:.0f}%)", (x1 + 10, y1 + 304), cv2.FONT_HERSHEY_SIMPLEX, 0.33, PALETTE["neon_green"], 1, cv2.LINE_AA)
-            cv2.putText(frame, f"XYZ: [{p.keypoints_3d[0,0]:+.2f},{p.keypoints_3d[0,1]:+.2f},{p.keypoints_3d[0,2]:+.2f}]", 
-                        (x1 + 10, y1 + 322), cv2.FONT_HERSHEY_SIMPLEX, 0.31, PALETTE["text_white"], 1, cv2.LINE_AA)
+            cv2.putText(frame, f"hand - tracked ({p.confidence*100:.0f}%)", (x1 + 12, y1 + 308), cv2.FONT_HERSHEY_SIMPLEX, 0.33, PALETTE["neon_green"], 1, cv2.LINE_AA)
+            cv2.putText(frame, f"xyz - [{p.keypoints_3d[0,0]:+.2f},{p.keypoints_3d[0,1]:+.2f},{p.keypoints_3d[0,2]:+.2f}]",
+                        (x1 + 12, y1 + 326), cv2.FONT_HERSHEY_SIMPLEX, 0.31, PALETTE["text_white"], 1, cv2.LINE_AA)
         else:
-            cv2.putText(frame, "HAND: SEARCHING...", (x1 + 10, y1 + 304), cv2.FONT_HERSHEY_SIMPLEX, 0.33, PALETTE["amber_gold"], 1, cv2.LINE_AA)
-            cv2.putText(frame, "Raise hand to camera", (x1 + 10, y1 + 322), cv2.FONT_HERSHEY_SIMPLEX, 0.30, PALETTE["text_dim"], 1, cv2.LINE_AA)
+            cv2.putText(frame, "hand - searching...", (x1 + 12, y1 + 308), cv2.FONT_HERSHEY_SIMPLEX, 0.33, PALETTE["amber_gold"], 1, cv2.LINE_AA)
+            cv2.putText(frame, "raise hand to camera", (x1 + 12, y1 + 326), cv2.FONT_HERSHEY_SIMPLEX, 0.30, PALETTE["text_dim"], 1, cv2.LINE_AA)
 
-        # Recording Status
         if is_recording:
-            cv2.putText(frame, f"● REC [{recorded_frames}f]", (x1 + 10, y1 + 346), cv2.FONT_HERSHEY_SIMPLEX, 0.34, PALETTE["laser_red"], 1, cv2.LINE_AA)
+            cv2.circle(frame, (x1 + 15, y1 + 342), 3, PALETTE["laser_red"], -1, cv2.LINE_AA)
+            cv2.putText(frame, f"rec [{recorded_frames}f]", (x1 + 24, y1 + 346), cv2.FONT_HERSHEY_SIMPLEX, 0.34, PALETTE["laser_red"], 1, cv2.LINE_AA)
 
         # Bottom Shortcut Hints
-        cv2.line(frame, (x1 + 10, y2 - 32), (x2 - 10, y2 - 32), (40, 50, 65), 1)
-        cv2.putText(frame, "'c':Step | 'i':Intent | 'm':Stats", (x1 + 8, y2 - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.30, PALETTE["text_dim"], 1, cv2.LINE_AA)
+        cv2.line(frame, (x1 + 12, y1 + 350), (x2 - 12, y1 + 350), (40, 50, 65), 1)
+        cv2.putText(frame, "'h':Collapse | 'c':Step | 'm':Stats", (x1 + 10, y1 + 366), cv2.FONT_HERSHEY_SIMPLEX, 0.29, PALETTE["text_dim"], 1, cv2.LINE_AA)
 
 
 class SyntheticCamera:
@@ -681,7 +784,11 @@ class LocalClientRunner:
             self.transcriber: AudioTranscriberABC = MockTranscriber()
         
         self.intent_parser: IntentParserABC = MockLLMIntentParser()
-        self.workflow = WorkflowController(foresee_steps=60, wait_user_timeout=2.0, auto_advance=True)
+        self.speaker: SpeechSynthesizerABC = SystemSpeaker()
+        self.workflow = WorkflowController(
+            foresee_steps=60, wait_user_timeout=2.0, auto_advance=True,
+            speaker=self.speaker, voice_guidance_enabled=True
+        )
         self.robot = MockRobotHardware(dof=7)
         self.checkpoint_manager = PolicyCheckpointManager()
         self.benchmark = CoAdaptationBenchmark()
@@ -747,6 +854,13 @@ class LocalClientRunner:
                 self.workflow.trigger_intent(self.current_parsed_intent.target_object if self.current_parsed_intent.is_active else "none")
                 logger.info(f"Voice Mode Transcribed: '{transcript}' -> Target: {self.current_parsed_intent.target_object}")
             self.voice_status = "IDLE"
+
+    def toggle_voice_guidance(self) -> None:
+        """Toggle spoken workflow guidance (announcements on each phase transition)."""
+        self.workflow.voice_guidance_enabled = not self.workflow.voice_guidance_enabled
+        if not self.workflow.voice_guidance_enabled:
+            self.speaker.stop()
+        logger.info(f"Voice Guidance: {'ON' if self.workflow.voice_guidance_enabled else 'MUTED'}")
 
     def cycle_intent(self) -> None:
         """Cycle through preset natural language intent prompts."""
@@ -1181,6 +1295,10 @@ class LocalClientRunner:
                     self.toggle_voice_mode()
                 elif key == ord("m"): # Toggle Co-Adaptation Benchmark Panel
                     self.visualizer.show_analytics_panel = not self.visualizer.show_analytics_panel
+                elif key == ord("h"): # Toggle expanded telemetry detail
+                    self.visualizer.show_telemetry_detail = not self.visualizer.show_telemetry_detail
+                elif key == ord("g"): # Toggle spoken workflow guidance
+                    self.toggle_voice_guidance()
                 elif key in (ord("k"), 19): # 'k' or Ctrl+S: Save checkpoint
                     self.save_checkpoint()
                 elif key in (ord("l"), 12): # 'l' or Ctrl+L: Load checkpoint
@@ -1218,6 +1336,7 @@ class LocalClientRunner:
             if self.cap:
                 self.cap.release()
             self.robot.disconnect()
+            self.speaker.stop()
             cv2.destroyAllWindows()
             await self.ws_client.close()
 

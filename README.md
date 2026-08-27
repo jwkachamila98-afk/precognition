@@ -174,11 +174,13 @@ When running the visualizer HUD (`apps/local_client.py` or `apps/run_demo.py`), 
 | Key | Function | Description |
 |:---|:---|:---|
 | **`ENTER`** or **`c`** | **Step Workflow Phase** | Advance `FORESEEING` $\to$ `WAIT_USER` $\to$ `USER_EXECUTING` $\to$ `ADAPTING` |
+| **`h`** | **Expand/Collapse Telemetry** | Toggle between the minimal glance card and the full telemetry dock |
 | **`m`** | **Co-Adaptation Panel** | Toggle multi-trial learning curve overlay & error reduction % |
 | **`k`** / `Ctrl+S` | **Save Checkpoint** | Persist learned adaptation weights under `config/profiles/<user_id>/` |
 | **`l`** / `Ctrl+L` | **Load Checkpoint** | Restore saved policy weights from disk |
 | **`x`** / `Ctrl+R` | **Reset Baseline** | Reset adaptation residual weights to zero baseline |
 | **`v`** / `SPACE` | **Voice Push-To-Talk** | Toggle voice speech-to-text listening / transcribing |
+| **`g`** | **Voice Guidance** | Mute/unmute spoken workflow instructions on each phase transition |
 | **`i`** | **Cycle Intent Prompt** | Cycle target object intent (`remote control`, `coffee cup`, `water bottle`) |
 | **`p`** | **Toggle Adaptation** | Enable / pause online residual PPO learning loop |
 | **`r`** | **Toggle Recording** | Save MP4 webcam video & JSONL telemetry dataset |
