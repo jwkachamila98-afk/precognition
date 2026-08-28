@@ -213,23 +213,71 @@ def _assert_in_viewport(sim, points, step):
     assert screen[:, 1].min() >= 0 and screen[:, 1].max() <= sim.height - 1, f"clipped in y at step {step}"
 
 
-def test_whole_plan_stays_inside_the_viewport(staged_sim):
-    """Neither the hand NOR the object may be clipped, at any step. The object
-    matters as much as the hand: it is what gets lifted out of frame."""
-    sim, traj, _ = staged_sim
+def _object_corners(sim, step):
     half = sim.object_size.astype(np.float32) * 0.5
     corners = np.array([[a, b, c] for a in (-1, 1) for b in (-1, 1) for c in (-1, 1)],
                        dtype=np.float32) * half
+    return sim._object_path_lab[step] + corners
+
+
+def test_object_never_leaves_the_viewport(staged_sim):
+    """The manipuland must stay in frame for the whole plan, including its lift.
+
+    The hand is deliberately NOT asserted here: the camera is locked, so a plan
+    whose approach starts far from the bench enters from off-screen by design.
+    The object is staged on the pedestal and has nowhere else to be.
+    """
+    sim, traj, _ = staged_sim
     for step in range(len(traj.waypoints)):
+        _assert_in_viewport(sim, _object_corners(sim, step), step)
+
+
+def test_the_hand_is_in_frame_for_the_grasp_and_the_lift(staged_sim):
+    """Whatever the approach does, the business end must be visible."""
+    sim, traj, _ = staged_sim
+    grasp = sim._contact_step()
+    for step in range(grasp, len(traj.waypoints)):
         _assert_in_viewport(sim, sim._hand_paths_lab[step], step)
-        _assert_in_viewport(sim, sim._object_path_lab[step] + corners, step)
 
 
 def test_hand_is_large_enough_to_read(staged_sim):
-    """Framing must keep the hand a meaningful fraction of the viewport at the
-    grasp, or the reenactment is unreadable however correct it is."""
+    """The locked camera must still leave the hand a meaningful fraction of the
+    viewport at the grasp, or the reenactment is unreadable however correct."""
     sim, _, _ = staged_sim
-    assert sim.hand_screen_height(sim._contact_step()) > 0.22 * sim.height
+    assert sim.hand_screen_height(sim._contact_step()) > 0.18 * sim.height
+
+
+def test_camera_is_locked_across_different_objects_and_plans():
+    """The whole point of the locked shot: two different manipulands with two
+    different plans must be filmed from exactly the same pose."""
+    poses = []
+    for size in [(0.05, 0.05, 0.05), (0.39, 0.39, 0.20)]:
+        bbox = BoundingBox3D(label="x", center=np.array([0.03, 0.02, 0.55], np.float32),
+                             size=np.array(size, dtype=np.float32))
+        traj = MockTrajectoryDiffusion().generate_foreseen_rollout(
+            start_hand_pose=None, target_object=bbox,
+            affordance_map=MockAffordanceExtractor().extract_affordance(bbox, "pick"),
+            intent="pick", num_steps=60)
+        sim = LabSimulator(width=192, height=144)
+        assert sim.prepare(traj, bbox, sprite=None)
+        poses.append((tuple(np.round(sim.camera.position, 5)),
+                      tuple(np.round(sim.camera.target, 5)),
+                      round(sim.camera.fov_y_deg, 5)))
+    assert poses[0] == poses[1], f"camera moved between plans: {poses}"
+
+
+def test_the_object_visibly_rises_when_it_is_picked_up(staged_sim):
+    """A lift the viewer cannot see is a lift that did not happen.
+
+    Regression from a live run reported as 'it sat there and never moved': the
+    object did rise, but only ~37 px, only over the last third of the rollout,
+    and with no grasp to cue it.
+    """
+    sim, traj, _ = staged_sim
+    top = sim.camera.project(sim._object_path_lab[0][None, :])[0][0, 1]
+    bottom = sim.camera.project(sim._object_path_lab[-1][None, :])[0][0, 1]
+    rise_px = float(top - bottom)
+    assert rise_px > 0.15 * sim.height, f"object rose only {rise_px:.0f}px"
 
 
 def test_render_produces_a_lit_image(staged_sim):
@@ -337,3 +385,87 @@ def test_oversized_detection_still_frames_readably():
                        dtype=np.float32) * half
     for step in (0, sim._contact_step(), len(traj.waypoints) - 1):
         _assert_in_viewport(sim, sim._object_path_lab[step] + corners, step)
+
+
+# ------------------------------------------------------- the grasp must grasp
+
+def test_the_thumb_opposes_the_fingers():
+    """Without opposition the hand can rest on an object but never hold one.
+
+    Reported live as 'the ghost hand must pick up the object as well'. In the
+    canonical pose every digit extends along the same axis, so the thumb was
+    just a shorter finger in the fingers' own plane.
+    """
+    gen = MockTrajectoryDiffusion()
+    closed = gen._generate_hand_keypoints_3d(
+        np.zeros(3, np.float32), gen._rot_grasp, gen._flex_closed)
+    opened = gen._generate_hand_keypoints_3d(
+        np.zeros(3, np.float32), gen._rot_grasp, 0.0)
+
+    def gap(k):
+        return float(np.linalg.norm(k[4] - k[[8, 12]].mean(axis=0)))
+
+    assert gap(closed) < gap(opened), "closing the hand must bring thumb and fingers together"
+    assert gap(closed) < 0.07, f"thumb never reaches the fingers (gap {gap(closed):.3f} m)"
+
+
+def test_closed_hand_does_not_splay_wider_than_a_palm():
+    """At the grasp the fingertips must span roughly a hand, not a dinner plate.
+
+    The fan that stops the fingers collapsing into one slab peaks exactly at
+    contact if it is not damped: tips ended up 13.8 cm apart around a 4.4 cm
+    object, closing on empty air either side of it.
+    """
+    gen = MockTrajectoryDiffusion()
+    closed = gen._generate_hand_keypoints_3d(
+        np.zeros(3, np.float32), gen._rot_grasp, gen._flex_closed)
+    palm = float(np.linalg.norm(closed[9] - closed[0]))
+    spread = float(np.linalg.norm(closed[[4, 8, 12, 16, 20]].ptp(axis=0)))
+    assert spread < 1.4 * palm, \
+        f"fingertips span {spread*100:.1f} cm on a {palm*100:.1f} cm palm"
+
+
+@pytest.mark.parametrize("detector_size", [
+    (0.11, 0.12, 0.11),      # a plausible cup
+    (0.39, 0.39, 0.20),      # what the detector actually reported for one
+    (0.15, 0.055, 0.03),     # a remote
+])
+def test_grasp_lands_on_the_object_as_staged(detector_size):
+    """The planner sizes its approach from the detector's raw extent, but the lab
+    stages a scale-corrected object. Un-reconciled, the hand closes in the air
+    above a smaller object."""
+    bbox = BoundingBox3D(label="x", center=np.array([0.03, 0.02, 0.55], np.float32),
+                         size=np.array(detector_size, dtype=np.float32))
+    traj = MockTrajectoryDiffusion().generate_foreseen_rollout(
+        start_hand_pose=None, target_object=bbox,
+        affordance_map=MockAffordanceExtractor().extract_affordance(bbox, "pick"),
+        intent="pick", num_steps=60)
+    sim = LabSimulator(width=192, height=144)
+    assert sim.prepare(traj, bbox, sprite=None)
+
+    grasp = sim._contact_step()
+    tips = sim._hand_paths_lab[grasp][[4, 8, 12, 16, 20]]
+    pinch = 0.5 * (tips[0] + tips[[1, 2]].mean(axis=0))
+    reach = float(np.linalg.norm(pinch - sim._object_path_lab[grasp]))
+    assert reach < 0.6 * float(sim.object_size.max()), \
+        f"grasp closed {reach*100:.1f} cm from the object it is meant to be holding"
+
+
+def test_the_object_travels_with_the_hand_once_grasped():
+    """After contact the object and hand must rise together, not drift apart."""
+    bbox = BoundingBox3D(label="cup", center=np.array([0.03, 0.02, 0.55], np.float32),
+                         size=np.array([0.11, 0.12, 0.11], dtype=np.float32))
+    traj = MockTrajectoryDiffusion().generate_foreseen_rollout(
+        start_hand_pose=None, target_object=bbox,
+        affordance_map=MockAffordanceExtractor().extract_affordance(bbox, "pick"),
+        intent="pick", num_steps=60)
+    sim = LabSimulator(width=192, height=144)
+    assert sim.prepare(traj, bbox, sprite=None)
+
+    grasp = sim._contact_step()
+    last = len(traj.waypoints) - 1
+    hand_rise = float(sim._hand_paths_lab[last][0, 1] - sim._hand_paths_lab[grasp][0, 1])
+    obj_rise = float(sim._object_path_lab[last][1] - sim._object_path_lab[grasp][1])
+    assert obj_rise > 0.05, f"object barely lifted ({obj_rise*100:.1f} cm)"
+    assert abs(hand_rise - obj_rise) < 0.02, \
+        f"hand rose {hand_rise*100:.1f} cm but object rose {obj_rise*100:.1f} cm - they separated"

@@ -55,6 +55,20 @@ _REFERENCE_PALM_M = 0.092
 _CAM_AZ_DEG = 17.0
 _CAM_EL_DEG = 21.0
 
+# The lab camera is LOCKED: one pose, identical for every demo, regardless of
+# object or plan. Framing the shot adaptively made each reenactment look like a
+# different scene - the viewer had to re-read the geometry every time before
+# they could see what the hand was doing. A fixed pose means the only thing that
+# changes between runs is the thing being demonstrated.
+#
+# It is chosen to hold the whole staged action: the manipuland (bounded to at
+# most ~20 cm by the hand-size guard), the wrist at full lift, and enough bench
+# and backdrop to place them. A very small object underfills it rather than
+# pulling the camera in, which is the deliberate trade for consistency.
+_CAM_DISTANCE_M = 0.87
+_CAM_TARGET_HEIGHT_M = 0.20      # above the staging pedestal
+_CAM_FOV_Y_DEG = 42.0
+
 
 def _view_direction() -> np.ndarray:
     """Unit vector from the staging area toward the lab camera."""
@@ -64,6 +78,9 @@ def _view_direction() -> np.ndarray:
         math.sin(el),
         math.cos(az) * math.cos(el),
     ], dtype=np.float32)
+
+# Thumb, index, middle, ring, pinky tips in the 21-joint layout.
+_FINGERTIPS = [4, 8, 12, 16, 20]
 
 _HOLOGRAM_COLOR = np.array([1.00, 0.70, 0.10], dtype=np.float32)   # BGR: electric cyan
 _HOLOGRAM_MATERIAL = Material(specular=0.32, shininess=42.0, emissive=0.85)
@@ -256,6 +273,7 @@ class LabSimulator:
         rest_y = float(anchor_lab[1])
         self._object_path_lab[:, 1] += rest_y - float(self._object_path_lab[0, 1])
 
+        self._seat_grasp_on_the_staged_object()
         self.camera = self._fit_camera()
         self._ensure_static_background()
         self._ready = True
@@ -270,6 +288,27 @@ class LabSimulator:
         )
         return True
 
+    def _seat_grasp_on_the_staged_object(self) -> None:
+        """Re-seat the hand so its grasp lands on the object as STAGED.
+
+        The planner sizes its approach from the detector's raw extent, but the
+        lab stages the object at a corrected scale (see
+        _object_longest_dimension). When those disagree - which is most of the
+        time, since the detector's extent comes from non-metric depth - the hand
+        closes in the air above a smaller object.
+
+        Shifting the whole hand path by a constant offset preserves the plan
+        exactly: the hand's motion relative to the object, and the object's own
+        lift, are both unchanged. Only where the grasp sits is corrected.
+        """
+        grasp = self._contact_step()
+        tips = self._hand_paths_lab[grasp][_FINGERTIPS]
+        pinch = 0.5 * (tips[0] + tips[[1, 2]].mean(axis=0))
+        # Grip the upper third of the object, where a hand actually takes a cup.
+        target = self._object_path_lab[grasp] + np.array(
+            [0.0, float(self.object_size[1]) * 0.18, 0.0], dtype=np.float32)
+        self._hand_paths_lab += (target - pinch)[None, None, :]
+
     def invalidate(self) -> None:
         """Drop the staged trajectory so the next demo re-stages from scratch."""
         self._ready = False
@@ -282,58 +321,24 @@ class LabSimulator:
         return self._ready and self.camera is not None
 
     def _fit_camera(self) -> Camera:
-        """Frame the reenactment by an explicit on-screen criterion.
+        """The locked lab camera - the same pose for every reenactment.
 
-        Two competing requirements, resolved by taking whichever distance is
-        larger:
-          * the HERO shot - hand and object at the moment of contact - must fill
-            enough of the frame to read as a hand (under roughly a third of
-            frame height it turns to mush);
-          * nothing in the whole trajectory may leave the frame.
-        A plain bounding-sphere fit satisfies only the second and produces a
-        distant, unreadable wide shot whenever the plan starts far from the
-        bench.
+        Deliberately ignores the trajectory. An earlier version fitted the shot
+        to each plan's extent, which kept everything perfectly in frame but made
+        no two demos look alike: the camera crept in and out between runs and a
+        large manipuland pushed it back far enough to shrink the hand past
+        legibility. Consistency is worth more here than optimal fill.
+
+        The consequence to be aware of: a plan whose approach begins far from the
+        bench (the user's real hand across the room, say) now starts off-screen
+        and flies in. That reads fine - it is an entrance, not a glitch - but it
+        does mean the viewport no longer guarantees the whole path is visible.
         """
-        hand_path = self._hand_paths_lab.reshape(-1, 3)
-        # The object's full extent, swept along its path: what must stay in shot.
-        half = self.object_size.astype(np.float32) * 0.5
-        corners = np.array([[sx, sy, sz] for sx in (-1, 1) for sy in (-1, 1) for sz in (-1, 1)],
-                           dtype=np.float32) * half
-        obj_extent = (self._object_path_lab[:, None, :] + corners[None, :, :]).reshape(-1, 3)
-        cloud = np.concatenate([hand_path, obj_extent]).astype(np.float32)
-
-        lo, hi = cloud.min(axis=0), cloud.max(axis=0)
-        centre = (lo + hi) * 0.5
-        # Bias the framing toward the staging area so the bench stays in shot
-        # even when the plan starts with the hand far outside the cell.
-        centre = 0.58 * centre + 0.42 * (LS.OBJECT_ANCHOR + np.array([0.0, 0.07, 0.0], np.float32))
-        centre[1] = float(np.clip(centre[1], LS.BENCH_TOP_Y + 0.06, LS.BENCH_TOP_Y + 0.28))
-
-        # The hero sphere covers the hand and the CONTACT REGION, not the whole
-        # object. Including a wide object's full extent here pushes the camera
-        # back to fit geometry nobody needs to read, shrinking the hand with it -
-        # the object may run past the ideal hero framing so long as r_all keeps
-        # it inside the viewport.
-        grasp = self._contact_step()
-        hero = np.concatenate([self._hand_paths_lab[grasp],
-                               self._object_path_lab[grasp][None, :]])
-        r_hero = float(np.max(np.linalg.norm(hero - centre, axis=1)))
-        r_all = float(np.max(np.linalg.norm(cloud - centre, axis=1)))
-
-        fov_y = 42.0
-        half = math.tan(math.radians(fov_y) * 0.5)
-        # Fractions of the half-frame height each sphere may occupy. The
-        # all-inclusive one stays under 1.0 so the plan keeps a visible margin
-        # rather than grazing the viewport edge at its extremes.
-        dist = max(r_hero / (half * 0.76), r_all / (half * 0.93))
-        dist = float(np.clip(dist, 0.52, 1.60))
-
-        position = centre + _view_direction() * dist
-        position[1] = float(max(position[1], LS.BENCH_TOP_Y + 0.22))
-        position[2] = float(max(position[2], LS.BENCH_FRONT_Z + 0.10))
-
-        return Camera(position=position, target=centre, up=(0.0, 1.0, 0.0),
-                      fov_y_deg=fov_y, width=self.width, height=self.height,
+        target = LS.OBJECT_ANCHOR + np.array([0.0, _CAM_TARGET_HEIGHT_M, 0.0],
+                                             dtype=np.float32)
+        position = target + _view_direction() * _CAM_DISTANCE_M
+        return Camera(position=position, target=target, up=(0.0, 1.0, 0.0),
+                      fov_y_deg=_CAM_FOV_Y_DEG, width=self.width, height=self.height,
                       near=0.04, far=40.0)
 
     def _contact_step(self) -> int:

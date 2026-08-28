@@ -57,10 +57,24 @@ class MockTrajectoryDiffusion(TrajectoryGeneratorABC):
         # Yaw is not cosmetic: at zero yaw the hand closes edge-on to the
         # viewer and every finger hides behind the one in front of it.
         self._rot_grasp = np.array([2.85, 0.60, 0.12], dtype=np.float32)
+
+        # Thumb opposition. In the canonical pose every digit extends along
+        # local -Y, so the thumb is just a shorter finger lying in the same
+        # plane as the others - it can approach an object but can never meet
+        # them around it, which is why the hand could only ever rest on the
+        # manipuland. A real thumb's metacarpal is rotated across the palm; this
+        # rotates the thumb's whole chain about the palm normal so its extension
+        # and curl carry it toward the fingertips it has to oppose.
+        _TH = math.radians(-62.0)
+        self._thumb_oppose = np.array([
+            [math.cos(_TH), -math.sin(_TH), 0.0],
+            [math.sin(_TH), math.cos(_TH), 0.0],
+            [0.0, 0.0, 1.0],
+        ], dtype=np.float32)
         # 0.85 curled the fingers past a right angle into a closed fist, which
-        # cannot enclose anything; 0.45 is a power grasp that still shows daylight
-        # between the fingers and the object.
-        self._flex_closed = 0.45
+        # cannot enclose anything; 0.55 closes firmly on the object while still
+        # showing daylight between the fingers.
+        self._flex_closed = 0.55
 
     def _generate_hand_keypoints_3d(
         self,
@@ -86,11 +100,30 @@ class MockTrajectoryDiffusion(TrajectoryGeneratorABC):
             prev = root
             joint_idx += 1
 
-            flex = finger_flex * (1.1 if f_idx in (0, 1) else 1.0)
+            is_thumb = f_idx == 0
+            flex = finger_flex * (1.35 if is_thumb else 1.0)
             # Abduction: fingers fan outward from the palm's midline as they
             # curl. Without it every finger sweeps the same plane and the whole
             # hand collapses into one slab the moment it closes.
-            spread = 0.30 * float(self._finger_roots[f_idx][0])
+            #
+            # The thumb is the exception and it is what makes a grasp a grasp:
+            # it curls ACROSS the palm toward the other fingertips rather than
+            # away from them. With every digit fanning the same way the hand can
+            # only ever rest on an object, never hold one - which is exactly how
+            # the reenactment read.
+            # Abduction is damped as the hand closes. The fan is what stops
+            # every finger sweeping one plane and collapsing into a slab, but
+            # left undamped it peaks exactly at contact - the fingers closed
+            # around 14 cm of empty air either side of a 4 cm object. This does
+            # not reverse the fan, it just keeps it from widening into the grip.
+            flex_frac = float(np.clip(finger_flex / max(self._flex_closed, 1e-6), 0.0, 1.0))
+            if is_thumb:
+                # Opposition, conversely, grows as the hand closes.
+                spread = (0.95 * abs(float(self._finger_roots[f_idx][0]))
+                          * (0.25 + 0.75 * flex_frac))
+            else:
+                spread = (0.34 * float(self._finger_roots[f_idx][0])
+                          * (1.0 - 0.80 * flex_frac))
             for seg_i, length in enumerate(self._seg_lens):
                 cur_flex = flex * (seg_i + 1) * 0.8
                 # Finger extension & curl in local frame
@@ -99,6 +132,8 @@ class MockTrajectoryDiffusion(TrajectoryGeneratorABC):
                     -length * math.cos(cur_flex),
                     length * math.sin(cur_flex)
                 ], dtype=np.float32)
+                if is_thumb:
+                    local_dir = self._thumb_oppose @ local_dir
                 nxt = prev + R @ local_dir
                 kpts[joint_idx] = nxt
                 prev = nxt
@@ -119,7 +154,12 @@ class MockTrajectoryDiffusion(TrajectoryGeneratorABC):
         """
         probe = self._generate_hand_keypoints_3d(
             np.zeros(3, dtype=np.float32), self._rot_grasp, self._flex_closed)
-        tip_offset = probe[self._fingertips].mean(axis=0) - probe[0]
+        # The grasp centre is where the THUMB opposes the fingers, not the
+        # centroid of all five tips. With the thumb crossing the palm the plain
+        # centroid sits off to one side, which puts the object beside the hand
+        # instead of between the thumb and fingers.
+        pinch = 0.5 * (probe[4] + probe[[8, 12]].mean(axis=0))
+        tip_offset = pinch - probe[0]
         return (obj_center + approach_offset - tip_offset).astype(np.float32)
 
     def _project_2d(self, keypoints_3d: np.ndarray) -> np.ndarray:
@@ -178,8 +218,10 @@ class MockTrajectoryDiffusion(TrajectoryGeneratorABC):
         p_grasp = self._solve_grasp_wrist(obj_center, approach_offset) + bias
         rot_grasp = self._rot_grasp.copy()
 
-        # Post-grasp lifted position (-Y is up in the camera frame)
-        p_lift = p_grasp + np.array([0.0, -0.09, 0.02], dtype=np.float32)
+        # Post-grasp lifted position (-Y is up in the camera frame). 9 cm was
+        # under 40 px on screen and easy to miss entirely; 14 cm reads clearly
+        # against the locked camera without pushing the wrist out of frame.
+        p_lift = p_grasp + np.array([0.0, -0.14, 0.02], dtype=np.float32)
 
         waypoints: List[ForeseenWaypoint] = []
         dt = 2.0 / num_steps # 2.0 seconds total
@@ -188,12 +230,16 @@ class MockTrajectoryDiffusion(TrajectoryGeneratorABC):
             t_frac = (step - 1) / float(num_steps - 1) # 0.0 to 1.0
             time_offset = step * dt
 
-            # Three kinematic phases:
-            # 1. Approach & Pre-Grasp (0.0 to 0.40)
-            # 2. Enclosure & Contact (0.40 to 0.65)
-            # 3. Lift & Manipulation (0.65 to 1.0)
-            if t_frac <= 0.40:
-                sub_t = minimum_jerk_step(t_frac / 0.40)
+            # Three kinematic phases. The split is weighted toward contact and
+            # lift rather than approach: the approach carries no information
+            # about the grasp, and at the frame rates this renders at, a lift
+            # squeezed into the last third of the rollout goes by in a handful
+            # of frames and reads as the object never having moved.
+            # 1. Approach & Pre-Grasp (0.0 to 0.28)
+            # 2. Enclosure & Contact (0.28 to 0.50)
+            # 3. Lift & Manipulation (0.50 to 1.0)
+            if t_frac <= 0.28:
+                sub_t = minimum_jerk_step(t_frac / 0.28)
                 wrist_pos = p_start + sub_t * (p_grasp - p_start)
                 wrist_rot = rot_start + sub_t * (rot_grasp - rot_start)
                 finger_flex = 0.2 * sub_t # Fingers open wide
@@ -201,8 +247,8 @@ class MockTrajectoryDiffusion(TrajectoryGeneratorABC):
                 contact_val = 0.0
                 gripper = 0.0
 
-            elif t_frac <= 0.65:
-                sub_t = minimum_jerk_step((t_frac - 0.40) / 0.25)
+            elif t_frac <= 0.50:
+                sub_t = minimum_jerk_step((t_frac - 0.28) / 0.22)
                 wrist_pos = p_grasp
                 wrist_rot = rot_grasp
                 finger_flex = 0.2 + (self._flex_closed - 0.2) * sub_t # Fingers enclose object
@@ -211,7 +257,7 @@ class MockTrajectoryDiffusion(TrajectoryGeneratorABC):
                 gripper = float(sub_t)
 
             else:
-                sub_t = minimum_jerk_step((t_frac - 0.65) / 0.35)
+                sub_t = minimum_jerk_step((t_frac - 0.50) / 0.50)
                 wrist_pos = p_grasp + sub_t * (p_lift - p_grasp)
                 wrist_rot = rot_grasp
                 finger_flex = self._flex_closed # Firm grasp hold
