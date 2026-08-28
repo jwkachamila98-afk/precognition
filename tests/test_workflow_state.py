@@ -313,3 +313,33 @@ def test_restart_phase_timer_extends_the_current_phase():
     time.sleep(0.25)
     assert wf.step_autonomous_demo() is True
     assert wf.current_phase == ExecutionPhase.IDLE
+
+
+def test_second_demo_request_abandons_the_attempt():
+    """Asking twice means "now", not "queue it again".
+
+    USER_EXECUTING ends after 60 DETECTED hand poses rather than on a timer, so
+    it runs about a minute with the hand in view and stalls indefinitely without
+    it. Deferring politely to that is not what a second keypress is asking for -
+    observed live, the user pressed twice on each of two consecutive attempts.
+    """
+    wf = WorkflowController(auto_advance=False)
+    wf.trigger_intent("coffee cup")
+    wf.transition_to(ExecutionPhase.USER_EXECUTING)
+
+    wf.handle_control_command("START_AUTONOMOUS_DEMO")
+    assert wf.current_phase == ExecutionPhase.USER_EXECUTING
+    assert wf._pending_demo_at is not None
+
+    wf.handle_control_command("START_AUTONOMOUS_DEMO")
+    assert wf.current_phase == ExecutionPhase.AUTONOMOUS_DEMO
+    assert wf._pending_demo_at is None, "the pending request was consumed, not left armed"
+
+
+def test_single_request_still_waits_politely():
+    """One press must not interrupt a real attempt."""
+    wf = WorkflowController(auto_advance=False)
+    wf.trigger_intent("coffee cup")
+    wf.transition_to(ExecutionPhase.USER_EXECUTING)
+    wf.handle_control_command("START_AUTONOMOUS_DEMO")
+    assert wf.current_phase == ExecutionPhase.USER_EXECUTING

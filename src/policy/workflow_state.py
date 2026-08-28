@@ -376,16 +376,32 @@ class WorkflowController:
             if self._target_label in ("none", "idle", "clear", ""):
                 logger.info("Autonomous Demo requested with no active target; ignoring.")
             elif self._phase in (ExecutionPhase.USER_EXECUTING, ExecutionPhase.ADAPTING):
-                # DEFER rather than drop. The request travels a frame behind the
-                # keypress, and the phases auto-advance on their own timers, so
-                # on a slow host the workflow routinely moves into a refusing
-                # phase in the gap - the user presses the key and nothing at all
-                # happens, with no way to tell that from a broken feature.
-                self._pending_demo_at = time.time()
-                logger.info(
-                    f"Autonomous Demo requested during [{self._phase.value}]; "
-                    f"deferred until the current attempt finishes."
-                )
+                if self._pending_demo_at is not None:
+                    # Asked twice. USER_EXECUTING does not end on a timer - it
+                    # ends after 60 DETECTED hand poses, so it runs about a
+                    # minute when the hand is in view and stalls indefinitely
+                    # when it is not. Waiting politely for that to finish is not
+                    # what someone pressing the key a second time is asking for.
+                    # Abandon the attempt and show them the demo.
+                    self._pending_demo_at = None
+                    logger.info(
+                        f"Autonomous Demo requested again during [{self._phase.value}]; "
+                        f"abandoning the current attempt and starting it now."
+                    )
+                    self.transition_to(ExecutionPhase.AUTONOMOUS_DEMO)
+                else:
+                    # DEFER rather than drop. The request travels a frame behind
+                    # the keypress, and the phases auto-advance on their own
+                    # timers, so on a slow host the workflow routinely moves into
+                    # a refusing phase in the gap - the user presses the key and
+                    # nothing at all happens, with no way to tell that from a
+                    # broken feature.
+                    self._pending_demo_at = time.time()
+                    logger.info(
+                        f"Autonomous Demo requested during [{self._phase.value}]; "
+                        f"deferred until the current attempt finishes. "
+                        f"Press again to abandon the attempt and start it now."
+                    )
             else:
                 self._pending_demo_at = None
                 self.transition_to(ExecutionPhase.AUTONOMOUS_DEMO)
