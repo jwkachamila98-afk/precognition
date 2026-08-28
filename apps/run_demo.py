@@ -128,6 +128,7 @@ def main() -> None:
     parser.add_argument("--record", action="store_true", help="Enable automatic dataset session recording")
     parser.add_argument("--port", type=int, default=8765, help="WebSocket port for local server (default: 8765)")
     parser.add_argument("--device", type=int, default=0, help="Camera device index (default: 0)")
+    parser.add_argument("--gemini-key", type=str, default=None, help="Gemini API key for voice transcription + TTS (defaults to $GEMINI_API_KEY)")
     args = parser.parse_args()
 
     # 1. Environment Checks
@@ -184,6 +185,9 @@ def main() -> None:
         "--tracker", args.tracker,
         "--device", str(args.device)
     ]
+
+    if args.gemini_key:
+        client_cmd.extend(["--gemini-key", args.gemini_key])
 
     if args.server_url:
         client_cmd.extend(["--server-url", args.server_url])

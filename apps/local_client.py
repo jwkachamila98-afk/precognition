@@ -17,6 +17,7 @@ import collections
 import math
 import threading
 import logging
+import os
 import sys
 import time
 from pathlib import Path
@@ -40,8 +41,8 @@ from src.perception.hand_tracker import HAND_CONNECTIONS, HandPose, HandSide, Ha
 from src.perception.scene_parser import BoundingBox3D, ParsedScene
 from src.perception.mediapipe_tracker import MediaPipeHandTracker, MEDIAPIPE_AVAILABLE
 from src.perception.intent_parser import IntentParserABC, MockLLMIntentParser, ParsedIntent
-from src.audio.speech_to_text import AudioTranscriberABC, MockTranscriber, WhisperTranscriber
-from src.audio.text_to_speech import SpeechSynthesizerABC, SystemSpeaker
+from src.audio.speech_to_text import AudioTranscriberABC, GeminiTranscriber, MockTranscriber, WhisperTranscriber
+from src.audio.text_to_speech import GeminiSpeaker, SpeechSynthesizerABC, SystemSpeaker
 from src.simulation.trajectory_generator import AffordanceMap, ForeseenTrajectory, ForeseenWaypoint
 from src.policy.discrepancy import DiscrepancyEngine, DiscrepancyState, EpisodeDiscrepancyReport
 from src.policy.workflow_state import ExecutionPhase, WorkflowController
@@ -342,14 +343,40 @@ class LocalVisualizer:
         xf,
         target_bbox: BoundingBox3D,
     ) -> None:
-        """Ghost afterimage of the object being picked up, following the trajectory's
-        own object_pose per waypoint - which is already kinematically consistent (static
-        until contact, then rigidly attached to the hand through the lift), not a
-        separate free-floating animation."""
+        """Ghost afterimage of the object being picked up.
+
+        The object's screen position is anchored to target_bbox - the REAL, currently
+        detected object position (ground truth, refreshed every frame) - not derived
+        from the trajectory's own object_pose field directly. object_pose was computed
+        server-side from whatever object position the server saw when the trajectory
+        was generated, in the SAME coordinate convention as the hand; applying the
+        hand's re-anchoring transform (xf) to it, as an earlier version of this code
+        did, mixed hand-tracking corrections into an unrelated real-world position and
+        made the box appear disconnected from the actual object.
+
+        Instead: pre-contact, the object hasn't moved, so it's drawn exactly at
+        target_bbox's real position. Once contact begins, only the RELATIVE 3D
+        displacement since the grasp moment (current object_pose - object_pose at the
+        first contact waypoint) is added onto that real position - this is the same
+        physical lift motion the hand undergoes, so the box visibly lifts with the
+        ghost hand without ever losing lock on where the object actually is.
+        """
         h, w = frame.shape[:2]
         depth = max(float(target_bbox.center[2]), 0.1)
         px_w = max(10, int(0.8 * w * float(target_bbox.size[0]) / depth))
         px_h = max(10, int(0.8 * w * float(target_bbox.size[1]) / depth))
+
+        grasp_idx = next(
+            (i for i, wp in enumerate(trajectory.waypoints) if float(np.max(wp.contact_state)) > 0.5),
+            len(trajectory.waypoints) - 1,
+        )
+        grasp_object_pos = trajectory.waypoints[grasp_idx].object_pose[:3]
+
+        def real_anchored_2d(step: int) -> np.ndarray:
+            wp = trajectory.waypoints[step]
+            delta_3d = wp.object_pose[:3] - grasp_object_pos if step >= grasp_idx else np.zeros(3, dtype=np.float32)
+            world_pos = target_bbox.center + delta_3d
+            return self._project_3d(world_pos, w, h)
 
         trail_span = 24
         trail_steps = sorted(set(range(max(0, step_idx - trail_span), step_idx, 4)) | {step_idx})
@@ -357,7 +384,7 @@ class LocalVisualizer:
         overlay = frame.copy()
         for s in trail_steps:
             wp = trajectory.waypoints[s]
-            center = xf(self._project_3d(wp.object_pose[:3], w, h)[None, :])[0]
+            center = real_anchored_2d(s)
             cx_i, cy_i = int(np.clip(center[0], 0, w - 1)), int(np.clip(center[1], 0, h - 1))
             age = (step_idx - s) / float(trail_span)
             in_contact = float(np.max(wp.contact_state)) > 0.5
@@ -368,8 +395,7 @@ class LocalVisualizer:
                 overlay = frame.copy()
 
         # Crisp outline + label on the current step
-        wp = trajectory.waypoints[step_idx]
-        center = xf(self._project_3d(wp.object_pose[:3], w, h)[None, :])[0]
+        center = real_anchored_2d(step_idx)
         cx_i, cy_i = int(np.clip(center[0], 0, w - 1)), int(np.clip(center[1], 0, h - 1))
         cv2.ellipse(frame, (cx_i, cy_i), (px_w // 2, px_h // 2), 0, 0, 360, (0, 235, 255), 2, cv2.LINE_AA)
         label = target_bbox.label.replace("_", " ")
@@ -1016,7 +1042,8 @@ class LocalClientRunner:
         enable_profiling: bool = False,
         enable_recording: bool = False,
         server_url: Optional[str] = None,
-        transcriber_type: str = "mock"
+        transcriber_type: str = "mock",
+        gemini_api_key: Optional[str] = None
     ) -> None:
         self.config = config
         
@@ -1047,14 +1074,24 @@ class LocalClientRunner:
         self.profiler = LatencyProfiler(window_size=100)
         self.recorder = SessionRecorder()
         
-        # Phase 6, 7 & 8 components
-        if transcriber_type == "whisper":
+        # Phase 6, 7 & 8 components. Gemini (transcription + TTS) takes priority when
+        # an API key is available, since it's confirmed higher quality than the local
+        # tiny.en Whisper model and macOS 'say' - each still falls back automatically
+        # to its non-Gemini counterpart internally on any network/API failure.
+        if gemini_api_key:
+            self.transcriber: AudioTranscriberABC = GeminiTranscriber(api_key=gemini_api_key)
+            logger.info("LocalClient: Using GeminiTranscriber for voice intent capture.")
+        elif transcriber_type == "whisper":
             self.transcriber: AudioTranscriberABC = WhisperTranscriber()
         else:
             self.transcriber: AudioTranscriberABC = MockTranscriber()
-        
+
         self.intent_parser: IntentParserABC = MockLLMIntentParser()
-        self.speaker: SpeechSynthesizerABC = SystemSpeaker()
+        if gemini_api_key:
+            self.speaker: SpeechSynthesizerABC = GeminiSpeaker(api_key=gemini_api_key)
+            logger.info("LocalClient: Using GeminiSpeaker for voice guidance output.")
+        else:
+            self.speaker: SpeechSynthesizerABC = SystemSpeaker()
         self.workflow = WorkflowController(
             foresee_steps=60, wait_user_timeout=2.0, auto_advance=True,
             # In remote mode the server owns the authoritative phase; the client announces
@@ -1819,6 +1856,7 @@ def main() -> None:
     parser.add_argument("--profile", action="store_true", help="Enable detailed component latency breakdown profiling to console")
     parser.add_argument("--record", action="store_true", help="Automatically begin session recording on launch")
     parser.add_argument("--server-url", type=str, default=None, help="Custom WebSocket server URL (e.g. ws://<CLOUD_GPU_IP>:8765)")
+    parser.add_argument("--gemini-key", type=str, default=os.environ.get("GEMINI_API_KEY"), help="Gemini API key for voice transcription + TTS (defaults to $GEMINI_API_KEY)")
     args = parser.parse_args()
 
     config_path = Path(args.config)
@@ -1837,7 +1875,8 @@ def main() -> None:
         enable_profiling=args.profile,
         enable_recording=args.record,
         server_url=args.server_url,
-        transcriber_type=args.transcriber
+        transcriber_type=args.transcriber,
+        gemini_api_key=args.gemini_key
     )
     asyncio.run(runner.run())
 

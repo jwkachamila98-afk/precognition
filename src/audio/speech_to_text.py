@@ -1,9 +1,15 @@
 """Continuous Audio Ingestion and Speech-to-Text (STT) Interfaces."""
 
+import base64
 import collections
+import io
+import json
 import logging
+import ssl
 import threading
 import time
+import urllib.request
+import wave
 from abc import ABC, abstractmethod
 from typing import List, Optional
 import numpy as np
@@ -179,3 +185,117 @@ class WhisperTranscriber(AudioTranscriberABC):
         except Exception as e:
             logger.error(f"File transcription failed: {e}")
             return self._fallback_mock.transcribe_file(audio_path)
+
+
+class GeminiTranscriber(AudioTranscriberABC):
+    """
+    Push-to-talk transcription via Gemini's native audio understanding. Buffers raw
+    PCM16 audio the same way WhisperTranscriber does (fed by the same sounddevice
+    microphone callback in local_client.py - no changes needed there), then sends the
+    full clip to Gemini once listening stops. Falls back to MockTranscriber on any
+    failure (missing key, network error, malformed response) so push-to-talk never
+    silently does nothing.
+    """
+
+    _ENDPOINT_TEMPLATE = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    _PROMPT = (
+        "Transcribe this audio clip exactly as spoken. Respond with ONLY the "
+        "transcribed text - no quotes, no punctuation commentary, no extra words."
+    )
+
+    def __init__(
+        self,
+        api_key: str,
+        model: str = "gemini-3.6-flash",
+        sample_rate: int = 16000,
+        timeout: float = 8.0,
+    ) -> None:
+        self.api_key = api_key
+        self.model = model
+        self.sample_rate = sample_rate
+        self.timeout = timeout
+        self._ssl_ctx = ssl.create_default_context()
+        try:
+            import certifi
+            self._ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+        except Exception:
+            pass
+
+        self._listening = False
+        self._audio_buffer: List[np.ndarray] = []
+        self._lock = threading.Lock()
+        self._fallback = MockTranscriber()
+
+    @property
+    def is_listening(self) -> bool:
+        return self._listening
+
+    def start_listening(self) -> None:
+        with self._lock:
+            self._listening = True
+            self._audio_buffer.clear()
+        logger.info("GeminiTranscriber: [LISTENING on microphone...]")
+
+    def stop_listening(self) -> str:
+        with self._lock:
+            self._listening = False
+            buffered = list(self._audio_buffer)
+            self._audio_buffer.clear()
+
+        if not buffered:
+            return self._fallback.stop_listening()
+
+        try:
+            audio_int16 = np.concatenate(buffered, axis=0)
+            wav_bytes = self._to_wav_bytes(audio_int16, self.sample_rate)
+            transcript = self._transcribe(wav_bytes)
+            logger.info(f"GeminiTranscriber: [TRANSCRIBED] -> '{transcript}'")
+            return transcript if transcript else "idle"
+        except Exception as e:
+            logger.error(f"GeminiTranscriber: transcription failed ({e}); falling back.")
+            return self._fallback.stop_listening()
+
+    def transcribe_stream(self, audio_chunk: bytes) -> Optional[str]:
+        if not self._listening:
+            return None
+        audio_np = np.frombuffer(audio_chunk, dtype=np.int16)
+        with self._lock:
+            self._audio_buffer.append(audio_np)
+        return None
+
+    def transcribe_file(self, audio_path: str) -> str:
+        try:
+            with open(audio_path, "rb") as f:
+                data = f.read()
+            return self._transcribe(data)
+        except Exception as e:
+            logger.error(f"GeminiTranscriber: file transcription failed ({e})")
+            return self._fallback.transcribe_file(audio_path)
+
+    @staticmethod
+    def _to_wav_bytes(audio_int16: np.ndarray, sample_rate: int) -> bytes:
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(sample_rate)
+            w.writeframes(audio_int16.astype(np.int16).tobytes())
+        return buf.getvalue()
+
+    def _transcribe(self, wav_bytes: bytes) -> str:
+        audio_b64 = base64.b64encode(wav_bytes).decode("ascii")
+        payload = {
+            "contents": [{"parts": [
+                {"text": self._PROMPT},
+                {"inline_data": {"mime_type": "audio/wav", "data": audio_b64}},
+            ]}]
+        }
+        url = f"{self._ENDPOINT_TEMPLATE.format(model=self.model)}?key={self.api_key}"
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, context=self._ssl_ctx, timeout=self.timeout) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+        return result["candidates"][0]["content"]["parts"][0]["text"].strip()
