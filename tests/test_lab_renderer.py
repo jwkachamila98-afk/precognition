@@ -355,19 +355,23 @@ def test_object_scale_is_bounded_by_the_grasping_hand():
     over 34 cm, staging a beach-ball on the bench. The detector's extent is
     back-projected from non-metric depth, so it is bounded by the one metric
     reference in the scene - the hand doing the grasping."""
-    from src.simulation.lab_sim import _object_longest_dimension, _REFERENCE_PALM_M
+    from src.simulation.lab_sim import (_object_longest_dimension, _REFERENCE_PALM_M,
+                                        _MAX_OBJECT_PALMS)
 
-    huge = BoundingBox3D(label="wine glass", center=np.zeros(3, np.float32),
+    # Unrecognised label, so this exercises the clamp rather than the class prior.
+    huge = BoundingBox3D(label="aardvark", center=np.zeros(3, np.float32),
                          size=np.array([0.27, 0.34, 0.15], dtype=np.float32))
     staged = _object_longest_dimension(huge, _REFERENCE_PALM_M)
-    assert staged <= 2.2 * _REFERENCE_PALM_M + 1e-6
+    assert staged <= _MAX_OBJECT_PALMS * _REFERENCE_PALM_M + 1e-6
     assert staged < 0.34
 
     tiny = BoundingBox3D(label="pen", center=np.zeros(3, np.float32),
                          size=np.array([0.004, 0.004, 0.004], dtype=np.float32))
     assert _object_longest_dimension(tiny, _REFERENCE_PALM_M) >= 0.45 * _REFERENCE_PALM_M - 1e-6
 
-    ok = BoundingBox3D(label="mug", center=np.zeros(3, np.float32),
+    # An unrecognised label has no prior, so a plausible measured extent passes
+    # through untouched.
+    ok = BoundingBox3D(label="aardvark", center=np.zeros(3, np.float32),
                        size=np.array([0.10, 0.12, 0.10], dtype=np.float32))
     assert _object_longest_dimension(ok, _REFERENCE_PALM_M) == pytest.approx(0.12, abs=1e-6)
 
@@ -479,3 +483,61 @@ def test_the_object_travels_with_the_hand_once_grasped():
     assert obj_rise > 0.05, f"object barely lifted ({obj_rise*100:.1f} cm)"
     assert abs(hand_rise - obj_rise) < 0.02, \
         f"hand rose {hand_rise*100:.1f} cm but object rose {obj_rise*100:.1f} cm - they separated"
+
+
+
+# ------------------------------------------------------ class size priors
+
+def test_class_prior_beats_the_detectors_non_metric_extent():
+    """A recognised class is sized from its prior, not from back-projected depth.
+
+    Both numbers below were measured live: 56 cm for a coffee cup on synthetic
+    depth here, 74 cm for a wine glass on real MiDaS depth on a GPU pod. The
+    hand-based clamp caught them, but only by pinning to its own ceiling, which
+    still staged a mug at double life size.
+    """
+    from src.simulation.lab_sim import _object_longest_dimension, _REFERENCE_PALM_M
+
+    cup = BoundingBox3D(label="cup", center=np.zeros(3, np.float32),
+                        size=np.array([0.56, 0.56, 0.30], dtype=np.float32))
+    staged = _object_longest_dimension(cup, _REFERENCE_PALM_M)
+    assert staged == pytest.approx(0.09, abs=1e-6), "a cup is a cup, not 56 cm"
+
+    glass = BoundingBox3D(label="wine glass", center=np.zeros(3, np.float32),
+                          size=np.array([0.74, 0.74, 0.40], dtype=np.float32))
+    assert _object_longest_dimension(glass, _REFERENCE_PALM_M) == pytest.approx(0.20, abs=1e-6)
+
+
+def test_prior_lookup_prefers_the_most_specific_label():
+    """'wine glass' must not be shadowed by a shorter substring match."""
+    from src.simulation.lab_sim import _size_prior_for
+
+    assert _size_prior_for("wine glass") == pytest.approx(0.20)
+    assert _size_prior_for("cell phone") == pytest.approx(0.15)
+    assert _size_prior_for("coffee cup") == pytest.approx(0.09)
+    assert _size_prior_for("remote_control") == pytest.approx(0.16)
+    assert _size_prior_for("aardvark") is None
+    assert _size_prior_for(None) is None
+    assert _size_prior_for("") is None
+
+
+def test_unknown_classes_still_fall_back_to_the_detector():
+    """The prior is an override for things we know, not a replacement for
+    detection - an unrecognised label still uses the measured extent."""
+    from src.simulation.lab_sim import _object_longest_dimension, _REFERENCE_PALM_M
+
+    odd = BoundingBox3D(label="aardvark", center=np.zeros(3, np.float32),
+                        size=np.array([0.12, 0.06, 0.06], dtype=np.float32))
+    assert _object_longest_dimension(odd, _REFERENCE_PALM_M) == pytest.approx(0.12, abs=1e-6)
+
+
+def test_priors_are_all_graspable():
+    """Every prior must survive the hand clamp unchanged, or it is not a size a
+    hand could be picking up and does not belong in the table."""
+    from src.simulation.lab_sim import (_CLASS_SIZE_PRIORS_M, _REFERENCE_PALM_M,
+                                        _MIN_OBJECT_PALMS, _MAX_OBJECT_PALMS)
+
+    lo = _MIN_OBJECT_PALMS * _REFERENCE_PALM_M
+    hi = _MAX_OBJECT_PALMS * _REFERENCE_PALM_M
+    for label, size in _CLASS_SIZE_PRIORS_M.items():
+        assert lo <= size <= hi, f"prior for '{label}' ({size*100:.0f} cm) is outside [{lo*100:.0f}, {hi*100:.0f}] cm"

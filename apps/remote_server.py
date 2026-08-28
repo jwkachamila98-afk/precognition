@@ -153,7 +153,11 @@ def main() -> None:
     try:
         from src.perception.yolo_object_detector import YoloObjectDetector
         from src.perception.live_scene_parser import LiveSceneParser
-        object_detector = YoloObjectDetector(model_name="yolov8s.pt", conf_threshold=0.30)
+        # yolov8s on a GPU costs nothing; on a CPU-only host it is ~0.74 s/frame,
+        # which paces the whole workflow. YOLO_MODEL lets a slow host drop to
+        # yolov8n without changing what a GPU deployment runs.
+        yolo_model = os.environ.get("YOLO_MODEL", "yolov8s.pt")
+        object_detector = YoloObjectDetector(model_name=yolo_model, conf_threshold=0.30)
         scene_parser = LiveSceneParser(
             object_detector=object_detector,
             num_points=app_config.perception.scene_parser.num_points,

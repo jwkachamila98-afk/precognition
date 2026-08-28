@@ -102,30 +102,68 @@ class LabTransform:
 
 # A manipuland is only as big as the hand grasping it can plausibly handle.
 # Expressed as multiples of palm length (wrist -> middle MCP, ~9.2 cm).
+# A hand manipulates plenty of things longer than itself - you take a 25 cm
+# bottle by the neck - so the ceiling is generous. Its job is to reject the
+# absurd (56 cm coffee cups, 74 cm wine glasses), not to enforce daintiness.
 _MIN_OBJECT_PALMS = 0.45
-_MAX_OBJECT_PALMS = 2.2
+_MAX_OBJECT_PALMS = 3.2
+
+# Typical longest dimension, in metres, for the things people actually pick up.
+# These are priors on the OBJECT CLASS, and they beat the detector's own extent
+# outright, because that extent is back-projected through depth which is
+# synthetic locally and only relative (MiDaS) on GPU - non-metric either way. It
+# reported a wine glass at 74 cm on a GPU pod and a coffee cup at 56 cm here. A
+# prior cannot tell a large mug from a small one, but it is never wrong by 6x.
+_CLASS_SIZE_PRIORS_M = {
+    "cup": 0.09, "mug": 0.10, "wine glass": 0.20, "bowl": 0.15, "bottle": 0.25,
+    "can": 0.12, "fork": 0.19, "knife": 0.22, "spoon": 0.17, "banana": 0.19,
+    "apple": 0.08, "orange": 0.08, "remote": 0.16, "cell phone": 0.15,
+    "phone": 0.15, "mouse": 0.11, "book": 0.24, "scissors": 0.16, "pen": 0.14,
+    "stylus": 0.14, "toothbrush": 0.19, "clock": 0.20, "vase": 0.25,
+    "sports ball": 0.22, "teddy bear": 0.28, "hair drier": 0.25,
+}
+
+
+def _size_prior_for(label: Optional[str]) -> Optional[float]:
+    """Prior for a detector label, matched on the longest contained keyword.
+
+    Longest-first so "wine glass" is not shadowed by a substring match, and
+    "cell phone" resolves ahead of "phone".
+    """
+    if not label:
+        return None
+    text = label.replace("_", " ").strip().lower()
+    for key in sorted(_CLASS_SIZE_PRIORS_M, key=len, reverse=True):
+        if key in text:
+            return _CLASS_SIZE_PRIORS_M[key]
+    return None
 
 
 def _object_longest_dimension(bbox: Optional[BoundingBox3D],
                               hand_palm_m: float) -> float:
     """The manipuland's longest dimension in metres, in a scale the plan supports.
 
-    Only the SCALAR is taken from the detector - its aspect comes from the
-    silhouette instead (see object_mesh.build_object_mesh). Even the scalar is
-    weak: it is back-projected from depth that is synthetic locally and only
-    relative (MiDaS) on the GPU pod, so it is not metric on either path. In
-    production it reported a wine glass at over 34 cm, which staged a beach-ball
-    on the bench and forced the camera back until the reenactment was unreadable.
+    Preference order, weakest evidence last:
+      1. a size prior for the detected CLASS, when the label names something
+         known - see _CLASS_SIZE_PRIORS_M for why this outranks measurement;
+      2. the detector's own 3-D extent, for anything unrecognised;
+      3. a hand-relative default when there is no detection at all.
 
-    So it is bounded by the one metric reference actually present in the scene:
-    the hand doing the grasping. An object the hand could not close around is not
-    the object this plan is grasping, whatever the detector says.
+    Whatever the source, the result is bounded by what the grasping hand could
+    actually close around. Only the SHAPE comes from the silhouette (see
+    object_mesh.build_object_mesh); this is scale alone.
     """
-    raw = None
-    if bbox is not None:
-        size = np.asarray(bbox.size, dtype=np.float32).reshape(3)
-        if np.all(np.isfinite(size)) and float(size.max()) > 1e-3:
-            raw = float(size.max())
+    prior = _size_prior_for(bbox.label if bbox is not None else None)
+    raw = prior
+    source = "class prior"
+
+    if raw is None:
+        source = "detector extent"
+        if bbox is not None:
+            size = np.asarray(bbox.size, dtype=np.float32).reshape(3)
+            if np.all(np.isfinite(size)) and float(size.max()) > 1e-3:
+                raw = float(size.max())
+
     if raw is None:
         return float(np.clip(1.4 * hand_palm_m, 0.05, 0.20))
 
@@ -134,9 +172,17 @@ def _object_longest_dimension(bbox: Optional[BoundingBox3D],
     clamped = float(np.clip(raw, lo, hi))
     if abs(clamped - raw) > 1e-3:
         logger.info(
-            f"LabSimulator: detector reported the target at {raw*100:.0f} cm, which the "
-            f"grasping hand ({hand_palm_m*100:.1f} cm palm) could not handle; staging it "
-            f"at {clamped*100:.0f} cm instead."
+            f"LabSimulator: {source} put the target at {raw*100:.0f} cm, which the "
+            f"grasping hand ({hand_palm_m*100:.1f} cm palm) could not handle; staging "
+            f"it at {clamped*100:.0f} cm instead."
+        )
+    elif prior is not None:
+        detected = (float(np.asarray(bbox.size, dtype=np.float32).max())
+                    if bbox is not None else float("nan"))
+        logger.info(
+            f"LabSimulator: staging '{bbox.label if bbox else '?'}' at its class "
+            f"prior of {clamped*100:.0f} cm (the detector's non-metric extent said "
+            f"{detected*100:.0f} cm)."
         )
     return clamped
 
