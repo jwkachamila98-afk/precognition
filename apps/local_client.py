@@ -1161,6 +1161,7 @@ class LocalClientRunner:
         self._network_latency_ms = 0.0
         self._network_got_first_response = False
         self._last_announced_phase: Optional[ExecutionPhase] = None
+        self._training_target_announced: Optional[str] = None
         self._remote_snapshot = {
             "poses": [], "bboxes": [], "affordance_map": None, "foreseen_traj": None,
             "depth_heatmap": None, "gripper_cmd": 0.0, "residuals": None, "reward_score": 0.0,
@@ -1655,14 +1656,23 @@ class LocalClientRunner:
                     if snap["benchmark_summary"]:
                         benchmark_summary = snap["benchmark_summary"]
 
-                    # The server's workflow controller is headless (no speakers on the GPU
-                    # pod), so the client announces phase changes locally instead.
+                    # The server's workflow controller is headless (no speakers on the
+                    # GPU pod), so the client announces locally instead - but only ONCE,
+                    # right when a training session first starts (the first FORESEEING
+                    # entry for a given target), not on every phase transition or every
+                    # RESTARTING-loop iteration. The on-screen instruction bar carries
+                    # ongoing guidance instead of narrating every step out loud.
                     if workflow_phase != self._last_announced_phase:
                         self._last_announced_phase = workflow_phase
-                        if self.workflow.voice_guidance_enabled:
-                            instruction = self.workflow._phase_instruction(workflow_phase)
-                            if instruction:
-                                self.speaker.speak(instruction)
+                        current_target = self.workflow._target_label
+                        if workflow_phase == ExecutionPhase.FORESEEING and current_target != self._training_target_announced:
+                            self._training_target_announced = current_target
+                            if self.workflow.voice_guidance_enabled:
+                                instruction = self.workflow._phase_instruction(workflow_phase)
+                                if instruction:
+                                    self.speaker.speak(instruction)
+                        elif workflow_phase == ExecutionPhase.IDLE:
+                            self._training_target_announced = None  # a future new intent should announce again
 
                     if not self._network_got_first_response:
                         cv2.putText(frame, f"CONNECTING TO {self.server_url or self.config.network.server_host}...",
