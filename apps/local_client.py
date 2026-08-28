@@ -1874,9 +1874,6 @@ class LocalClientRunner:
                         cv2.putText(frame, f"CONNECTING TO {self.server_url or self.config.network.server_host}...",
                                     (30, frame.shape[0] // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA)
 
-                # Reset one-shot command (only relevant for mock_local, which sends none)
-                self._control_cmd_to_send = None
-
                 # Client-side afterimage recording: capture the user's OWN real hand
                 # poses (already tracked locally every frame in both modes) while they
                 # execute, so the ghost hand can later replay their ACTUAL motion
