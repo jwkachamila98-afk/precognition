@@ -541,3 +541,57 @@ def test_priors_are_all_graspable():
     hi = _MAX_OBJECT_PALMS * _REFERENCE_PALM_M
     for label, size in _CLASS_SIZE_PRIORS_M.items():
         assert lo <= size <= hi, f"prior for '{label}' ({size*100:.0f} cm) is outside [{lo*100:.0f}, {hi*100:.0f}] cm"
+
+
+# ------------------------------------------------------------- smooth motion
+
+def test_plan_is_sampled_continuously_not_snapped(staged_sim):
+    """The trajectory position must be fractional.
+
+    Rounding it to a whole waypoint quantised the reenactment to 60 discrete
+    poses, which reads as a stutter no matter how smoothly progress advances.
+    """
+    sim, _, _ = staged_sim
+    positions = [sim.step_for_progress(p) for p in np.linspace(0.0, 0.82, 40)]
+    assert any(abs(p - round(p)) > 1e-3 for p in positions), "positions are snapped to whole waypoints"
+    assert all(b >= a - 1e-6 for a, b in zip(positions, positions[1:])), "must advance monotonically"
+
+
+def test_interpolated_pose_lies_between_its_neighbours(staged_sim):
+    """A fractional index must blend the two waypoints it sits between."""
+    sim, _, _ = staged_sim
+    a = sim._lerp_along(sim._hand_paths_lab, 10.0)
+    b = sim._lerp_along(sim._hand_paths_lab, 11.0)
+    mid = sim._lerp_along(sim._hand_paths_lab, 10.5)
+    assert np.allclose(a, sim._hand_paths_lab[10])
+    assert np.allclose(b, sim._hand_paths_lab[11])
+    assert np.allclose(mid, 0.5 * (a + b), atol=1e-5)
+    assert not np.allclose(mid, a), "midpoint must differ from either neighbour"
+
+
+def test_motion_between_frames_stays_small_at_client_frame_rates(staged_sim):
+    """No frame may lurch. Driving the animation from the server's phase
+    progress - which lands about once a second - and snapping to whole waypoints
+    produced 60 px jumps between otherwise-frozen frames.
+    """
+    sim, _, _ = staged_sim
+    fps, demo_seconds = 8.0, 6.0
+    prev, jumps = None, []
+    for i in range(int(fps * demo_seconds)):
+        pos = sim.step_for_progress(min((i / fps) / demo_seconds, 1.0))
+        screen = sim.camera.project(sim._lerp_along(sim._hand_paths_lab, pos))[0]
+        if prev is not None:
+            jumps.append(float(np.abs(screen - prev).max()))
+        prev = screen
+    assert max(jumps) < 0.12 * sim.height, f"largest single-frame jump {max(jumps):.0f}px"
+
+
+def test_telemetry_reads_a_fractional_position(staged_sim):
+    """The HUD must accept the same index the renderer uses, and its continuous
+    fields must not tick in whole-waypoint steps."""
+    sim, traj, _ = staged_sim
+    mid = sim._contact_step() + 0.5
+    tel = sim.telemetry(mid)
+    assert 1 <= tel["step"] <= len(traj.waypoints)
+    lifts = [sim.telemetry(s)["lift_cm"] for s in np.linspace(40.0, 59.0, 12)]
+    assert any(abs(v - round(v, 1)) > 1e-9 for v in lifts) or len(set(lifts)) > 6

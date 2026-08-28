@@ -459,17 +459,34 @@ class LabSimulator:
 
     # --------------------------------------------------------------- render
 
-    def step_for_progress(self, progress: float) -> int:
-        """Map the workflow's 0..1 phase progress onto a trajectory index.
+    def step_for_progress(self, progress: float) -> float:
+        """Map the workflow's 0..1 phase progress onto a trajectory position.
 
         The plan is 2 s of motion but the demo phase holds for ~6 s, so it plays
         out over the first 82% and then holds on the final grasp - the held beat
         is what makes the result readable rather than a blink-and-miss loop.
+
+        Returns a FRACTIONAL index. Rounding it to a whole waypoint quantised the
+        motion to 60 discrete poses across the demo, which reads as a stutter
+        however smoothly the progress itself advances; callers interpolate
+        between the neighbouring waypoints instead.
         """
         n = len(self.trajectory.waypoints) if self.trajectory else 1
         play = float(np.clip(progress / 0.82, 0.0, 1.0))
         eased = play * play * (3.0 - 2.0 * play)
-        return int(np.clip(round(eased * (n - 1)), 0, n - 1))
+        return float(np.clip(eased * (n - 1), 0.0, n - 1))
+
+    @staticmethod
+    def _lerp_along(path: np.ndarray, frame: float) -> np.ndarray:
+        """Sample a per-waypoint array at a fractional index."""
+        n = len(path)
+        t = float(np.clip(frame, 0.0, n - 1))
+        i0 = int(np.floor(t))
+        i1 = min(i0 + 1, n - 1)
+        f = t - i0
+        if f <= 1e-6:
+            return path[i0]
+        return (path[i0] * (1.0 - f) + path[i1] * f).astype(np.float32)
 
     def hand_screen_height(self, step: int) -> float:
         """On-screen pixel height of the hand at `step` - the framing check that
@@ -479,31 +496,40 @@ class LabSimulator:
         screen, _ = self.camera.project(self._hand_paths_lab[int(step)])
         return float(screen[:, 1].max() - screen[:, 1].min())
 
-    def telemetry(self, step: int) -> Dict[str, float]:
-        """Per-step numbers for the caller's HUD - all from the real plan."""
+    def telemetry(self, step: float) -> Dict[str, float]:
+        """Per-step numbers for the caller's HUD - all from the real plan.
+
+        Accepts the same fractional index the renderer uses; the discrete fields
+        (step number, contact) come from the nearest waypoint, while the
+        continuous ones are interpolated so they do not visibly tick.
+        """
         if not self.trajectory or not self.trajectory.waypoints:
             return {}
         n = len(self.trajectory.waypoints)
-        wp = self.trajectory.waypoints[int(np.clip(step, 0, n - 1))]
+        idx = int(np.clip(round(step), 0, n - 1))
+        wp = self.trajectory.waypoints[idx]
+        grip = float(np.interp(step, np.arange(n),
+                               [w.gripper_aperture for w in self.trajectory.waypoints]))
+        lifted = float(self._lerp_along(self._object_path_lab, step)[1])
         return {
-            "step": int(step) + 1,
+            "step": idx + 1,
             "num_steps": n,
             "sim_time": float(wp.time_offset),
-            "gripper": float(wp.gripper_aperture),
+            "gripper": grip,
             "contact": float(np.mean(wp.contact_state)),
-            "lift_cm": float(max(0.0, self._object_path_lab[step, 1]
-                                 - self._object_path_lab[0, 1]) * 100.0),
+            "lift_cm": float(max(0.0, lifted - self._object_path_lab[0, 1]) * 100.0),
         }
 
-    def _hand_mesh_for(self, step: int) -> Mesh:
+    def _hand_mesh_for(self, step: float) -> Mesh:
         return HM.build_hand_mesh(
-            self._hand_paths_lab[step],
+            self._lerp_along(self._hand_paths_lab, step),
             color=_HOLOGRAM_COLOR,
             material=_HOLOGRAM_MATERIAL,
         )
 
-    def _object_mesh_for(self, step: int) -> Mesh:
-        return self.object_mesh.transformed(translation=self._object_path_lab[step])
+    def _object_mesh_for(self, step: float) -> Mesh:
+        return self.object_mesh.transformed(
+            translation=self._lerp_along(self._object_path_lab, step))
 
     def _planar_shadow_mask(self, meshes: List[Mesh]) -> Optional[np.ndarray]:
         """Key-light shadow of the actors cast onto the staging surface.
@@ -564,7 +590,7 @@ class LabSimulator:
         return covered & (normal_y > 0.45) & (world_y > LS.BENCH_TOP_Y - 0.04) \
             & (world_y < LS.PEDESTAL_TOP_Y + 0.012)
 
-    def render(self, step: int, elapsed: float = 0.0,
+    def render(self, step: float, elapsed: float = 0.0,
                push_in: float = 0.0) -> Optional[np.ndarray]:
         """Render one frame of the reenactment as a BGR uint8 image.
 
@@ -577,8 +603,8 @@ class LabSimulator:
             return None
         t0 = time.perf_counter()
 
-        step = int(np.clip(step, 0, len(self.trajectory.waypoints) - 1))
-        key = (step, round(push_in, 3))
+        step = float(np.clip(step, 0.0, len(self.trajectory.waypoints) - 1))
+        key = (round(step, 3), round(push_in, 3))
         if self._last_image is not None:
             if key == self._last_key:
                 # Identical content. Nothing to recompute, whatever the clock

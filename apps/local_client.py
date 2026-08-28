@@ -1465,6 +1465,12 @@ class LocalClientRunner:
         self._lab_image: Optional[np.ndarray] = None
         self._lab_anchor_rect: Optional[tuple] = None
         self._lab_last_t = time.perf_counter()
+        # Wall-clock start of the running demo. The reenactment is played from
+        # this rather than from the server's reported phase progress: that value
+        # only refreshes when a response lands (about once a second on a CPU-only
+        # host), so animating from it held each pose for a beat and then jumped,
+        # however fast this client was actually drawing.
+        self._lab_demo_started_at: Optional[float] = None
         self._remote_snapshot = {
             "poses": [], "bboxes": [], "affordance_map": None, "foreseen_traj": None,
             "depth_heatmap": None, "gripper_cmd": 0.0, "residuals": None, "reward_score": 0.0,
@@ -1561,6 +1567,7 @@ class LocalClientRunner:
             target_bbox = bboxes[0] if bboxes else None
             if self.lab_sim.prepare(foreseen_traj, target_bbox, self._object_sprite):
                 self._lab_staged = True
+                self._lab_demo_started_at = now
                 if target_bbox is not None:
                     h, w = frame.shape[:2]
                     centre, px_w, px_h = self.visualizer._bbox_screen_rect(target_bbox, w, h)
@@ -1571,20 +1578,33 @@ class LocalClientRunner:
                 else:
                     self._lab_anchor_rect = None
 
-        # Open in ~0.45 s, close in ~0.30 s.
-        rate = (1.0 / 0.45) if (active and self._lab_staged) else -(1.0 / 0.30)
+        # Open in ~0.6 s, close in ~0.4 s. Longer than feels necessary on paper:
+        # at the frame rates this client actually achieves, a 0.45 s open was
+        # only a handful of frames and read as a snap rather than a movement.
+        rate = (1.0 / 0.60) if (active and self._lab_staged) else -(1.0 / 0.40)
         self._lab_open = float(np.clip(self._lab_open + rate * dt, 0.0, 1.0))
 
         if self._lab_open <= 0.001:
             if self._lab_image is not None and not active:
                 self._lab_image = None
                 self._lab_staged = False
+                self._lab_demo_started_at = None
                 self.lab_sim.invalidate()
             return
 
         if self._lab_staged and self.lab_sim.is_ready:
-            step = self.lab_sim.step_for_progress(progress)
-            rendered = self.lab_sim.render(step, elapsed=now, push_in=progress)
+            # Play from the local clock, falling back to the server's progress
+            # only if staging somehow happened without a start time. The server's
+            # value is the authority on when the phase ENDS; it is a poor source
+            # for how far through the animation is, because it arrives in steps.
+            if self._lab_demo_started_at is not None:
+                span = max(self.workflow.autonomous_demo_duration_sec, 0.1)
+                smooth = (now - self._lab_demo_started_at) / span
+                play = float(np.clip(max(smooth, progress), 0.0, 1.0))
+            else:
+                play = progress
+            step = self.lab_sim.step_for_progress(play)
+            rendered = self.lab_sim.render(step, elapsed=now, push_in=play)
             if rendered is not None:
                 self._lab_image = rendered
             telemetry = self.lab_sim.telemetry(step)
