@@ -168,3 +168,41 @@ async def test_phase7_websocket_workflow_e2e():
     finally:
         await client.close()
         await server.stop()
+
+
+def test_autonomous_demo_can_be_replayed_without_re_arming_the_intent():
+    """The demo must be repeatable while the target is still in frame.
+
+    Regression from a live run: the demo ends by returning to IDLE, and IDLE
+    cleared the target label, so the guard in handle_control_command refused
+    every press after the first - silently, with the object still detected and
+    the intent unchanged.
+    """
+    wf = WorkflowController(auto_advance=False)
+    wf.trigger_intent("coffee cup")
+    assert wf._target_label == "coffee cup"
+
+    wf.handle_control_command("START_AUTONOMOUS_DEMO")
+    assert wf.current_phase == ExecutionPhase.AUTONOMOUS_DEMO
+
+    wf.transition_to(ExecutionPhase.IDLE)          # how the demo ends
+    assert wf._target_label == "coffee cup", "the showcase must not clear the intent"
+
+    wf.handle_control_command("START_AUTONOMOUS_DEMO")
+    assert wf.current_phase == ExecutionPhase.AUTONOMOUS_DEMO, "second demo was refused"
+
+
+def test_withdrawing_the_intent_still_clears_the_target():
+    """The exception above is scoped to the demo: an explicit intent withdrawal
+    (or any other route to IDLE) must still clear the target."""
+    wf = WorkflowController(auto_advance=False)
+    wf.trigger_intent("coffee cup")
+
+    wf.transition_to(ExecutionPhase.USER_EXECUTING)
+    wf.transition_to(ExecutionPhase.IDLE)
+    assert wf._target_label == "none"
+
+    wf.trigger_intent("coffee cup")
+    wf.trigger_intent("none")
+    assert wf._target_label == "none"
+    assert wf.current_phase == ExecutionPhase.IDLE

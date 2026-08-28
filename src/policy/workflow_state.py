@@ -171,7 +171,15 @@ class WorkflowController:
 
         if new_phase == ExecutionPhase.IDLE:
             self.recorded_physical_poses.clear()
-            self._target_label = "none"
+            # Returning to IDLE normally means the user withdrew their intent, so
+            # the target is cleared. The Autonomous Demo is the exception: it is a
+            # one-off showcase that ENDS by returning to IDLE, and the user's
+            # intent is untouched by it. Clearing the target there made the demo a
+            # strictly once-per-intent affair - every subsequent press of the
+            # hotkey was refused by the guard in handle_control_command, silently,
+            # while the object was still sitting in frame.
+            if old_phase != ExecutionPhase.AUTONOMOUS_DEMO:
+                self._target_label = "none"
         elif new_phase == ExecutionPhase.USER_EXECUTING:
             self.recorded_physical_poses.clear()
 
