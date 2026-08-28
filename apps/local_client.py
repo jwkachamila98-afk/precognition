@@ -1813,17 +1813,36 @@ class LocalClientRunner:
             logger.warning(f"Could not open microphone input stream ({result.get('error')}). Voice intent capture will use canned fallback text.")
             self._audio_stream = None
 
+    def _open_capture(self, device_id: int):
+        """Open a capture device, preferring AVFoundation on macOS."""
+        if sys.platform == "darwin":
+            cap = cv2.VideoCapture(device_id, cv2.CAP_AVFOUNDATION)
+            if cap.isOpened():
+                return cap
+        return cv2.VideoCapture(device_id)
+
+    @staticmethod
+    def _delivers_frames(cap, attempts: int = 8) -> bool:
+        """Whether a capture actually yields frames, not merely opens.
+
+        isOpened() is not the same question. A camera asked for a mode it does
+        not support opens happily and then fails every read - on macOS each one
+        blocks for a full second first, so the client appears to hang rather
+        than to fail.
+        """
+        for _ in range(attempts):
+            ok, frame = cap.read()
+            if ok and frame is not None:
+                return True
+            time.sleep(0.02)
+        return False
+
     def setup_camera(self) -> None:
         """Initialize physical camera with AVFoundation on macOS or fallback to synthetic."""
         device_id = self.config.camera.device_id
         logger.info(f"Opening camera device {device_id}...")
 
-        if sys.platform == "darwin":
-            self.cap = cv2.VideoCapture(device_id, cv2.CAP_AVFOUNDATION)
-            if not self.cap.isOpened():
-                self.cap = cv2.VideoCapture(device_id)
-        else:
-            self.cap = cv2.VideoCapture(device_id)
+        self.cap = self._open_capture(device_id)
 
         if not self.cap.isOpened():
             logger.warning(f"Could not open physical camera (device_id={device_id}).")
@@ -1838,16 +1857,45 @@ class LocalClientRunner:
             else:
                 raise RuntimeError(f"Failed to open video capture device {device_id}")
         else:
-            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.config.camera.width)
-            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config.camera.height)
+            want_w, want_h = self.config.camera.width, self.config.camera.height
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, want_w)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, want_h)
             self.cap.set(cv2.CAP_PROP_FPS, self.config.camera.fps)
             self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-            for _ in range(5):
-                self.cap.read()
-                time.sleep(0.02)
+            if not self._delivers_frames(self.cap):
+                # Requesting an unsupported mode is not a soft failure: the
+                # device stops delivering entirely. Reopen and take whatever it
+                # natively offers, resizing in software instead.
+                logger.warning(
+                    f"Camera {device_id} opened but delivers no frames at "
+                    f"{want_w}x{want_h} - that mode is unsupported. Reopening at "
+                    f"the camera's native resolution."
+                )
+                self.cap.release()
+                self.cap = self._open_capture(device_id)
+                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-            logger.info(f"Camera opened successfully ({self.config.camera.width}x{self.config.camera.height} @ {self.config.camera.fps} FPS).")
+                if not self._delivers_frames(self.cap):
+                    logger.warning(f"Camera {device_id} delivers no frames in any mode.")
+                    self.cap.release()
+                    if self.config.camera.use_synthetic_if_unavailable:
+                        logger.info("Initializing Synthetic Camera fallback generator...")
+                        self.cap = SyntheticCamera(width=want_w, height=want_h,
+                                                   fps=self.config.camera.fps)
+                        self.is_synthetic_camera = True
+                    else:
+                        raise RuntimeError(f"Camera {device_id} delivers no frames")
+
+            if not self.is_synthetic_camera:
+                got_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                got_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                note = "" if (got_w, got_h) == (want_w, want_h) else \
+                    f" - resizing to {want_w}x{want_h} in software"
+                logger.info(
+                    f"Camera opened successfully ({got_w}x{got_h} @ "
+                    f"{self.config.camera.fps} FPS){note}."
+                )
 
     async def run(self) -> None:
         """Main application execution loop."""
@@ -1900,6 +1948,13 @@ class LocalClientRunner:
 
                 consecutive_failures = 0
                 frame_id += 1
+
+                # The camera may be running at its native resolution because the
+                # configured one was unsupported; everything downstream (network
+                # payload size, recorder, HUD layout) assumes the configured one.
+                if frame.shape[1] != self.config.camera.width or frame.shape[0] != self.config.camera.height:
+                    frame = cv2.resize(frame, (self.config.camera.width, self.config.camera.height),
+                                       interpolation=cv2.INTER_AREA)
 
                 # Mirror real webcam feed horizontally for natural selfie view
                 if not self.is_synthetic_camera:
