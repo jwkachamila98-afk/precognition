@@ -32,6 +32,12 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from config.config_parser import AppConfig
+# Must run before torch/ultralytics are imported: they download models over
+# HTTPS and cannot be handed a custom SSL context (see src/utils/certs.py).
+from src.utils.certs import ensure_ca_bundle
+
+ensure_ca_bundle()
+
 from src.perception.intent_parser import StructuredLLMIntentParser
 from src.mocks.mock_hand_tracker import MockHandTracker
 from src.mocks.mock_depth_estimator import MockDepthEstimator

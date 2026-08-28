@@ -1,6 +1,9 @@
 """Unit and integration tests for Phase 6 Speech-to-Text and Structured LLM Intent Parsing."""
 
 import numpy as np
+import importlib.util
+import sys
+
 import pytest
 
 from src.audio.speech_to_text import MockTranscriber, WhisperTranscriber
@@ -30,6 +33,18 @@ def test_mock_transcriber():
     assert "remote" in transcript or "cup" in transcript or "bottle" in transcript
 
 
+@pytest.mark.skipif(
+    "torch" in sys.modules or importlib.util.find_spec("torch") is not None,
+    reason=(
+        "faster-whisper (ctranslate2) and torch each bundle their own OpenMP "
+        "runtime, and loading both into one process aborts the interpreter on "
+        "macOS - a hard native abort, not an exception, so it takes the whole "
+        "test session with it. local_client.py documents the same conflict and "
+        "avoids NeuralResidualPolicy for exactly this reason. pytest imports "
+        "torch during collection, so this test cannot run in a session where "
+        "torch is installed."
+    ),
+)
 def test_whisper_transcriber_fallback():
     transcriber = WhisperTranscriber(model_size="tiny.en", device="cpu")
     transcriber.start_listening()

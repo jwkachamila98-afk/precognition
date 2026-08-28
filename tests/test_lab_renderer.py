@@ -289,9 +289,14 @@ def test_render_produces_a_lit_image(staged_sim):
     assert 20 < img.mean() < 235       # neither crushed nor blown out
 
 
-def test_render_is_throttled_between_identical_steps(staged_sim):
-    """Back-to-back calls for the same step reuse the frame instead of spending
-    the client's budget re-rendering it."""
+def test_identical_frames_are_never_re_rendered(staged_sim):
+    """The same step and zoom must reuse the cached frame unconditionally.
+
+    Regression: this was additionally gated on a rate-limit interval measured
+    from when the previous render STARTED, so as soon as a render took longer
+    than the interval - which happens the moment the machine is under load - the
+    cache stopped engaging and identical frames were redrawn from scratch.
+    """
     sim, _, _ = staged_sim
     step = sim._contact_step()
     sim._last_render_t = 0.0
@@ -300,6 +305,11 @@ def test_render_is_throttled_between_identical_steps(staged_sim):
     second = sim.render(step, push_in=0.5)
     assert second is first
     assert sim.last_render_ms == -1.0  # untouched: no re-render happened
+
+    # Even with the rate limit long expired, identical content is still reused.
+    sim._last_render_t = 0.0
+    assert sim.render(step, push_in=0.5) is first
+    assert sim.last_render_ms == -1.0
 
 
 def test_prepare_rejects_an_empty_plan():

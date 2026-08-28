@@ -12,6 +12,7 @@ Supported Modes:
 """
 
 import argparse
+import importlib.util
 import asyncio
 import collections
 import math
@@ -37,6 +38,12 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from config.config_parser import AppConfig
+# Must run before torch/ultralytics are imported: they download models over
+# HTTPS and cannot be handed a custom SSL context (see src/utils/certs.py).
+from src.utils.certs import ensure_ca_bundle
+
+ensure_ca_bundle()
+
 from src.perception.hand_tracker import HAND_CONNECTIONS, HandPose, HandTrackerABC
 from src.perception.scene_parser import BoundingBox3D, ParsedScene
 from src.perception.mediapipe_tracker import MediaPipeHandTracker, MEDIAPIPE_AVAILABLE
@@ -1328,6 +1335,19 @@ class LocalClientRunner:
         if gemini_api_key:
             self.transcriber: AudioTranscriberABC = GeminiTranscriber(api_key=gemini_api_key)
             logger.info("LocalClient: Using GeminiTranscriber for voice intent capture.")
+        elif transcriber_type == "whisper" and importlib.util.find_spec("torch") is not None:
+            # Same conflict documented below for NeuralResidualPolicy, but this
+            # one is fatal rather than avoidable: faster-whisper (ctranslate2)
+            # and torch each bundle an OpenMP runtime, and constructing a
+            # WhisperModel in a process where torch is importable aborts the
+            # interpreter outright. Degrade to the mock rather than take the
+            # whole client down mid-session.
+            logger.warning(
+                "LocalClient: torch is installed, which crashes faster-whisper on load "
+                "(conflicting OpenMP runtimes). Falling back to MockTranscriber - set "
+                "GEMINI_API_KEY for real speech-to-text."
+            )
+            self.transcriber: AudioTranscriberABC = MockTranscriber()
         elif transcriber_type == "whisper":
             self.transcriber: AudioTranscriberABC = WhisperTranscriber()
         else:

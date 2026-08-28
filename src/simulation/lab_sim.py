@@ -533,12 +533,17 @@ class LabSimulator:
 
         step = int(np.clip(step, 0, len(self.trajectory.waypoints) - 1))
         key = (step, round(push_in, 3))
-        if (self._last_image is not None
-                and t0 - self._last_render_t < self._min_interval
-                and key == self._last_key):
-            # Nothing new to show and it is too soon to spend another render:
-            # hand back the previous frame rather than the client's frame budget.
-            return self._last_image
+        if self._last_image is not None:
+            if key == self._last_key:
+                # Identical content. Nothing to recompute, whatever the clock
+                # says - gating this on the interval as well meant that once a
+                # render took longer than the interval itself (which it does as
+                # soon as the machine is loaded) the cache never engaged, and
+                # the same frame was redrawn from scratch every call.
+                return self._last_image
+            if t0 - self._last_render_t < self._min_interval:
+                # New content, but too soon to spend the client's frame budget.
+                return self._last_image
         hand = self._hand_mesh_for(step)
         obj = self._object_mesh_for(step)
 
