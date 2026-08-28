@@ -76,6 +76,11 @@ class MockTrajectoryDiffusion(TrajectoryGeneratorABC):
         # showing daylight between the fingers.
         self._flex_closed = 0.55
 
+        # How the wrist is oriented at the START of the approach, expressed as an
+        # offset from the grasp orientation. A hand orients itself as it reaches;
+        # it does not tumble on the way in.
+        self._pre_grasp_offset = np.array([-0.28, -0.18, 0.0], dtype=np.float32)
+
     def _generate_hand_keypoints_3d(
         self,
         wrist_pos: np.ndarray,
@@ -191,7 +196,6 @@ class MockTrajectoryDiffusion(TrajectoryGeneratorABC):
         # Determine start wrist position
         if start_hand_pose is not None and len(start_hand_pose.keypoints_3d) > 0:
             p_start = start_hand_pose.keypoints_3d[0].copy()
-            rot_start = start_hand_pose.mano_params.wrist_rotation.copy() if start_hand_pose.mano_params else np.zeros(3, dtype=np.float32)
         else:
             # No hand observed: start from a READY STANDOFF relative to the object
             # rather than a fixed point in camera space. A hard-coded home pose is
@@ -202,7 +206,6 @@ class MockTrajectoryDiffusion(TrajectoryGeneratorABC):
             # the object and nearer the camera.
             p_start = (target_object.center
                        + np.array([-0.05, -0.11, -0.04], dtype=np.float32))
-            rot_start = np.zeros(3, dtype=np.float32)
 
         bias = learned_bias if learned_bias is not None else np.zeros(3, dtype=np.float32)
 
@@ -217,6 +220,16 @@ class MockTrajectoryDiffusion(TrajectoryGeneratorABC):
         # Nudged by whatever this user has demonstrated in prior attempts.
         p_grasp = self._solve_grasp_wrist(obj_center, approach_offset) + bias
         rot_grasp = self._rot_grasp.copy()
+
+        # The approach begins ALREADY oriented for the grasp, offset only enough
+        # to settle visibly. It used to begin at the identity rotation - or, with
+        # a hand detected, at the tracker's wrist_rotation, which is a
+        # [pitch, yaw, 0] triple derived from the palm direction and NOT the same
+        # parameterisation as _rot_grasp, where rx = 2.85 encodes "inverted".
+        # Either way the wrist interpolated ~163 degrees during the approach: the
+        # hand entered upside down, fingertips 14 cm ABOVE the wrist, and
+        # cartwheeled over on the way in.
+        rot_start = rot_grasp + self._pre_grasp_offset
 
         # Post-grasp lifted position (-Y is up in the camera frame). 9 cm was
         # under 40 px on screen and easy to miss entirely; 14 cm reads clearly

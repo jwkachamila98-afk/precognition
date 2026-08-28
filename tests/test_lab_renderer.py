@@ -701,3 +701,48 @@ def test_geometry_follows_the_plans_target_not_the_frames_detection():
     assert sim.object_size[1] == pytest.approx(0.25, abs=0.02), \
         f"staged {sim.object_size.round(3)} - took its size from the stale detection"
     assert sim.object_size[1] > 2.5 * sim.object_size[0], "a bottle, not a lozenge"
+
+
+def test_the_hand_never_approaches_inverted():
+    """Fingertips must stay below the wrist for a top-down grasp, at every step.
+
+    Reported live as "the ghost hand is inverted". The approach interpolated the
+    wrist orientation from an incompatible starting triple - the identity, or
+    the tracker's [pitch, yaw, 0] palm direction, neither of which is the same
+    parameterisation as the grasp pose where rx = 2.85 encodes "inverted". The
+    hand entered upside down with its fingertips 14 cm ABOVE the wrist and
+    cartwheeled 163 degrees on the way in.
+    """
+    from src.mocks.mock_hand_tracker import MockHandTracker
+    tips = [4, 8, 12, 16, 20]
+
+    for hand in (None, MockHandTracker().estimate(np.zeros((480, 640, 3), np.uint8))[0]):
+        bbox = BoundingBox3D(label="water bottle", center=np.array([0.03, 0.02, 0.55], np.float32),
+                             size=np.array([0.09, 0.28, 0.09], dtype=np.float32))
+        traj = MockTrajectoryDiffusion().generate_foreseen_rollout(
+            start_hand_pose=hand, target_object=bbox,
+            affordance_map=MockAffordanceExtractor().extract_affordance(bbox, "pick"),
+            intent="pick", num_steps=60)
+        sim = LabSimulator(width=192, height=144)
+        assert sim.prepare(traj, bbox, sprite=None)
+
+        for step in range(len(traj.waypoints)):
+            pose = sim._hand_paths_lab[step]
+            assert float(pose[tips][:, 1].mean()) < float(pose[0][1]), (
+                f"step {step}: fingertips above the wrist "
+                f"({'no hand' if hand is None else 'hand'} detected)")
+
+
+def test_the_wrist_does_not_tumble_during_the_approach():
+    """Total wrist rotation across the plan must stay modest. A hand orients
+    itself as it reaches; 163 degrees of roll is a cartwheel."""
+    gen = MockTrajectoryDiffusion()
+    bbox = BoundingBox3D(label="water bottle", center=np.array([0.03, 0.02, 0.55], np.float32),
+                         size=np.array([0.09, 0.28, 0.09], dtype=np.float32))
+    traj = gen.generate_foreseen_rollout(
+        start_hand_pose=None, target_object=bbox,
+        affordance_map=MockAffordanceExtractor().extract_affordance(bbox, "pick"),
+        intent="pick", num_steps=60)
+    rots = np.stack([wp.wrist_pose[3:6] for wp in traj.waypoints])
+    travel = float(np.abs(rots[-1] - rots[0]).max())
+    assert travel < np.radians(45.0), f"wrist rotated {np.degrees(travel):.0f} deg during the plan"
