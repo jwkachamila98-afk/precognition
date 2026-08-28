@@ -295,3 +295,21 @@ def test_deferred_demo_still_expires_while_startable():
     time.sleep(0.08)
     assert wf.poll_pending_demo() is False
     assert wf.current_phase == ExecutionPhase.WAIT_USER
+
+
+def test_restart_phase_timer_extends_the_current_phase():
+    """A phase that had to wait for something before it could begin must still
+    get its full duration for the part the user actually sees."""
+    wf = WorkflowController(auto_advance=True, autonomous_demo_duration_sec=0.20)
+    wf.trigger_intent("coffee cup")
+    wf.transition_to(ExecutionPhase.AUTONOMOUS_DEMO)
+
+    time.sleep(0.15)                       # spent waiting for a target
+    wf.restart_phase_timer()
+    assert wf.step_autonomous_demo() is False, "clock should have restarted"
+    assert wf.current_phase == ExecutionPhase.AUTONOMOUS_DEMO
+    assert wf.phase_progress < 0.5
+
+    time.sleep(0.25)
+    assert wf.step_autonomous_demo() is True
+    assert wf.current_phase == ExecutionPhase.IDLE

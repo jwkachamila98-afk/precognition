@@ -281,6 +281,15 @@ class WorkflowController:
             return True
         return False
 
+    def restart_phase_timer(self) -> None:
+        """Restart the current phase's clock without re-entering the phase.
+
+        Used when a phase has been waiting on something it needed before it
+        could actually begin, so that its duration covers the part the user sees
+        rather than the setup they did not.
+        """
+        self._phase_start_time = time.time()
+
     def poll_pending_demo(self) -> bool:
         """Start a deferred Autonomous Demo once the workflow will accept one.
 

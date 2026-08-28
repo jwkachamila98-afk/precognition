@@ -109,6 +109,9 @@ class WSInferenceServer:
         # pattern as ADAPTING above), not regenerated every frame.
         self._autonomous_demo_generated = False
         self._autonomous_demo_traj = None
+        # When the current demo started waiting for a detectable target.
+        self._autonomous_demo_wait_start = 0.0
+        self._AUTONOMOUS_DEMO_TARGET_TIMEOUT_SEC = 12.0
 
     def _apply_learned_correction(self, traj, target_box, image_shape: tuple) -> None:
         """Run each waypoint of a freshly generated demo trajectory through the
@@ -252,6 +255,7 @@ class WSInferenceServer:
                 self.workflow.poll_pending_demo()
                 current_phase = self.workflow.current_phase
                 if current_phase != ExecutionPhase.AUTONOMOUS_DEMO:
+                    self._autonomous_demo_wait_start = time.time()
                     # Covers being interrupted by any other command mid-demo, not just
                     # the normal timeout - a stale flag would skip regeneration on the
                     # NEXT activation and silently replay an old plan.
@@ -299,7 +303,26 @@ class WSInferenceServer:
                     self._adaptation_computed_this_episode = False
                     self.workflow.step_restarting()
                 elif current_phase == ExecutionPhase.AUTONOMOUS_DEMO:
-                    if not self._autonomous_demo_generated and target_box is not None:
+                    # The demo cannot show anything without a target to plan
+                    # against, so its clock does not start until there is one.
+                    # Previously the phase simply ran its six seconds regardless
+                    # and, if the object happened not to be detected in those
+                    # frames - at ~1 FPS the whole demo is about six frames -
+                    # the user watched six seconds of nothing.
+                    if not self._autonomous_demo_generated and target_box is None:
+                        waited = time.time() - self._autonomous_demo_wait_start
+                        if waited > self._AUTONOMOUS_DEMO_TARGET_TIMEOUT_SEC:
+                            logger.info(
+                                f"Autonomous Demo: no target visible after {waited:.0f}s; "
+                                f"abandoning. Hold the object in view and try again."
+                            )
+                            self.workflow.transition_to(ExecutionPhase.IDLE)
+                        # Hold the phase open; do not burn the demo on an empty scene.
+                        continue_demo = False
+                    else:
+                        continue_demo = True
+
+                    if continue_demo and not self._autonomous_demo_generated and target_box is not None:
                         demo_traj = self.trajectory_diffusion.generate_foreseen_rollout(
                             start_hand_pose=hand_poses[0] if hand_poses else None,
                             target_object=target_box,
@@ -312,11 +335,15 @@ class WSInferenceServer:
                         self._autonomous_demo_traj = demo_traj
                         self.workflow.stored_foreseen_trajectory = demo_traj
                         self._autonomous_demo_generated = True
+                        # The phase has been open while we waited for a target;
+                        # give the plan its full duration from here.
+                        self.workflow.restart_phase_timer()
                         logger.info(
                             f"Autonomous Demo: generated a fresh {len(demo_traj.waypoints)}-step plan "
                             f"for '{target_box.label}' at its current live position, policy-corrected."
                         )
-                    self.workflow.step_autonomous_demo()
+                    if continue_demo:
+                        self.workflow.step_autonomous_demo()
 
                 # 7. Discrepancy Engine & Policy Evaluation
                 real_h = hand_poses[0] if hand_poses else None
