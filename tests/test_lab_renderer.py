@@ -673,3 +673,31 @@ def test_class_mesh_is_preferred_over_the_silhouette():
     assert sim.prepare(traj, bbox, sprite)
     assert sim.object_is_reconstructed is False, "should have used the class mesh"
     assert sim.object_size[1] > sim.object_size[0], "bottle staged upright"
+
+
+def test_geometry_follows_the_plans_target_not_the_frames_detection():
+    """The staged object must match the plan being reenacted.
+
+    The client stages on a later frame than the one the plan was generated from,
+    so the detector may by then be reporting a different object. Taking the label
+    from the frame staged one object's geometry against another object's
+    trajectory - seen live as a bottle plan rendered with a stale, unrecognised
+    box at 4x12x5 cm instead of a 7x25x7 cm bottle.
+    """
+    bbox = BoundingBox3D(label="water bottle", center=np.array([0.03, 0.02, 0.55], np.float32),
+                         size=np.array([0.09, 0.28, 0.09], dtype=np.float32))
+    traj = MockTrajectoryDiffusion().generate_foreseen_rollout(
+        start_hand_pose=None, target_object=bbox,
+        affordance_map=MockAffordanceExtractor().extract_affordance(bbox, "pick"),
+        intent="pick", num_steps=60)
+
+    # The frame the client happens to stage on now shows something else entirely.
+    stale = BoundingBox3D(label="aardvark", center=np.array([0.03, 0.02, 0.55], np.float32),
+                          size=np.array([0.12, 0.05, 0.05], dtype=np.float32))
+    sim = LabSimulator(width=192, height=144)
+    assert sim.prepare(traj, stale, sprite=None)
+
+    assert sim.object_is_reconstructed is False, "should still use the bottle's class mesh"
+    assert sim.object_size[1] == pytest.approx(0.25, abs=0.02), \
+        f"staged {sim.object_size.round(3)} - took its size from the stale detection"
+    assert sim.object_size[1] > 2.5 * sim.object_size[0], "a bottle, not a lozenge"

@@ -421,8 +421,16 @@ class WSInferenceServer:
                 # policy-corrected plan, reusing the same foreseen_trajectory field
                 # the client already knows how to receive - it just means something
                 # different (a hands-off showcase) while this phase is active.
-                if current_phase == ExecutionPhase.AUTONOMOUS_DEMO and self._autonomous_demo_traj is not None:
-                    foreseen_dict = self._autonomous_demo_traj.to_dict()
+                if current_phase == ExecutionPhase.AUTONOMOUS_DEMO:
+                    # Send the demo's own plan, or NOTHING. Falling through to the
+                    # live-guidance trajectory while the demo was still waiting for
+                    # a detectable target let the client stage that stale plan -
+                    # with whatever object had been detected during the previous
+                    # phase - a full eleven seconds before the real demo plan
+                    # existed. The reenactment then showed the wrong object
+                    # entirely. An absent trajectory simply makes the client wait.
+                    foreseen_dict = (self._autonomous_demo_traj.to_dict()
+                                     if self._autonomous_demo_traj is not None else None)
 
                 step_cnt = getattr(self.policy, "step_count", 0)
                 p_loss = getattr(self.policy, "loss_history", [0.0])[-1]

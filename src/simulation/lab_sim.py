@@ -155,7 +155,8 @@ def _size_prior_for(label: Optional[str]) -> Optional[float]:
 
 
 def _object_longest_dimension(bbox: Optional[BoundingBox3D],
-                              hand_palm_m: float) -> float:
+                              hand_palm_m: float,
+                              label: Optional[str] = None) -> float:
     """The manipuland's longest dimension in metres, in a scale the plan supports.
 
     Preference order, weakest evidence last:
@@ -168,7 +169,7 @@ def _object_longest_dimension(bbox: Optional[BoundingBox3D],
     actually close around. Only the SHAPE comes from the silhouette (see
     object_mesh.build_object_mesh); this is scale alone.
     """
-    prior = _size_prior_for(bbox.label if bbox is not None else None)
+    prior = _size_prior_for(label or (bbox.label if bbox is not None else None))
     raw = prior
     source = "class prior"
 
@@ -195,7 +196,7 @@ def _object_longest_dimension(bbox: Optional[BoundingBox3D],
         detected = (float(np.asarray(bbox.size, dtype=np.float32).max())
                     if bbox is not None else float("nan"))
         logger.info(
-            f"LabSimulator: staging '{bbox.label if bbox else '?'}' at its class "
+            f"LabSimulator: staging '{label or (bbox.label if bbox else '?')}' at its class "
             f"prior of {clamped*100:.0f} cm (the detector's non-metric extent said "
             f"{detected*100:.0f} cm)."
         )
@@ -296,7 +297,12 @@ class LabSimulator:
         measured_palm = float(np.median(
             np.linalg.norm(raw_kpts[:, HM._MCP["middle"]] - raw_kpts[:, HM.WRIST], axis=1)))
         scale = float(np.clip(_REFERENCE_PALM_M / max(measured_palm, 1e-4), 0.15, 8.0))
-        longest = _object_longest_dimension(target_bbox, _REFERENCE_PALM_M)
+        # The label comes from the PLAN, not from whatever the detector happens
+        # to see in the frame this client stages on - those are different frames,
+        # and using the latter staged one object's geometry against another
+        # object's trajectory.
+        longest = _object_longest_dimension(target_bbox, _REFERENCE_PALM_M,
+                                            label=self.target_label)
 
         origin_cam = (np.asarray(target_bbox.center, dtype=np.float32) if target_bbox is not None
                       else np.asarray(waypoints[0].object_pose[:3], dtype=np.float32))
@@ -309,8 +315,7 @@ class LabSimulator:
         mesh = None
         self.object_is_reconstructed = False
         try:
-            mesh = OL.build_class_mesh(target_bbox.label if target_bbox else None,
-                                       longest, sprite)
+            mesh = OL.build_class_mesh(self.target_label, longest, sprite)
         except Exception as exc:
             logger.warning(f"LabSimulator: class mesh failed ({exc}); trying the silhouette.")
 
