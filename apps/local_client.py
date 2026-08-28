@@ -486,6 +486,10 @@ class LocalVisualizer:
             if fill_w > 0:
                 cv2.rectangle(frame, (bar_x, bar_y), (bar_x + fill_w, bar_y + bar_h), PALETTE["neon_green"], -1)
 
+        elif phase == ExecutionPhase.RESTARTING:
+            cv2.circle(frame, (bx1 + 18, by1 + 16), int(4 + 2 * pulse), PALETTE["neon_violet"], -1, cv2.LINE_AA)
+            msg = f"Restarting with improved plan  -  {int(progress*100)}%"
+            cv2.putText(frame, msg, (bx1 + 30, by1 + 21), cv2.FONT_HERSHEY_SIMPLEX, 0.36, PALETTE["neon_violet"], 1, cv2.LINE_AA)
         elif phase == ExecutionPhase.ADAPTING or episode_report is not None:
             cv2.circle(frame, (bx1 + 18, by1 + 16), 5, PALETTE["neon_violet"], -1, cv2.LINE_AA)
             rew = episode_report.episode_reward if episode_report else 0.0
@@ -508,6 +512,7 @@ class LocalVisualizer:
             ExecutionPhase.WAIT_USER: ("YOUR TURN", "Move your hand to match the ghost, then press 'c' when ready", PALETTE["cyan_electric"]),
             ExecutionPhase.USER_EXECUTING: ("GO", f"Reach for the {target} now - follow the ghost hand", PALETTE["neon_green"]),
             ExecutionPhase.ADAPTING: ("LEARNING", "Comparing your motion to the plan...", PALETTE["neon_violet"]),
+            ExecutionPhase.RESTARTING: ("TRY AGAIN", f"Restarting with an improved plan for the {target}...", PALETTE["neon_violet"]),
         }
         title, body, color = messages.get(phase, messages[ExecutionPhase.IDLE])
 
@@ -1029,6 +1034,7 @@ class LocalClientRunner:
         self.local_policy = MockResidualPolicy()
         self._last_action = np.zeros(7, dtype=np.float32)
         self._cached_foreseen_traj = None
+        self._local_learned_wrist_bias = np.zeros(3, dtype=np.float32)
 
         # Network client
         self.ws_client = WSStreamingClient(
@@ -1409,13 +1415,17 @@ class LocalClientRunner:
                                 intent=self.intent
                             )
                             start_h = poses[0] if poses else None
-                            if self._cached_foreseen_traj is None or self.workflow.current_phase == ExecutionPhase.FORESEEING:
+                            local_live_guidance = self.workflow.current_phase in (
+                                ExecutionPhase.FORESEEING, ExecutionPhase.USER_EXECUTING
+                            )
+                            if self._cached_foreseen_traj is None or local_live_guidance:
                                 self._cached_foreseen_traj = self.local_trajectory_diffusion.generate_foreseen_rollout(
                                     start_hand_pose=start_h,
                                     target_object=target_box,
                                     affordance_map=affordance_map,
                                     intent=self.intent,
-                                    num_steps=60
+                                    num_steps=60,
+                                    learned_bias=self._local_learned_wrist_bias
                                 )
                                 self.workflow.stored_foreseen_trajectory = self._cached_foreseen_traj
 
@@ -1439,8 +1449,16 @@ class LocalClientRunner:
                         )
                         self.last_episode_report = rep
                         self.benchmark.record_trial(rep, intent=self.intent)
-                        self.workflow.transition_to(ExecutionPhase.IDLE)
+                        episode_offset = np.clip(
+                            np.array(rep.mean_wrist_offset, dtype=np.float32), -0.05, 0.05
+                        )
+                        self._local_learned_wrist_bias = np.clip(
+                            0.6 * self._local_learned_wrist_bias + 0.4 * episode_offset, -0.05, 0.05
+                        )
+                        self.workflow.transition_to(ExecutionPhase.RESTARTING)
                         self._cached_foreseen_traj = None
+                    elif self.workflow.current_phase == ExecutionPhase.RESTARTING:
+                        self.workflow.step_restarting()
 
                     workflow_phase = self.workflow.current_phase
                     phase_progress = self.workflow.phase_progress

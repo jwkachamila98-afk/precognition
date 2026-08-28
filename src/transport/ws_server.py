@@ -88,6 +88,13 @@ class WSInferenceServer:
         self._cached_foreseen_traj = None
         self._last_client_time = time.time()
 
+        # Accumulated co-adaptation signal: mean (real - foreseen) wrist offset across
+        # completed episodes, EMA-blended so the suggested grasp trajectory visibly
+        # shifts toward how this user actually moves over repeated attempts.
+        self._learned_wrist_bias = np.zeros(3, dtype=np.float32)
+        self._BIAS_EMA_ALPHA = 0.4
+        self._BIAS_MAX_METERS = 0.05
+
     async def handle_client(self, websocket: Any) -> None:
         client_address = getattr(websocket, "remote_address", "client")
         logger.info(f"Client connected from {client_address}")
@@ -175,7 +182,8 @@ class WSInferenceServer:
                             target_object=target_box,
                             affordance_map=affordance_map,
                             intent=frame_msg.intent,
-                            num_steps=60
+                            num_steps=60,
+                            learned_bias=self._learned_wrist_bias
                         )
                         self.workflow.stored_foreseen_trajectory = self._cached_foreseen_traj
 
@@ -203,8 +211,23 @@ class WSInferenceServer:
                     self.workflow.last_adaptation_report = episode_report_dict
                     self.benchmark.record_trial(rep, intent=frame_msg.intent)
                     logger.info(f"Episode Discrepancy Compiled: Reward={rep.episode_reward:+.3f} | MSE={rep.mean_pose_error:.4f}m")
-                    self.workflow.transition_to(ExecutionPhase.IDLE)
+
+                    # Fold this episode's directional error into the accumulated
+                    # co-adaptation bias (EMA across iterations, clamped so one noisy
+                    # attempt can't send the plan drifting).
+                    episode_offset = np.clip(
+                        np.array(rep.mean_wrist_offset, dtype=np.float32),
+                        -self._BIAS_MAX_METERS, self._BIAS_MAX_METERS
+                    )
+                    self._learned_wrist_bias = np.clip(
+                        (1.0 - self._BIAS_EMA_ALPHA) * self._learned_wrist_bias + self._BIAS_EMA_ALPHA * episode_offset,
+                        -self._BIAS_MAX_METERS, self._BIAS_MAX_METERS
+                    )
+
+                    self.workflow.transition_to(ExecutionPhase.RESTARTING)
                     self._cached_foreseen_traj = None
+                elif current_phase == ExecutionPhase.RESTARTING:
+                    self.workflow.step_restarting()
 
                 # 7. Discrepancy Engine & Policy Evaluation
                 real_h = hand_poses[0] if hand_poses else None

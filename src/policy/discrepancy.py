@@ -43,6 +43,11 @@ class EpisodeDiscrepancyReport:
     num_steps_sim: int                  # Number of foreseen reference waypoints (usually 60)
     num_steps_real: int                 # Number of physically tracked frames
     policy_loss_delta: float = 0.0      # Loss reduction after policy optimization step
+    mean_wrist_offset: List[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
+    # Mean (real - foreseen) wrist position offset (meters, camera frame) across the
+    # episode. This is the actual co-adaptation signal: the direction the next foreseen
+    # plan should shift to better match how this user really moves, not just a scalar
+    # error magnitude.
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -53,7 +58,8 @@ class EpisodeDiscrepancyReport:
             "episode_reward": float(self.episode_reward),
             "num_steps_sim": int(self.num_steps_sim),
             "num_steps_real": int(self.num_steps_real),
-            "policy_loss_delta": float(self.policy_loss_delta)
+            "policy_loss_delta": float(self.policy_loss_delta),
+            "mean_wrist_offset": [float(v) for v in self.mean_wrist_offset]
         }
 
     @classmethod
@@ -66,7 +72,8 @@ class EpisodeDiscrepancyReport:
             episode_reward=float(data.get("episode_reward", 0.0)),
             num_steps_sim=int(data.get("num_steps_sim", 60)),
             num_steps_real=int(data.get("num_steps_real", 0)),
-            policy_loss_delta=float(data.get("policy_loss_delta", 0.0))
+            policy_loss_delta=float(data.get("policy_loss_delta", 0.0)),
+            mean_wrist_offset=list(data.get("mean_wrist_offset", [0.0, 0.0, 0.0]))
         )
 
 
@@ -309,6 +316,10 @@ class DiscrepancyEngine(DiscrepancyEngineABC):
         final_sim_tip = sim_kpts_seq[-1, 8, :]
         contact_misalign = float(np.linalg.norm(final_real_tip - final_sim_tip))
 
+        # 4b. Mean wrist offset (real - foreseen): the actual co-adaptation signal used
+        # to shift the NEXT foreseen plan toward how this user really moves their hand.
+        wrist_offset = np.mean(aligned_real_kpts[:, 0, :] - sim_kpts_seq[:, 0, :], axis=0)
+
         # 5. Cumulative Episode Reward Formulation
         # R_episode in [-1.0, +1.0]
         alignment_term = np.exp(-4.0 * mean_pose_err)
@@ -339,5 +350,6 @@ class DiscrepancyEngine(DiscrepancyEngineABC):
             episode_reward=r_episode,
             num_steps_sim=N_sim,
             num_steps_real=K_real,
-            policy_loss_delta=loss_delta
+            policy_loss_delta=loss_delta,
+            mean_wrist_offset=wrist_offset.tolist()
         )

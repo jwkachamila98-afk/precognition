@@ -102,10 +102,17 @@ class MockTrajectoryDiffusion(TrajectoryGeneratorABC):
         target_object: BoundingBox3D,
         affordance_map: AffordanceMap,
         intent: str = "foresee me picking this remote control",
-        num_steps: int = 60
+        num_steps: int = 60,
+        learned_bias: Optional[np.ndarray] = None
     ) -> ForeseenTrajectory:
         """
         Generate a 60-frame kinematically stable reference trajectory tau_ref.
+
+        learned_bias: (3,) accumulated mean (real - foreseen) wrist offset from prior
+        completed episodes for this session (see DiscrepancyEngine.compile_episode_
+        discrepancy). Shifts the suggested grasp point toward how this user has
+        actually been moving, so the plan visibly improves across iterations instead
+        of suggesting the same generic approach every time.
         """
         # Determine start wrist position
         if start_hand_pose is not None and len(start_hand_pose.keypoints_3d) > 0:
@@ -115,10 +122,13 @@ class MockTrajectoryDiffusion(TrajectoryGeneratorABC):
             p_start = np.array([0.08, 0.08, 0.48], dtype=np.float32)
             rot_start = np.zeros(3, dtype=np.float32)
 
+        bias = learned_bias if learned_bias is not None else np.zeros(3, dtype=np.float32)
+
         # Target grasp wrist position derived from object center & affordance
         obj_center = target_object.center.copy()
-        # Position hand slightly behind and above target object
-        p_grasp = obj_center + np.array([0.0, -0.03, -0.06], dtype=np.float32)
+        # Position hand slightly behind and above target object, nudged by whatever
+        # this user has demonstrated in prior attempts on this same grasp.
+        p_grasp = obj_center + np.array([0.0, -0.03, -0.06], dtype=np.float32) + bias
         rot_grasp = np.array([0.25, 0.0, 0.1], dtype=np.float32)
 
         # Post-grasp lifted position

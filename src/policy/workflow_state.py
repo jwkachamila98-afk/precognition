@@ -21,6 +21,8 @@ class ExecutionPhase(str, Enum):
     WAIT_USER = "WAIT_USER"               # Rollout complete; waiting for user trigger to begin physical move
     USER_EXECUTING = "USER_EXECUTING"     # Tracking real physical hand vs reference waypoints
     ADAPTING = "ADAPTING"                 # Compiling cumulative trajectory discrepancy & updating residual policy
+    RESTARTING = "RESTARTING"             # Brief pause before looping back into FORESEEING with the
+                                           # updated co-adaptation bias, so the same grasp visibly improves
 
 
 class WorkflowControlSignal(str, Enum):
@@ -56,6 +58,7 @@ class WorkflowController:
         foresee_duration_sec: float = 2.0,
         wait_user_timeout: float = 3.0,
         execution_max_steps: int = 90,
+        restart_delay_sec: float = 2.5,
         auto_advance: bool = True,
         speaker: Optional[SpeechSynthesizerABC] = None,
         voice_guidance_enabled: bool = True
@@ -64,6 +67,7 @@ class WorkflowController:
         self.foresee_duration_sec = foresee_duration_sec
         self.wait_user_timeout = wait_user_timeout
         self.execution_max_steps = execution_max_steps
+        self.restart_delay_sec = restart_delay_sec
         self.auto_advance = auto_advance
         self.speaker = speaker
         self.voice_guidance_enabled = voice_guidance_enabled
@@ -96,6 +100,9 @@ class WorkflowController:
             return min(1.0, len(self.recorded_physical_poses) / float(self.foresee_steps))
         elif self._phase == ExecutionPhase.ADAPTING:
             return 1.0
+        elif self._phase == ExecutionPhase.RESTARTING:
+            elapsed = time.time() - self._phase_start_time
+            return min(1.0, elapsed / max(self.restart_delay_sec, 0.1))
         return 0.0
 
     @property
@@ -126,6 +133,8 @@ class WorkflowController:
             return f"Go. Reach for the {target} now, following the ghost hand."
         elif phase == ExecutionPhase.ADAPTING:
             return "Comparing your motion to the plan now."
+        elif phase == ExecutionPhase.RESTARTING:
+            return f"Nice. Restarting with what I learned about how you grasp the {target}."
         return None
 
     def transition_to(self, new_phase: ExecutionPhase) -> None:
@@ -205,6 +214,21 @@ class WorkflowController:
             return True
         return False
 
+    def step_restarting(self) -> bool:
+        """Brief pause after ADAPTING so the user has a clear moment to register that
+        a new, adapted attempt is about to begin. Loops back into FORESEEING for the
+        SAME target (preserving _target_label) rather than dropping to IDLE, so the
+        improved plan is immediately visible without re-speaking the object name.
+        Returns True once the restart has fired."""
+        if self._phase != ExecutionPhase.RESTARTING:
+            return False
+
+        elapsed = time.time() - self._phase_start_time
+        if elapsed >= self.restart_delay_sec and self.auto_advance:
+            self.trigger_intent(self._target_label)
+            return True
+        return False
+
     def advance_phase(self) -> ExecutionPhase:
         """Manual trigger to jump to the subsequent phase."""
         if self._phase == ExecutionPhase.IDLE:
@@ -216,7 +240,9 @@ class WorkflowController:
         elif self._phase == ExecutionPhase.USER_EXECUTING:
             self.transition_to(ExecutionPhase.ADAPTING)
         elif self._phase == ExecutionPhase.ADAPTING:
-            self.transition_to(ExecutionPhase.IDLE)
+            self.transition_to(ExecutionPhase.RESTARTING)
+        elif self._phase == ExecutionPhase.RESTARTING:
+            self.trigger_intent(self._target_label)  # skip the wait, restart immediately
         return self._phase
 
     def handle_control_command(self, cmd: str) -> None:
