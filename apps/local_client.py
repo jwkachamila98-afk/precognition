@@ -1565,9 +1565,15 @@ class LocalClientRunner:
 
         if active and not self._lab_staged:
             target_bbox = bboxes[0] if bboxes else None
+            self.lab_sim.demo_duration_sec = self.workflow.autonomous_demo_duration_sec
             if self.lab_sim.prepare(foreseen_traj, target_bbox, self._object_sprite):
                 self._lab_staged = True
-                self._lab_demo_started_at = now
+                # Back-date the local clock onto the SERVER's phase clock. Starting
+                # it at the moment of staging left the playback trailing the phase
+                # by however long detection and staging took, so the panel closed
+                # while the animation still had that much left to run.
+                span = max(self.workflow.autonomous_demo_duration_sec, 0.1)
+                self._lab_demo_started_at = now - float(np.clip(progress, 0.0, 1.0)) * span
                 if target_bbox is not None:
                     h, w = frame.shape[:2]
                     centre, px_w, px_h = self.visualizer._bbox_screen_rect(target_bbox, w, h)

@@ -746,3 +746,38 @@ def test_the_wrist_does_not_tumble_during_the_approach():
     rots = np.stack([wp.wrist_pose[3:6] for wp in traj.waypoints])
     travel = float(np.abs(rots[-1] - rots[0]).max())
     assert travel < np.radians(45.0), f"wrist rotated {np.degrees(travel):.0f} deg during the plan"
+
+
+def test_end_hold_is_a_fixed_beat_not_a_fixed_fraction(staged_sim):
+    """Holding the finished grasp for a proportion of the phase reads as a pause
+    at six seconds and as dead air at twelve. It must be a fixed duration."""
+    sim, traj, _ = staged_sim
+    last = float(len(traj.waypoints) - 1)
+
+    for span, expected_hold in ((6.0, 1.4), (12.0, 1.4)):
+        sim.demo_duration_sec = span
+        # Find where the plan finishes playing, in seconds.
+        finished_at = next(p for p in np.linspace(0.0, 1.0, 2001)
+                           if sim.step_for_progress(p) >= last - 1e-6) * span
+        assert abs((span - finished_at) - expected_hold) < 0.25, (
+            f"span {span}s held for {span - finished_at:.2f}s, expected ~{expected_hold}s")
+
+
+def test_a_longer_demo_yields_proportionally_more_motion(staged_sim):
+    """The complaint was the animation cutting off partway. At the frame rates
+    this renders at, the fix is wall-clock time: more seconds means more frames
+    means the approach, grasp and lift all get shown."""
+    sim, _, _ = staged_sim
+
+    def frames_with_motion(span, fps=2.5):
+        sim.demo_duration_sec = span
+        prev, moved = None, 0
+        for i in range(int(fps * span)):
+            pos = sim.step_for_progress(min((i / fps) / span, 1.0))
+            screen = sim.camera.project(sim._lerp_along(sim._hand_paths_lab, pos))[0]
+            if prev is not None and float(np.abs(screen - prev).max()) > 0.5:
+                moved += 1
+            prev = screen
+        return moved
+
+    assert frames_with_motion(12.0) > 1.8 * frames_with_motion(6.0)

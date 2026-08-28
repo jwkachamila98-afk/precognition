@@ -64,7 +64,10 @@ class WorkflowController:
         execution_max_steps: int = 90,
         adapting_duration_sec: float = 3.5,
         restart_delay_sec: float = 2.5,
-        autonomous_demo_duration_sec: float = 6.0,
+        # Six seconds is only a dozen frames on a CPU-only host, which is not
+        # enough to show an approach, a grasp and a lift - the motion appeared
+        # to cut off partway through.
+        autonomous_demo_duration_sec: float = 12.0,
         auto_advance: bool = True,
         speaker: Optional[SpeechSynthesizerABC] = None,
         voice_guidance_enabled: bool = True

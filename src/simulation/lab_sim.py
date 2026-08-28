@@ -70,6 +70,9 @@ _CAM_EL_DEG = 21.0
 # show the grasp closing, with the palm well clear of edge-on.
 _HAND_APPROACH_OFFSET_DEG = 330.0
 
+# How long the completed grasp is held on screen once the plan has played out.
+_END_HOLD_SEC = 1.4
+
 # The lab camera is LOCKED: one pose, identical for every demo, regardless of
 # object or plan. Framing the shot adaptively made each reenactment look like a
 # different scene - the viewer had to re-read the geometry every time before
@@ -237,6 +240,9 @@ class LabSimulator:
         self._ready = False
         self.last_render_ms = 0.0
 
+        # Set by the client from the workflow, so the playback window matches the
+        # phase the server is actually holding.
+        self.demo_duration_sec = 12.0
         self._lights, self._env = self._build_lighting()
         self._vignette = self._build_vignette()
 
@@ -534,7 +540,12 @@ class LabSimulator:
         between the neighbouring waypoints instead.
         """
         n = len(self.trajectory.waypoints) if self.trajectory else 1
-        play = float(np.clip(progress / 0.82, 0.0, 1.0))
+        # Hold the finished grasp for a FIXED beat rather than a fixed fraction:
+        # a proportion that reads as a pause at six seconds reads as dead air at
+        # twelve.
+        span = max(self.demo_duration_sec, 0.5)
+        play_until = float(np.clip(1.0 - _END_HOLD_SEC / span, 0.5, 0.97))
+        play = float(np.clip(progress / play_until, 0.0, 1.0))
         eased = play * play * (3.0 - 2.0 * play)
         return float(np.clip(eased * (n - 1), 0.0, n - 1))
 
