@@ -255,3 +255,43 @@ def test_demo_available_immediately_when_the_phase_allows():
     wf.handle_control_command("START_AUTONOMOUS_DEMO")
     assert wf.current_phase == ExecutionPhase.AUTONOMOUS_DEMO
     assert wf._pending_demo_at is None
+
+
+def test_deferred_demo_survives_an_attempt_longer_than_the_ttl():
+    """A real attempt runs far longer than the expiry window.
+
+    Regression from a live run: the TTL was wall-clock from the keypress, so a
+    44-second execution phase discarded the request every time and the user saw
+    nothing - the same silent failure the deferral was added to fix. The clock
+    must only run while a phase would actually accept the demo.
+    """
+    wf = WorkflowController(auto_advance=False)
+    wf.pending_demo_ttl_sec = 0.05
+    wf.trigger_intent("coffee cup")
+    wf.transition_to(ExecutionPhase.USER_EXECUTING)
+    wf.handle_control_command("START_AUTONOMOUS_DEMO")
+
+    # Far longer than the TTL, but all of it inside a phase that refuses.
+    for _ in range(4):
+        time.sleep(0.03)
+        assert wf.poll_pending_demo() is False
+    assert wf._pending_demo_at is not None, "request must survive a long attempt"
+
+    wf.transition_to(ExecutionPhase.WAIT_USER)
+    assert wf.poll_pending_demo() is True
+    assert wf.current_phase == ExecutionPhase.AUTONOMOUS_DEMO
+
+
+def test_deferred_demo_still_expires_while_startable():
+    """The expiry must still fire when the demo could have run but did not."""
+    wf = WorkflowController(auto_advance=False)
+    wf.pending_demo_ttl_sec = 0.05
+    wf.trigger_intent("coffee cup")
+    wf.transition_to(ExecutionPhase.USER_EXECUTING)
+    wf.handle_control_command("START_AUTONOMOUS_DEMO")
+    wf.poll_pending_demo()
+
+    wf._phase = ExecutionPhase.WAIT_USER      # startable, but never polled
+    time.sleep(0.08)
+    assert wf.poll_pending_demo() is False
+    assert wf.current_phase == ExecutionPhase.WAIT_USER

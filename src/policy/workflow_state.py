@@ -88,6 +88,9 @@ class WorkflowController:
         # A demo requested while the workflow was mid-episode, waiting for a
         # phase that will accept it. See handle_control_command.
         self._pending_demo_at: Optional[float] = None
+        # Counted only while a phase WOULD accept the demo (see
+        # poll_pending_demo), so this bounds "how long a startable request may
+        # sit unstarted", not how long the user's attempt is allowed to take.
         self.pending_demo_ttl_sec = 20.0
         self.speaker = speaker
         self.voice_guidance_enabled = voice_guidance_enabled
@@ -288,16 +291,24 @@ class WorkflowController:
         if self._pending_demo_at is None:
             return False
 
+        if self._target_label in ("none", "idle", "clear", ""):
+            self._pending_demo_at = None
+            logger.info("Autonomous Demo request dropped: the target was cleared.")
+            return False
+
+        if self._phase in (ExecutionPhase.USER_EXECUTING, ExecutionPhase.ADAPTING,
+                           ExecutionPhase.AUTONOMOUS_DEMO):
+            # Hold the request AND the clock. The expiry exists so a forgotten
+            # request cannot fire out of nowhere, not to impose a deadline on
+            # the attempt the user is in the middle of - a real attempt runs
+            # 45 s or more, so a wall-clock timer measured from the keypress
+            # simply discarded the request every time.
+            self._pending_demo_at = time.time()
+            return False
+
         if time.time() - self._pending_demo_at > self.pending_demo_ttl_sec:
             self._pending_demo_at = None
             logger.info("Autonomous Demo request expired before a phase would accept it.")
-            return False
-
-        if self._target_label in ("none", "idle", "clear", ""):
-            self._pending_demo_at = None
-            return False
-        if self._phase in (ExecutionPhase.USER_EXECUTING, ExecutionPhase.ADAPTING,
-                           ExecutionPhase.AUTONOMOUS_DEMO):
             return False
 
         self._pending_demo_at = None
