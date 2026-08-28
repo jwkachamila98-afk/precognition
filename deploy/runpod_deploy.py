@@ -115,11 +115,24 @@ def get_status(api_key: str = DEFAULT_API_KEY) -> None:
             print(f"    - Status:   {status}")
             print(f"    - Rate:     ${cost:.3f}/hr")
             print(f"    - Uptime:   {uptime} seconds")
-            
-            # WebSocket proxy URL
-            ws_proxy = f"wss://{pod_id}-8765.proxy.runpod.net"
-            print(f"    - WebSocket Endpoint: {ws_proxy}")
-            print(f"    - Connect Command:    python apps/run_demo.py --server-url {ws_proxy}")
+
+            # Connect over the DIRECT TCP mapping, not the HTTPS proxy.
+            # RunPod's *-8765.proxy.runpod.net hostname does not forward to the
+            # container's 8765: the HTTP proxy is bound to a different internal
+            # port, so a WebSocket upgrade against it is rejected with HTTP 404
+            # even while the server is healthy and listening on 0.0.0.0:8765.
+            # The runtime port list carries the real public IP and port.
+            ws_url = None
+            for port in (runtime.get("ports") or []):
+                if port.get("privatePort") == 8765 and port.get("ip"):
+                    ws_url = f"ws://{port['ip']}:{port['publicPort']}"
+                    break
+
+            if ws_url:
+                print(f"    - WebSocket Endpoint: {ws_url}")
+                print(f"    - Connect Command:    python apps/run_demo.py --server-url {ws_url}")
+            else:
+                print("    - WebSocket Endpoint: (not mapped yet - pod still starting)")
             print("-" * 65)
 
     print("=" * 65 + "\n")
@@ -149,7 +162,7 @@ def launch_pod(
             imageName: "{image_name}",
             ports: "8765/http,8765/tcp,22/tcp",
             volumeMountPath: "/workspace",
-            dockerArgs: "bash -c 'mkdir -p /workspace/Precognition && (git clone https://github.com/jwkachamila98-afk/precognition.git /workspace/Precognition || (cd /workspace/Precognition && git pull)) ; cd /workspace/Precognition ; pip install websockets opencv-python-headless mediapipe scipy pyyaml certifi ; python apps/remote_server.py --port 8765 ; sleep infinity'"
+            dockerArgs: "bash -c 'mkdir -p /workspace/Precognition && (git clone https://github.com/jwkachamila98-afk/precognition.git /workspace/Precognition || (cd /workspace/Precognition && git pull)) ; cd /workspace/Precognition ; pip install websockets opencv-python-headless mediapipe scipy pyyaml certifi ; python apps/remote_server.py --host 0.0.0.0 --port 8765 ; sleep infinity'"
         }}) {{
             id
             imageName
@@ -163,9 +176,12 @@ def launch_pod(
     if deploy_data:
         pod_id = deploy_data.get("id")
         print(f"[✓] GPU Pod Successfully Created! (ID: {pod_id})")
-        print(f"[*] WebSocket Proxy URL: wss://{pod_id}-8765.proxy.runpod.net")
-        print("\n[✓] Once the pod initializes (~60s), connect your Mac visualizer with:")
-        print(f"    python apps/run_demo.py --server-url wss://{pod_id}-8765.proxy.runpod.net\n")
+        print("\n[✓] Once the pod initializes (~2-3 min), run this to get its endpoint:")
+        print("    python deploy/runpod_deploy.py status")
+        print("[i] Connect over the DIRECT TCP mapping it prints (ws://<ip>:<port>).")
+        print("    The wss://<pod>-8765.proxy.runpod.net hostname does NOT work: the")
+        print("    HTTP proxy is bound to a different internal port and rejects the")
+        print("    WebSocket upgrade with HTTP 404 even when the server is healthy.\n")
     else:
         print("[!] Pod creation response did not return an instance ID. Check account credits or GPU availability.")
 

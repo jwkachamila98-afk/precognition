@@ -266,6 +266,74 @@ part of the plan leaves the viewport.
 
 ---
 
+## Deploying to RunPod (verified 2026-08-28)
+
+Launch a pod, then ask it for its endpoint:
+
+```bash
+export RUNPOD_API_KEY=...
+python deploy/runpod_deploy.py launch --gpu "NVIDIA GeForce RTX 4090"
+python deploy/runpod_deploy.py status      # prints the ws:// endpoint to connect to
+python apps/run_demo.py --server-url ws://<ip>:<port>
+python deploy/runpod_deploy.py terminate --pod <pod_id>
+```
+
+**Connect over the direct TCP mapping, not the HTTPS proxy.** The
+`wss://<pod_id>-8765.proxy.runpod.net` hostname does *not* reach the server:
+RunPod's HTTP proxy is bound to a different internal port, so the WebSocket
+upgrade is rejected with `HTTP 404` even while the server is healthy and
+listening on `0.0.0.0:8765`. `runpod_deploy.py status` reads the pod's runtime
+port list and prints the working `ws://<public_ip>:<public_port>` instead.
+
+**Pick a data centre near you.** Measured from the US against a pod in
+`EU-CZ-1`: **644 ms mean / 2.0 s p95** round-trip, versus ~107 ms against a
+server on localhost. The client is built to tolerate this (network I/O is
+decoupled from the render loop) but the workflow paces itself off round-trips,
+so a distant pod makes every phase drag.
+
+**The server's workflow persists across client connections.** It is one
+`WorkflowController` per server process, not per connection, so reconnecting
+does not reset it - and `START_AUTONOMOUS_DEMO` is refused while the phase is
+`USER_EXECUTING` or `ADAPTING`. If the demo hotkey appears to do nothing after a
+disconnect, the server is parked mid-episode. There is currently no hotkey bound
+to `RESET_IDLE` (`x` / `Ctrl+R` sends `RESET_BASELINE`, which resets policy
+weights, not the phase); restarting the server clears it.
+
+**Do not `pkill -f` anything on a pod.** The container's PID 1 command line
+contains the entire start script, including the server's path, so a pattern like
+`pkill -f apps/remote_server.py` matches PID 1 and kills the container.
+
+### What the cloud run exercised
+
+The simulated lab renders on the **client**, so the pod exercises the plan side:
+perception, trajectory generation, and the policy correction, all on GPU
+(`MiDaS_small`, `yolov8s`, and `NeuralResidualPolicy` on CUDA, with real online
+RWR updates). The client then stages that GPU-generated plan in the lab. Server
+log from the verified run:
+
+```
+[IDLE] -> [FORESEEING] -> [AUTONOMOUS_DEMO]
+Autonomous Demo: generated a fresh 60-step plan for 'wine glass'
+                 at its current live position, policy-corrected
+NeuralResidualPolicy: RWR update #1 (batch=16) loss=0.0616
+```
+
+and the matching client log, showing the object-scale guard doing its job on
+real (not synthetic) depth:
+
+```
+LabSimulator: detector reported the target at 74 cm, which the grasping hand
+              (9.2 cm palm) could not handle; staging it at 20 cm instead.
+LabSimulator: staged 'wine glass' (10x19x8 cm, hand scale x1.01) across 60 steps
+              - lab 484 tris static, 144 object tris, prepared in 684 ms.
+```
+
+That 74 cm is what MiDaS-derived depth reports for a wine glass, which is why
+the manipuland's scale is bounded by the hand rather than trusted from the
+detector. See **The Simulated Lab** above.
+
+---
+
 ## Safety Guardrails & Interlocks
 
 The system actively enforces the following hard constraints in real time ([`SafetyMonitor`](file:///Users/jameskachamila/Desktop/Precognition/src/safety/safety_monitor.py)):
