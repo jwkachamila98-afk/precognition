@@ -43,7 +43,7 @@ from src.perception.mediapipe_tracker import MediaPipeHandTracker, MEDIAPIPE_AVA
 from src.perception.intent_parser import IntentParserABC, MockLLMIntentParser, ParsedIntent
 from src.audio.speech_to_text import AudioTranscriberABC, GeminiTranscriber, MockTranscriber, WhisperTranscriber
 from src.audio.text_to_speech import GeminiSpeaker, SpeechSynthesizerABC, SystemSpeaker
-from src.simulation.trajectory_generator import AffordanceMap, ForeseenTrajectory, ForeseenWaypoint
+from src.simulation.trajectory_generator import AffordanceMap, ForeseenTrajectory
 from src.policy.discrepancy import DiscrepancyEngine, DiscrepancyState, EpisodeDiscrepancyReport
 from src.policy.workflow_state import ExecutionPhase, WorkflowController
 from src.policy.checkpointing import PolicyCheckpointManager
@@ -68,11 +68,6 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 )
 logger = logging.getLogger("LocalClient")
-
-# Short lookahead into the continuously-replanned foreseen trajectory used to render
-# the "current" ghost hand pose - roughly 12/60 * 2.0s duration ~= 0.4s ahead of the
-# real hand's current position, rather than playing the full trajectory as an animation.
-GHOST_LOOKAHEAD_STEPS = 12
 
 # Preset intent prompts for cycling via keypress 'i'
 PRESET_INTENTS = [
@@ -325,83 +320,6 @@ class LocalVisualizer:
         t = dst_p0 - R @ src_p0
         return R.astype(np.float32), t.astype(np.float32)
 
-    @staticmethod
-    def _project_3d(p3d: np.ndarray, w: int, h: int) -> np.ndarray:
-        """Project a 3D camera-frame point to 2D pixels using the same default pinhole
-        intrinsics convention used throughout this project (BoundingBox3D.project_to_2d,
-        MockTrajectoryDiffusion._project_2d) when no calibrated intrinsics are available."""
-        fx = fy = 0.8 * w
-        cx, cy = w / 2.0, h / 2.0
-        z = max(float(p3d[2]), 0.1)
-        return np.array([fx * p3d[0] / z + cx, fy * p3d[1] / z + cy], dtype=np.float32)
-
-    def _draw_ghost_object_afterimage(
-        self,
-        frame: np.ndarray,
-        trajectory: ForeseenTrajectory,
-        step_idx: int,
-        xf,
-        target_bbox: BoundingBox3D,
-    ) -> None:
-        """Ghost afterimage of the object being picked up.
-
-        The object's screen position is anchored to target_bbox - the REAL, currently
-        detected object position (ground truth, refreshed every frame) - not derived
-        from the trajectory's own object_pose field directly. object_pose was computed
-        server-side from whatever object position the server saw when the trajectory
-        was generated, in the SAME coordinate convention as the hand; applying the
-        hand's re-anchoring transform (xf) to it, as an earlier version of this code
-        did, mixed hand-tracking corrections into an unrelated real-world position and
-        made the box appear disconnected from the actual object.
-
-        Instead: pre-contact, the object hasn't moved, so it's drawn exactly at
-        target_bbox's real position. Once contact begins, only the RELATIVE 3D
-        displacement since the grasp moment (current object_pose - object_pose at the
-        first contact waypoint) is added onto that real position - this is the same
-        physical lift motion the hand undergoes, so the box visibly lifts with the
-        ghost hand without ever losing lock on where the object actually is.
-        """
-        h, w = frame.shape[:2]
-        depth = max(float(target_bbox.center[2]), 0.1)
-        px_w = max(10, int(0.8 * w * float(target_bbox.size[0]) / depth))
-        px_h = max(10, int(0.8 * w * float(target_bbox.size[1]) / depth))
-
-        grasp_idx = next(
-            (i for i, wp in enumerate(trajectory.waypoints) if float(np.max(wp.contact_state)) > 0.5),
-            len(trajectory.waypoints) - 1,
-        )
-        grasp_object_pos = trajectory.waypoints[grasp_idx].object_pose[:3]
-
-        def real_anchored_2d(step: int) -> np.ndarray:
-            wp = trajectory.waypoints[step]
-            delta_3d = wp.object_pose[:3] - grasp_object_pos if step >= grasp_idx else np.zeros(3, dtype=np.float32)
-            world_pos = target_bbox.center + delta_3d
-            return self._project_3d(world_pos, w, h)
-
-        trail_span = 24
-        trail_steps = sorted(set(range(max(0, step_idx - trail_span), step_idx, 4)) | {step_idx})
-
-        overlay = frame.copy()
-        for s in trail_steps:
-            wp = trajectory.waypoints[s]
-            center = real_anchored_2d(s)
-            cx_i, cy_i = int(np.clip(center[0], 0, w - 1)), int(np.clip(center[1], 0, h - 1))
-            age = (step_idx - s) / float(trail_span)
-            in_contact = float(np.max(wp.contact_state)) > 0.5
-            color = (0, 210, 255) if in_contact else (150, 210, 255)
-            cv2.ellipse(overlay, (cx_i, cy_i), (px_w // 2, px_h // 2), 0, 0, 360, color, -1, cv2.LINE_AA)
-            if s != step_idx:
-                cv2.addWeighted(overlay, 0.30 * (1.0 - age), frame, 1.0 - 0.30 * (1.0 - age), 0, dst=frame)
-                overlay = frame.copy()
-
-        # Crisp outline + label on the current step
-        center = real_anchored_2d(step_idx)
-        cx_i, cy_i = int(np.clip(center[0], 0, w - 1)), int(np.clip(center[1], 0, h - 1))
-        cv2.ellipse(frame, (cx_i, cy_i), (px_w // 2, px_h // 2), 0, 0, 360, (0, 235, 255), 2, cv2.LINE_AA)
-        label = target_bbox.label.replace("_", " ")
-        cv2.putText(frame, label, (cx_i - px_w // 2, cy_i - px_h // 2 - 6),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.34, (0, 235, 255), 1, cv2.LINE_AA)
-
     def _draw_hand_mesh(
         self,
         frame: np.ndarray,
@@ -459,53 +377,133 @@ class LocalVisualizer:
 
         cv2.addWeighted(overlay, alpha, frame, 1.0 - alpha, 0, dst=frame)
 
-    def draw_foreseen_ghost_trajectory(
+    def _draw_object_replay_afterimage(
         self,
         frame: np.ndarray,
-        trajectory: Optional[ForeseenTrajectory],
-        step_override: Optional[int] = None,
-        real_poses: Optional[List[HandPose]] = None,
-        target_bbox: Optional[BoundingBox3D] = None,
-        label: str = "NEXT-STEP GUIDE",
-    ) -> int:
-        """Render animated holographic Foreseen Ghost Hand rollout with particle comets
-        and a ghost afterimage of the target object.
+        replay_poses: List[HandPose],
+        idx: int,
+        xf,
+        target_bbox: BoundingBox3D,
+    ) -> None:
+        """Ghost afterimage of the object as it would be manipulated by the
+        replayed hand motion.
 
-        Re-anchored every frame to the real, live hand pose (position AND orientation,
-        via a 2D similarity transform from wrist -> middle-MCP) so the ghost visibly
-        starts at the same spot and angle as the real hand and tracks it continuously,
-        rather than a fixed pose baked in whenever the trajectory was generated
-        server-side (which may be stale or from a frame where the hand wasn't visible)."""
-        if not self.show_foreseen_ghost or trajectory is None or not trajectory.waypoints:
+        Anchored to target_bbox - the REAL, currently detected object position
+        (ground truth, refreshed every frame) - never a simulated position,
+        since a real recorded hand replay carries no object-physics data of its
+        own to draw from.
+
+        Contact is approximated as the replay frame where the recorded wrist
+        comes closest to the object in 3D (the real hand tracker's own 3D
+        estimate). Before that frame the object hasn't moved, so it's drawn
+        exactly at the real bbox position. From that frame onward, the object
+        ghost follows the SAME relative 2D screen displacement the wrist
+        undergoes since the contact moment (in the replay's own re-anchored
+        space via xf) - approximating "the object moves rigidly with the hand
+        once grasped" without a separate physics simulation.
+        """
+        h, w = frame.shape[:2]
+        depth = max(float(target_bbox.center[2]), 0.1)
+        px_w = max(10, int(0.8 * w * float(target_bbox.size[0]) / depth))
+        px_h = max(10, int(0.8 * w * float(target_bbox.size[1]) / depth))
+
+        fx = fy = 0.8 * w
+        cx, cy = w / 2.0, h / 2.0
+        bbox_2d = np.array(
+            [fx * target_bbox.center[0] / depth + cx, fy * target_bbox.center[1] / depth + cy],
+            dtype=np.float32,
+        )
+
+        dists = [float(np.linalg.norm(p.keypoints_3d[0] - target_bbox.center)) for p in replay_poses]
+        grasp_idx = int(np.argmin(dists))
+        grasp_wrist_2d = replay_poses[grasp_idx].keypoints_2d[0].reshape(1, 2)
+
+        def anchored_2d(step: int) -> np.ndarray:
+            if step < grasp_idx:
+                return bbox_2d
+            wrist_2d = replay_poses[step].keypoints_2d[0].reshape(1, 2)
+            delta = xf(wrist_2d)[0] - xf(grasp_wrist_2d)[0]
+            return bbox_2d + delta
+
+        trail_span = 24
+        trail_steps = sorted(set(range(max(0, idx - trail_span), idx, 4)) | {idx})
+
+        overlay = frame.copy()
+        for s in trail_steps:
+            center = anchored_2d(s)
+            cx_i, cy_i = int(np.clip(center[0], 0, w - 1)), int(np.clip(center[1], 0, h - 1))
+            age = (idx - s) / float(trail_span)
+            in_contact = s >= grasp_idx
+            color = (0, 210, 255) if in_contact else (150, 210, 255)
+            cv2.ellipse(overlay, (cx_i, cy_i), (px_w // 2, px_h // 2), 0, 0, 360, color, -1, cv2.LINE_AA)
+            if s != idx:
+                cv2.addWeighted(overlay, 0.30 * (1.0 - age), frame, 1.0 - 0.30 * (1.0 - age), 0, dst=frame)
+                overlay = frame.copy()
+
+        # Crisp outline + label on the current replay frame
+        center = anchored_2d(idx)
+        cx_i, cy_i = int(np.clip(center[0], 0, w - 1)), int(np.clip(center[1], 0, h - 1))
+        cv2.ellipse(frame, (cx_i, cy_i), (px_w // 2, px_h // 2), 0, 0, 360, (0, 235, 255), 2, cv2.LINE_AA)
+        label = target_bbox.label.replace("_", " ")
+        cv2.putText(frame, label, (cx_i - px_w // 2, cy_i - px_h // 2 - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.34, (0, 235, 255), 1, cv2.LINE_AA)
+
+    def draw_hand_replay(
+        self,
+        frame: np.ndarray,
+        replay_poses: Optional[List[HandPose]],
+        real_poses: Optional[List[HandPose]] = None,
+        reanchor: bool = False,
+        label: str = "",
+        color: tuple = (255, 235, 100),
+        target_bbox: Optional[BoundingBox3D] = None,
+    ) -> int:
+        """Render an afterimage/replay of a REAL previously-recorded hand motion -
+        never a synthetic generated plan. Two uses:
+
+        - reanchor=True: the preview shown during FORESEEING for the 2nd+ attempt at
+          the same object. It replays the user's OWN previous attempt, re-anchored
+          (2D similarity transform, wrist -> middle-MCP) to start from wherever the
+          real hand currently is, so it reads as "here's roughly what you did last
+          time, from here." Nothing is drawn on the very first attempt (no prior
+          recording yet) - callers pass replay_poses=None in that case.
+        - reanchor=False: the post-execution review moment during ADAPTING. It
+          replays the attempt that JUST finished at its own real recorded screen
+          positions, unmodified - literally "here's what you just did."
+
+        Never called during USER_EXECUTING - the user's real hand is unobstructed
+        while actually performing the action."""
+        if not self.show_foreseen_ghost or not replay_poses:
             self._smoothed_ghost_kpts = None
             return 0
 
         h, w = frame.shape[:2]
-        num_steps = len(trajectory.waypoints)
-        step_idx = (step_override if step_override is not None else self.anim_frame_idx) % num_steps
-        current_wp: ForeseenWaypoint = trajectory.waypoints[step_idx]
+        num_frames = len(replay_poses)
+        idx = self.anim_frame_idx % num_frames
+        current_pose = replay_poses[idx]
 
-        if real_poses and len(real_poses[0].keypoints_2d) > 9:
+        if reanchor and real_poses and len(real_poses[0].keypoints_2d) > 9:
             real_kpts = real_poses[0].keypoints_2d
-            ghost_kpts0 = trajectory.waypoints[0].hand_keypoints_2d
+            replay_kpts0 = replay_poses[0].keypoints_2d
             self._ghost_transform = self._compute_similarity_transform(
-                ghost_kpts0[0], ghost_kpts0[9], real_kpts[0], real_kpts[9]
+                replay_kpts0[0], replay_kpts0[9], real_kpts[0], real_kpts[9]
             )
-        R, t = self._ghost_transform
+            R, t = self._ghost_transform
+        else:
+            R, t = np.eye(2, dtype=np.float32), np.zeros(2, dtype=np.float32)
 
         def xf(pts_2d: np.ndarray) -> np.ndarray:
             return pts_2d @ R.T + t
 
-        # 0. Ghost object afterimage (drawn first, underneath the hand)
+        # Object afterimage (drawn first, underneath the hand)
         if target_bbox is not None:
-            self._draw_ghost_object_afterimage(frame, trajectory, step_idx, xf, target_bbox)
+            self._draw_object_replay_afterimage(frame, replay_poses, idx, xf, target_bbox)
 
-        # 1. Shimmering Trajectory Comet Ribbon
-        trail_pts_raw = xf(np.stack([wp.hand_keypoints_2d[0] for wp in trajectory.waypoints]))
+        # Shimmering trail of the wrist path across the whole recorded motion.
+        trail_pts_raw = xf(np.stack([p.keypoints_2d[0] for p in replay_poses]))
         trail_pts = [
             (int(np.clip(u, 0, w - 1)), int(np.clip(v, 0, h - 1))) for u, v in trail_pts_raw
         ]
-
         if len(trail_pts) > 1:
             for i in range(len(trail_pts) - 1):
                 alpha_frac = i / float(len(trail_pts))
@@ -516,22 +514,22 @@ class LocalVisualizer:
                 )
                 cv2.line(frame, trail_pts[i], trail_pts[i + 1], trail_color, 1 + int(alpha_frac * 2), lineType=cv2.LINE_AA)
 
-        # 2. Holographic Dotted Ghost Hand Pose, smoothed toward the latest replanned
-        # target so it glides continuously rather than snapping on each server update.
-        target_kpts_2d = xf(current_wp.hand_keypoints_2d)
+        # Holographic afterimage hand, smoothed frame-to-frame so the loop glides
+        # rather than snapping between recorded samples.
+        target_kpts_2d = xf(current_pose.keypoints_2d)
         if self._smoothed_ghost_kpts is None or self._smoothed_ghost_kpts.shape != target_kpts_2d.shape:
             self._smoothed_ghost_kpts = target_kpts_2d.copy()
         else:
             self._smoothed_ghost_kpts = self._smoothed_ghost_kpts + 0.35 * (target_kpts_2d - self._smoothed_ghost_kpts)
         ghost_kpts_2d = self._smoothed_ghost_kpts
-        ghost_color = (255, 235, 100) # Bright Ice Cyan
-        self._draw_hand_mesh(frame, ghost_kpts_2d, ghost_color, alpha=0.80)
+        self._draw_hand_mesh(frame, ghost_kpts_2d, color, alpha=0.80)
 
-        wrist_pt = (int(np.clip(ghost_kpts_2d[0, 0], 0, w - 1)), int(np.clip(ghost_kpts_2d[0, 1], 0, h - 1)))
-        cv2.putText(frame, label, (wrist_pt[0] - 60, wrist_pt[1] - 14),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, ghost_color, 1, cv2.LINE_AA)
+        if label:
+            wrist_pt = (int(np.clip(ghost_kpts_2d[0, 0], 0, w - 1)), int(np.clip(ghost_kpts_2d[0, 1], 0, h - 1)))
+            cv2.putText(frame, label, (wrist_pt[0] - 60, wrist_pt[1] - 14),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, color, 1, cv2.LINE_AA)
 
-        return step_idx + 1
+        return idx + 1
 
     def draw_workflow_banner(
         self,
@@ -597,18 +595,24 @@ class LocalVisualizer:
             msg = "Standby - press 'i' or talk ('v')"
             cv2.putText(frame, msg, (bx1 + 30, by1 + 21), cv2.FONT_HERSHEY_SIMPLEX, 0.36, PALETTE["text_dim"], 1, cv2.LINE_AA)
 
-    def draw_instruction_bar(self, frame: np.ndarray, phase: ExecutionPhase, target_label: str = "") -> None:
+    def draw_instruction_bar(
+        self, frame: np.ndarray, phase: ExecutionPhase, target_label: str = "", has_replay: bool = False
+    ) -> None:
         """Large, unmissable bottom-center bar stating exactly what to do right now,
         in plain language - separate from the compact top-of-frame status banner."""
         h, w = frame.shape[:2]
         target = target_label.replace("_", " ") if target_label and target_label.lower() not in ("none", "") else "an object"
 
+        foreseeing_body = (
+            f"Watch a replay of your last attempt at the {target}..." if has_replay
+            else f"First try - go with your best guess for the {target}. Get ready..."
+        )
         messages = {
             ExecutionPhase.IDLE: ("STANDBY", "Hold 'v' or SPACE and say what to pick up, e.g. \"wine glass\"", PALETTE["text_dim"]),
-            ExecutionPhase.FORESEEING: ("PREVIEWING", f"Watch the ghost hand plan how to grab the {target}...", PALETTE["amber_gold"]),
-            ExecutionPhase.WAIT_USER: ("YOUR TURN", "Move your hand to match the ghost, then press 'c' when ready", PALETTE["cyan_electric"]),
-            ExecutionPhase.USER_EXECUTING: ("GO", f"Reach for the {target} now - follow the ghost hand", PALETTE["neon_green"]),
-            ExecutionPhase.ADAPTING: ("LEARNING", "Comparing your motion to the plan...", PALETTE["neon_violet"]),
+            ExecutionPhase.FORESEEING: ("PREVIEWING", foreseeing_body, PALETTE["amber_gold"]),
+            ExecutionPhase.WAIT_USER: ("YOUR TURN", "Get in position, then press 'c' when ready", PALETTE["cyan_electric"]),
+            ExecutionPhase.USER_EXECUTING: ("GO", f"Reach for the {target} now - do it your way", PALETTE["neon_green"]),
+            ExecutionPhase.ADAPTING: ("REVIEW", "Here's a replay of what you just did...", PALETTE["neon_violet"]),
             ExecutionPhase.RESTARTING: ("TRY AGAIN", f"Restarting with an improved plan for the {target}...", PALETTE["neon_violet"]),
         }
         title, body, color = messages.get(phase, messages[ExecutionPhase.IDLE])
@@ -1114,6 +1118,7 @@ class LocalClientRunner:
         self.is_synthetic_camera = False
         self._audio_stream: Optional["sd.InputStream"] = None
         self._is_fullscreen = False
+        self._screen_w, self._screen_h = self._detect_screen_size()
 
         selected_tracker = tracker_type or config.perception.hand_tracker.tracker_type
         self.use_mediapipe = (selected_tracker == "mediapipe") and MEDIAPIPE_AVAILABLE
@@ -1143,6 +1148,7 @@ class LocalClientRunner:
         self._last_action = np.zeros(7, dtype=np.float32)
         self._cached_foreseen_traj = None
         self._local_learned_wrist_bias = np.zeros(3, dtype=np.float32)
+        self._local_adaptation_computed_this_episode = False
 
         # Network client
         self.ws_client = WSStreamingClient(
@@ -1162,6 +1168,18 @@ class LocalClientRunner:
         self._network_got_first_response = False
         self._last_announced_phase: Optional[ExecutionPhase] = None
         self._training_target_announced: Optional[str] = None
+
+        # Client-side real-motion afterimage recording. The ghost hand is now a
+        # replay of the user's OWN recorded hand poses, never a synthetic plan -
+        # recorded locally (independent of the server's internal recording, which
+        # isn't sent back over the wire) so it works the same in mock_local and
+        # mock_remote. `_last_completed_recording` persists across the RESTARTING
+        # loop until the NEXT execution finishes, so it can serve both as this
+        # attempt's post-execution review AND the next attempt's FORESEEING preview.
+        self._local_recorded_poses: List[HandPose] = []
+        self._last_completed_recording: List[HandPose] = []
+        self._last_recording_phase: Optional[ExecutionPhase] = None
+        self._last_recording_target: Optional[str] = None
         self._remote_snapshot = {
             "poses": [], "bboxes": [], "affordance_map": None, "foreseen_traj": None,
             "depth_heatmap": None, "gripper_cmd": 0.0, "residuals": None, "reward_score": 0.0,
@@ -1248,16 +1266,60 @@ class LocalClientRunner:
             saved_path = self.recorder.start_recording(width=width, height=height, fps=self.config.camera.fps)
             logger.info(f"Session recording started at: {saved_path}")
 
+    @staticmethod
+    def _detect_screen_size() -> tuple:
+        """Best-effort physical display resolution for fake-fullscreen mode, via
+        tkinter (bundled with the python.org macOS installer this project already
+        requires). Falls back to a common 1080p size if unavailable."""
+        try:
+            import tkinter
+            root = tkinter.Tk()
+            root.withdraw()
+            w, h = root.winfo_screenwidth(), root.winfo_screenheight()
+            root.destroy()
+            return w, h
+        except Exception:
+            return 1920, 1080
+
     def toggle_fullscreen(self) -> None:
-        """Toggle the visualizer window between windowed (resizable) and true fullscreen."""
+        """Toggle the visualizer window between its native size and a maximized
+        'fake fullscreen' that fills the screen.
+
+        Deliberately NOT using cv2.WND_PROP_FULLSCREEN: on macOS's Cocoa HighGUI
+        backend that property transition (a) stretches the 640x480 4:3 camera
+        frame to the display's own aspect ratio using HighGUI's flat grey
+        letterbox fill - not this app's theme, and easily a third of a widescreen
+        display - and (b) has been observed to drop keyboard focus, so
+        cv2.waitKey() stops receiving most hotkeys until the window is clicked
+        back into focus. Resizing/moving a WINDOW_NORMAL window to the screen's
+        dimensions gets the same "fills the screen" effect while keeping
+        keyboard capture reliable; letterboxing is instead done ourselves (see
+        _prepare_display_frame) with a themed pad color."""
         window_name = self.config.visualization.window_name
         self._is_fullscreen = not self._is_fullscreen
-        cv2.setWindowProperty(
-            window_name,
-            cv2.WND_PROP_FULLSCREEN,
-            cv2.WINDOW_FULLSCREEN if self._is_fullscreen else cv2.WINDOW_NORMAL,
-        )
+        if self._is_fullscreen:
+            cv2.resizeWindow(window_name, self._screen_w, self._screen_h)
+            cv2.moveWindow(window_name, 0, 0)
+        else:
+            cv2.resizeWindow(window_name, self.config.camera.width, self.config.camera.height)
+            cv2.moveWindow(window_name, 60, 60)
         logger.info(f"Visualizer window: {'FULLSCREEN' if self._is_fullscreen else 'windowed'}")
+
+    def _prepare_display_frame(self, frame: np.ndarray) -> np.ndarray:
+        """When in fake-fullscreen mode, scale the frame to fill the display
+        while preserving its aspect ratio, letterboxing any leftover space with
+        a themed dark color instead of leaving it to HighGUI's default fill."""
+        if not self._is_fullscreen:
+            return frame
+        h, w = frame.shape[:2]
+        scale = min(self._screen_w / w, self._screen_h / h)
+        new_w, new_h = max(1, int(w * scale)), max(1, int(h * scale))
+        resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        canvas = np.full((self._screen_h, self._screen_w, 3), PALETTE["dark_glass_bg"], dtype=np.uint8)
+        x_off = (self._screen_w - new_w) // 2
+        y_off = (self._screen_h - new_h) // 2
+        canvas[y_off:y_off + new_h, x_off:x_off + new_w] = resized
+        return canvas
 
     def toggle_tracker(self) -> None:
         """Toggle between MediaPipe live tracker and synthetic mock."""
@@ -1551,22 +1613,27 @@ class LocalClientRunner:
                         real_h = poses[0] if poses else None
                         self.workflow.record_execution_step(real_h)
                     elif self.workflow.current_phase == ExecutionPhase.ADAPTING:
-                        rep = self.local_discrepancy_engine.compile_episode_discrepancy(
-                            foreseen_traj=self.workflow.stored_foreseen_trajectory,
-                            recorded_poses=self.workflow.recorded_physical_poses,
-                            policy=self.local_policy
-                        )
-                        self.last_episode_report = rep
-                        self.benchmark.record_trial(rep, intent=self.intent)
-                        episode_offset = np.clip(
-                            np.array(rep.mean_wrist_offset, dtype=np.float32), -0.05, 0.05
-                        )
-                        self._local_learned_wrist_bias = np.clip(
-                            0.6 * self._local_learned_wrist_bias + 0.4 * episode_offset, -0.05, 0.05
-                        )
-                        self.workflow.transition_to(ExecutionPhase.RESTARTING)
-                        self._cached_foreseen_traj = None
+                        if not self._local_adaptation_computed_this_episode:
+                            rep = self.local_discrepancy_engine.compile_episode_discrepancy(
+                                foreseen_traj=self.workflow.stored_foreseen_trajectory,
+                                recorded_poses=self.workflow.recorded_physical_poses,
+                                policy=self.local_policy
+                            )
+                            self.last_episode_report = rep
+                            self.benchmark.record_trial(rep, intent=self.intent)
+                            episode_offset = np.clip(
+                                np.array(rep.mean_wrist_offset, dtype=np.float32), -0.05, 0.05
+                            )
+                            self._local_learned_wrist_bias = np.clip(
+                                0.6 * self._local_learned_wrist_bias + 0.4 * episode_offset, -0.05, 0.05
+                            )
+                            self._cached_foreseen_traj = None
+                            self._local_adaptation_computed_this_episode = True
+                        # Holds here for workflow.adapting_duration_sec instead of advancing
+                        # immediately, so the post-execution replay review has screen time.
+                        self.workflow.step_adapting()
                     elif self.workflow.current_phase == ExecutionPhase.RESTARTING:
+                        self._local_adaptation_computed_this_episode = False
                         self.workflow.step_restarting()
 
                     workflow_phase = self.workflow.current_phase
@@ -1681,6 +1748,27 @@ class LocalClientRunner:
                 # Reset one-shot command (only relevant for mock_local, which sends none)
                 self._control_cmd_to_send = None
 
+                # Client-side afterimage recording: capture the user's OWN real hand
+                # poses (already tracked locally every frame in both modes) while they
+                # execute, so the ghost hand can later replay their ACTUAL motion
+                # instead of a synthetic plan. Snapshot the finished recording the
+                # moment execution ends, before a future RESTARTING loop starts a
+                # fresh one. A genuinely NEW target (as opposed to the RESTARTING loop
+                # re-attempting the SAME target) drops any stale recording from a
+                # different object.
+                if self.workflow._target_label != self._last_recording_target:
+                    self._last_recording_target = self.workflow._target_label
+                    self._last_completed_recording = []
+                    self._local_recorded_poses = []
+                if workflow_phase != self._last_recording_phase:
+                    if workflow_phase == ExecutionPhase.USER_EXECUTING:
+                        self._local_recorded_poses = []
+                    elif self._last_recording_phase == ExecutionPhase.USER_EXECUTING and self._local_recorded_poses:
+                        self._last_completed_recording = list(self._local_recorded_poses)
+                    self._last_recording_phase = workflow_phase
+                if workflow_phase == ExecutionPhase.USER_EXECUTING and poses:
+                    self._local_recorded_poses.append(poses[0])
+
                 # Session Recording
                 if self.recorder.is_recording:
                     mano_dict = poses[0].mano_params.to_dict() if (poses and poses[0].mano_params) else None
@@ -1716,26 +1804,30 @@ class LocalClientRunner:
                 self.visualizer.draw_3d_bounding_boxes(frame, bboxes)
                 self.visualizer.draw_affordance_hotspots(frame, affordance_map)
                 
-                # The server continuously replans the trajectory from wherever the real
-                # hand currently is while actively guiding a grasp (see ws_server.py) -
-                # the ghost follows the hand, not the other way around. So render a
-                # short near-term lookahead into whatever's the LATEST plan (a "here's
-                # where to move next" nudge), not a long fixed animation played back
-                # over elapsed time - that would fight the server's own continuous
-                # replanning and drift away from the real hand.
-                step_idx_to_draw: Optional[int] = None
-                ghost_label = "NEXT-STEP GUIDE"
-                if foreseen_traj is not None and foreseen_traj.waypoints:
-                    num_wp = len(foreseen_traj.waypoints)
-                    if workflow_phase in (ExecutionPhase.FORESEEING, ExecutionPhase.WAIT_USER, ExecutionPhase.USER_EXECUTING):
-                        step_idx_to_draw = min(GHOST_LOOKAHEAD_STEPS, num_wp - 1)
-                    elif workflow_phase == ExecutionPhase.ADAPTING:
-                        step_idx_to_draw = num_wp - 1  # episode just ended - show the final grasp/lift pose as reference
-                        ghost_label = "FINAL POSE REFERENCE"
+                # Ghost hand is an afterimage/replay of the user's OWN real recorded
+                # motion, never a synthetic generated plan:
+                #  - FORESEEING: replay of the PREVIOUS attempt, re-anchored to start
+                #    from wherever the real hand currently is. Nothing is shown on the
+                #    very first attempt at an object (no prior recording exists yet).
+                #  - ADAPTING: a review moment replaying the attempt that JUST
+                #    finished, at its own real recorded positions (no re-anchoring).
+                #  - Never drawn during USER_EXECUTING - the user's real hand is
+                #    unobstructed while actually performing the action.
+                replay_poses: Optional[List[HandPose]] = None
+                replay_reanchor = False
+                ghost_label = ""
+                if workflow_phase == ExecutionPhase.FORESEEING and self._last_completed_recording:
+                    replay_poses = self._last_completed_recording
+                    replay_reanchor = True
+                    ghost_label = "PREVIEW: YOUR LAST ATTEMPT"
+                elif workflow_phase == ExecutionPhase.ADAPTING and self._last_completed_recording:
+                    replay_poses = self._last_completed_recording
+                    replay_reanchor = False
+                    ghost_label = "REPLAY: WHAT YOU JUST DID"
 
-                foreseen_step = self.visualizer.draw_foreseen_ghost_trajectory(
-                    frame, foreseen_traj, step_override=step_idx_to_draw, real_poses=poses,
-                    target_bbox=bboxes[0] if bboxes else None, label=ghost_label
+                foreseen_step = self.visualizer.draw_hand_replay(
+                    frame, replay_poses, real_poses=poses, reanchor=replay_reanchor, label=ghost_label,
+                    target_bbox=bboxes[0] if bboxes else None
                 )
                 self.visualizer.draw_depth_pip(frame, depth_heatmap)
                 
@@ -1751,7 +1843,8 @@ class LocalClientRunner:
                 self.visualizer.draw_instruction_bar(
                     frame=frame,
                     phase=workflow_phase,
-                    target_label=(parsed_intent_resp.target_object if parsed_intent_resp else self.intent)
+                    target_label=(parsed_intent_resp.target_object if parsed_intent_resp else self.intent),
+                    has_replay=bool(self._last_completed_recording)
                 )
 
                 # Render Co-Adaptation Benchmark Panel
@@ -1789,7 +1882,7 @@ class LocalClientRunner:
                     self.visualizer.draw_hotkey_panel(frame, top_y=100)
 
                 # Display frame window
-                cv2.imshow(self.config.visualization.window_name, frame)
+                cv2.imshow(self.config.visualization.window_name, self._prepare_display_frame(frame))
 
                 # Handle keyboard inputs
                 key = cv2.waitKey(1) & 0xFF
@@ -1806,6 +1899,13 @@ class LocalClientRunner:
                     self.visualizer.show_telemetry_detail = not self.visualizer.show_telemetry_detail
                 elif key == ord("g"): # Toggle spoken workflow guidance
                     self.toggle_voice_guidance()
+                elif key == ord("e"): # Export co-adaptation benchmark trials to JSON + CSV
+                    if self.benchmark.total_trials == 0:
+                        logger.info("Benchmark Export: No trials recorded yet.")
+                    else:
+                        json_path = self.benchmark.export_summary_json()
+                        csv_path = self.benchmark.export_csv()
+                        logger.info(f"Benchmark Export: Wrote {json_path} and {csv_path}")
                 elif key in (ord("k"), 19): # 'k' or Ctrl+S: Save checkpoint
                     self.save_checkpoint()
                 elif key in (ord("l"), 12): # 'l' or Ctrl+L: Load checkpoint

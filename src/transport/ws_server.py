@@ -95,6 +95,13 @@ class WSInferenceServer:
         self._BIAS_EMA_ALPHA = 0.4
         self._BIAS_MAX_METERS = 0.05
 
+        # ADAPTING now holds for workflow.adapting_duration_sec (see workflow_state.py)
+        # instead of computing the episode report and transitioning to RESTARTING on
+        # the very next frame - this flag makes sure the (somewhat expensive) discrepancy
+        # compilation + bias update runs exactly ONCE per episode, on the first frame
+        # processed while in ADAPTING, rather than every frame during the hold.
+        self._adaptation_computed_this_episode = False
+
     async def handle_client(self, websocket: Any) -> None:
         client_address = getattr(websocket, "remote_address", "client")
         logger.info(f"Client connected from {client_address}")
@@ -202,31 +209,38 @@ class WSInferenceServer:
                     real_h = hand_poses[0] if hand_poses else None
                     self.workflow.record_execution_step(real_h)
                 elif current_phase == ExecutionPhase.ADAPTING:
-                    rep = self.discrepancy_engine.compile_episode_discrepancy(
-                        foreseen_traj=self.workflow.stored_foreseen_trajectory,
-                        recorded_poses=self.workflow.recorded_physical_poses,
-                        policy=self.policy
-                    )
-                    episode_report_dict = rep.to_dict()
-                    self.workflow.last_adaptation_report = episode_report_dict
-                    self.benchmark.record_trial(rep, intent=frame_msg.intent)
-                    logger.info(f"Episode Discrepancy Compiled: Reward={rep.episode_reward:+.3f} | MSE={rep.mean_pose_error:.4f}m")
+                    if not self._adaptation_computed_this_episode:
+                        rep = self.discrepancy_engine.compile_episode_discrepancy(
+                            foreseen_traj=self.workflow.stored_foreseen_trajectory,
+                            recorded_poses=self.workflow.recorded_physical_poses,
+                            policy=self.policy
+                        )
+                        episode_report_dict = rep.to_dict()
+                        self.workflow.last_adaptation_report = episode_report_dict
+                        self.benchmark.record_trial(rep, intent=frame_msg.intent)
+                        logger.info(f"Episode Discrepancy Compiled: Reward={rep.episode_reward:+.3f} | MSE={rep.mean_pose_error:.4f}m")
 
-                    # Fold this episode's directional error into the accumulated
-                    # co-adaptation bias (EMA across iterations, clamped so one noisy
-                    # attempt can't send the plan drifting).
-                    episode_offset = np.clip(
-                        np.array(rep.mean_wrist_offset, dtype=np.float32),
-                        -self._BIAS_MAX_METERS, self._BIAS_MAX_METERS
-                    )
-                    self._learned_wrist_bias = np.clip(
-                        (1.0 - self._BIAS_EMA_ALPHA) * self._learned_wrist_bias + self._BIAS_EMA_ALPHA * episode_offset,
-                        -self._BIAS_MAX_METERS, self._BIAS_MAX_METERS
-                    )
+                        # Fold this episode's directional error into the accumulated
+                        # co-adaptation bias (EMA across iterations, clamped so one noisy
+                        # attempt can't send the plan drifting).
+                        episode_offset = np.clip(
+                            np.array(rep.mean_wrist_offset, dtype=np.float32),
+                            -self._BIAS_MAX_METERS, self._BIAS_MAX_METERS
+                        )
+                        self._learned_wrist_bias = np.clip(
+                            (1.0 - self._BIAS_EMA_ALPHA) * self._learned_wrist_bias + self._BIAS_EMA_ALPHA * episode_offset,
+                            -self._BIAS_MAX_METERS, self._BIAS_MAX_METERS
+                        )
 
-                    self.workflow.transition_to(ExecutionPhase.RESTARTING)
-                    self._cached_foreseen_traj = None
+                        self._cached_foreseen_traj = None
+                        self._adaptation_computed_this_episode = True
+
+                    # Holds here for workflow.adapting_duration_sec (see workflow_state.py)
+                    # instead of advancing immediately, so the client's post-execution
+                    # replay of the user's own recorded motion has real screen time.
+                    self.workflow.step_adapting()
                 elif current_phase == ExecutionPhase.RESTARTING:
+                    self._adaptation_computed_this_episode = False
                     self.workflow.step_restarting()
 
                 # 7. Discrepancy Engine & Policy Evaluation

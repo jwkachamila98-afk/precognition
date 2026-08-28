@@ -55,18 +55,26 @@ class WorkflowController:
     def __init__(
         self,
         foresee_steps: int = 60,
-        foresee_duration_sec: float = 2.0,
+        foresee_duration_sec: float = 3.5,
         wait_user_timeout: float = 3.0,
         execution_max_steps: int = 90,
+        adapting_duration_sec: float = 3.5,
         restart_delay_sec: float = 2.5,
         auto_advance: bool = True,
         speaker: Optional[SpeechSynthesizerABC] = None,
         voice_guidance_enabled: bool = True
     ) -> None:
         self.foresee_steps = foresee_steps
+        # Long enough that the client's full real-motion replay (up to
+        # execution_max_steps frames, ~2-3s of recorded execution) plays through
+        # at least once before the phase auto-advances, rather than being cut
+        # off mid-clip.
         self.foresee_duration_sec = foresee_duration_sec
         self.wait_user_timeout = wait_user_timeout
         self.execution_max_steps = execution_max_steps
+        # Same reasoning as foresee_duration_sec, but for the post-execution
+        # "here's what you just did" review replay.
+        self.adapting_duration_sec = adapting_duration_sec
         self.restart_delay_sec = restart_delay_sec
         self.auto_advance = auto_advance
         self.speaker = speaker
@@ -99,7 +107,8 @@ class WorkflowController:
         elif self._phase == ExecutionPhase.USER_EXECUTING:
             return min(1.0, len(self.recorded_physical_poses) / float(self.foresee_steps))
         elif self._phase == ExecutionPhase.ADAPTING:
-            return 1.0
+            elapsed = time.time() - self._phase_start_time
+            return min(1.0, elapsed / max(self.adapting_duration_sec, 0.1))
         elif self._phase == ExecutionPhase.RESTARTING:
             elapsed = time.time() - self._phase_start_time
             return min(1.0, elapsed / max(self.restart_delay_sec, 0.1))
@@ -126,15 +135,15 @@ class WorkflowController:
         if phase == ExecutionPhase.IDLE:
             return "Standby. Say what to pick up, for example wine glass."
         elif phase == ExecutionPhase.FORESEEING:
-            return f"Watch the ghost hand. Planning how to grasp the {target}."
+            return f"Get ready to grasp the {target}."
         elif phase == ExecutionPhase.WAIT_USER:
-            return "Your turn. Move your hand to match the ghost, then press C when ready."
+            return "Your turn. Press C when ready."
         elif phase == ExecutionPhase.USER_EXECUTING:
-            return f"Go. Reach for the {target} now, following the ghost hand."
+            return f"Go. Reach for the {target} now."
         elif phase == ExecutionPhase.ADAPTING:
-            return "Comparing your motion to the plan now."
+            return "Nice. Here's a replay of what you just did."
         elif phase == ExecutionPhase.RESTARTING:
-            return f"Nice. Restarting with what I learned about how you grasp the {target}."
+            return f"Restarting with what I learned about how you grasp the {target}."
         return None
 
     def transition_to(self, new_phase: ExecutionPhase) -> None:
@@ -211,6 +220,21 @@ class WorkflowController:
         if len(self.recorded_physical_poses) >= self.foresee_steps or self._step_index >= self.execution_max_steps:
             if self.auto_advance:
                 self.transition_to(ExecutionPhase.ADAPTING)
+            return True
+        return False
+
+    def step_adapting(self) -> bool:
+        """Hold in ADAPTING for a fixed wall-clock duration so the post-execution
+        replay review (rendered client-side from the user's own recorded motion)
+        gets real screen time, instead of the phase advancing to RESTARTING on
+        the very next processed frame - which previously gave the review moment
+        almost no time to be seen at all. Returns True once elapsed."""
+        if self._phase != ExecutionPhase.ADAPTING:
+            return False
+
+        elapsed = time.time() - self._phase_start_time
+        if elapsed >= self.adapting_duration_sec and self.auto_advance:
+            self.transition_to(ExecutionPhase.RESTARTING)
             return True
         return False
 
