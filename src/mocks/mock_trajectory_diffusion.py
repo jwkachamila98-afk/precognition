@@ -47,6 +47,20 @@ class MockTrajectoryDiffusion(TrajectoryGeneratorABC):
         ], dtype=np.float32)
 
         self._seg_lens = [0.035, 0.026, 0.020] # 3 phalanges
+        self._fingertips = [4, 8, 12, 16, 20]
+
+        # Wrist orientation at the grasp: rolled ~163 deg about the camera X
+        # axis so the palm faces DOWN over the object and the fingers point at
+        # it. The canonical pose in _generate_hand_keypoints_3d has the fingers
+        # extending along local -Y (i.e. straight up out of the wrist), which is
+        # the pose a hand holds when it is NOT reaching for anything.
+        # Yaw is not cosmetic: at zero yaw the hand closes edge-on to the
+        # viewer and every finger hides behind the one in front of it.
+        self._rot_grasp = np.array([2.85, 0.60, 0.12], dtype=np.float32)
+        # 0.85 curled the fingers past a right angle into a closed fist, which
+        # cannot enclose anything; 0.45 is a power grasp that still shows daylight
+        # between the fingers and the object.
+        self._flex_closed = 0.45
 
     def _generate_hand_keypoints_3d(
         self,
@@ -73,11 +87,15 @@ class MockTrajectoryDiffusion(TrajectoryGeneratorABC):
             joint_idx += 1
 
             flex = finger_flex * (1.1 if f_idx in (0, 1) else 1.0)
+            # Abduction: fingers fan outward from the palm's midline as they
+            # curl. Without it every finger sweeps the same plane and the whole
+            # hand collapses into one slab the moment it closes.
+            spread = 0.30 * float(self._finger_roots[f_idx][0])
             for seg_i, length in enumerate(self._seg_lens):
                 cur_flex = flex * (seg_i + 1) * 0.8
                 # Finger extension & curl in local frame
                 local_dir = np.array([
-                    0.005 * math.sin(cur_flex),
+                    0.005 * math.sin(cur_flex) + spread * math.sin(cur_flex),
                     -length * math.cos(cur_flex),
                     length * math.sin(cur_flex)
                 ], dtype=np.float32)
@@ -87,6 +105,22 @@ class MockTrajectoryDiffusion(TrajectoryGeneratorABC):
                 joint_idx += 1
 
         return kpts
+
+    def _solve_grasp_wrist(self, obj_center: np.ndarray, approach_offset: np.ndarray) -> np.ndarray:
+        """Wrist position that puts the closed fingertips ON the object.
+
+        Placing the wrist by a hand-tuned offset from the object centre only
+        looks right by accident: the hand is ~17 cm from wrist to fingertip, so
+        an offset picked to look plausible in a flat 2-D overlay leaves the
+        fingers grasping empty air the moment the same plan is viewed in 3D.
+        Instead the canonical closed-hand pose is built once at the origin, the
+        fingertip centroid measured, and the wrist placed so that centroid lands
+        on the intended contact point.
+        """
+        probe = self._generate_hand_keypoints_3d(
+            np.zeros(3, dtype=np.float32), self._rot_grasp, self._flex_closed)
+        tip_offset = probe[self._fingertips].mean(axis=0) - probe[0]
+        return (obj_center + approach_offset - tip_offset).astype(np.float32)
 
     def _project_2d(self, keypoints_3d: np.ndarray) -> np.ndarray:
         """Project (21, 3) 3D keypoints to (21, 2) image plane coordinates."""
@@ -119,19 +153,32 @@ class MockTrajectoryDiffusion(TrajectoryGeneratorABC):
             p_start = start_hand_pose.keypoints_3d[0].copy()
             rot_start = start_hand_pose.mano_params.wrist_rotation.copy() if start_hand_pose.mano_params else np.zeros(3, dtype=np.float32)
         else:
-            p_start = np.array([0.08, 0.08, 0.48], dtype=np.float32)
+            # No hand observed: start from a READY STANDOFF relative to the object
+            # rather than a fixed point in camera space. A hard-coded home pose is
+            # only ever near the target by luck - when the object is somewhere else
+            # the plan opens with a long traverse across empty space that carries no
+            # information about the grasp, and dominates any view of it.
+            # Camera frame: +X right, +Y down, +Z away, so this is up-and-left of
+            # the object and nearer the camera.
+            p_start = (target_object.center
+                       + np.array([-0.05, -0.11, -0.04], dtype=np.float32))
             rot_start = np.zeros(3, dtype=np.float32)
 
         bias = learned_bias if learned_bias is not None else np.zeros(3, dtype=np.float32)
 
-        # Target grasp wrist position derived from object center & affordance
+        # Target grasp wrist position derived from object center & affordance.
         obj_center = target_object.center.copy()
-        # Position hand slightly behind and above target object, nudged by whatever
-        # this user has demonstrated in prior attempts on this same grasp.
-        p_grasp = obj_center + np.array([0.0, -0.03, -0.06], dtype=np.float32) + bias
-        rot_grasp = np.array([0.25, 0.0, 0.1], dtype=np.float32)
+        # Contact point: the object's TOP SURFACE, not its centre. Aiming the
+        # fingertips at the centre buries them inside a solid object - harmless
+        # in a flat overlay, obviously wrong the moment the same plan is
+        # rendered in 3D. Camera frame has +Y down, so -Y is up.
+        obj_half_h = float(np.asarray(target_object.size, dtype=np.float32)[1]) * 0.5
+        approach_offset = np.array([0.0, -0.95 * obj_half_h, 0.0], dtype=np.float32)
+        # Nudged by whatever this user has demonstrated in prior attempts.
+        p_grasp = self._solve_grasp_wrist(obj_center, approach_offset) + bias
+        rot_grasp = self._rot_grasp.copy()
 
-        # Post-grasp lifted position
+        # Post-grasp lifted position (-Y is up in the camera frame)
         p_lift = p_grasp + np.array([0.0, -0.09, 0.02], dtype=np.float32)
 
         waypoints: List[ForeseenWaypoint] = []
@@ -158,7 +205,7 @@ class MockTrajectoryDiffusion(TrajectoryGeneratorABC):
                 sub_t = minimum_jerk_step((t_frac - 0.40) / 0.25)
                 wrist_pos = p_grasp
                 wrist_rot = rot_grasp
-                finger_flex = 0.2 + 0.65 * sub_t # Fingers enclose object
+                finger_flex = 0.2 + (self._flex_closed - 0.2) * sub_t # Fingers enclose object
                 obj_pos = np.concatenate([obj_center, target_object.rotation])
                 contact_val = float(sub_t)
                 gripper = float(sub_t)
@@ -167,7 +214,7 @@ class MockTrajectoryDiffusion(TrajectoryGeneratorABC):
                 sub_t = minimum_jerk_step((t_frac - 0.65) / 0.35)
                 wrist_pos = p_grasp + sub_t * (p_lift - p_grasp)
                 wrist_rot = rot_grasp
-                finger_flex = 0.85 # Firm grasp hold
+                finger_flex = self._flex_closed # Firm grasp hold
                 # Object moves rigidly attached to hand
                 lifted_obj_center = obj_center + sub_t * (p_lift - p_grasp)
                 obj_pos = np.concatenate([lifted_obj_center, target_object.rotation])

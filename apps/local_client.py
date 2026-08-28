@@ -37,13 +37,14 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from config.config_parser import AppConfig
-from src.perception.hand_tracker import HAND_CONNECTIONS, HandPose, HandSide, HandTrackerABC
+from src.perception.hand_tracker import HAND_CONNECTIONS, HandPose, HandTrackerABC
 from src.perception.scene_parser import BoundingBox3D, ParsedScene
 from src.perception.mediapipe_tracker import MediaPipeHandTracker, MEDIAPIPE_AVAILABLE
 from src.perception.intent_parser import IntentParserABC, MockLLMIntentParser, ParsedIntent
 from src.audio.speech_to_text import AudioTranscriberABC, GeminiTranscriber, MockTranscriber, WhisperTranscriber
 from src.audio.text_to_speech import GeminiSpeaker, SpeechSynthesizerABC, SystemSpeaker
 from src.simulation.trajectory_generator import AffordanceMap, ForeseenTrajectory
+from src.simulation.lab_sim import LabSimulator
 from src.policy.discrepancy import DiscrepancyEngine, DiscrepancyState, EpisodeDiscrepancyReport
 from src.policy.workflow_state import ExecutionPhase, WorkflowController
 from src.policy.checkpointing import PolicyCheckpointManager
@@ -612,6 +613,156 @@ class LocalVisualizer:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.38, color, 1, cv2.LINE_AA)
 
         return idx + 1
+
+    @staticmethod
+    def _ease_out_cubic(t: float) -> float:
+        t = float(np.clip(t, 0.0, 1.0))
+        return 1.0 - (1.0 - t) ** 3
+
+    def lab_panel_rect(self, frame_shape: tuple, lab_shape: tuple) -> tuple:
+        """Where the simulated-lab viewport sits when fully open.
+
+        Sized to leave the top status banner and the bottom instruction bar
+        uncovered - those two carry the workflow state, and losing them for the
+        six seconds of the demo would be a downgrade.
+        """
+        h, w = frame_shape[:2]
+        lab_h, lab_w = lab_shape[:2]
+        top, bottom = 48, 74
+        ph = max(80, h - top - bottom)
+        pw = int(round(ph * lab_w / max(lab_h, 1)))
+        if pw > w - 24:
+            pw = w - 24
+            ph = int(round(pw * lab_h / max(lab_w, 1)))
+        x1 = (w - pw) // 2
+        y1 = top + max(0, (h - top - bottom - ph) // 2)
+        return x1, y1, x1 + pw, y1 + ph
+
+    def draw_lab_panel(
+        self,
+        frame: np.ndarray,
+        lab_image: np.ndarray,
+        open_t: float,
+        anchor_rect: Optional[tuple] = None,
+        target_label: str = "",
+        telemetry: Optional[dict] = None,
+        progress: float = 0.0,
+    ) -> None:
+        """Composite the simulated-lab reenactment as a viewport that irises open.
+
+        The panel grows from the target object's own position in the live frame
+        out to its full size, over the dimmed and blurred camera feed - so it
+        reads as the system opening a window into its own simulation of THAT
+        object, rather than as a separate video cutting in.
+        """
+        if lab_image is None or open_t <= 0.001:
+            return
+        h, w = frame.shape[:2]
+        tx1, ty1, tx2, ty2 = self.lab_panel_rect(frame.shape, lab_image.shape)
+        e = self._ease_out_cubic(open_t)
+
+        if anchor_rect is None:
+            cx, cy = (tx1 + tx2) // 2, (ty1 + ty2) // 2
+            anchor_rect = (cx - 8, cy - 6, cx + 8, cy + 6)
+        ax1, ay1, ax2, ay2 = anchor_rect
+
+        x1 = int(round(ax1 + (tx1 - ax1) * e))
+        y1 = int(round(ay1 + (ty1 - ay1) * e))
+        x2 = int(round(ax2 + (tx2 - ax2) * e))
+        y2 = int(round(ay2 + (ty2 - ay2) * e))
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w, x2), min(h, y2)
+        pw, ph = x2 - x1, y2 - y1
+        if pw < 8 or ph < 8:
+            return
+
+        # Recede the live feed: darken, and defocus via a downscale/upscale pair
+        # (a real Gaussian at full resolution costs more than the 3-D render).
+        small = cv2.resize(frame, (max(1, w // 6), max(1, h // 6)), interpolation=cv2.INTER_AREA)
+        blurred = cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR)
+        cv2.addWeighted(blurred, 0.55 * e, frame, 1.0 - 0.55 * e, 0, dst=frame)
+        if e > 0.01:
+            dark = np.zeros_like(frame)
+            cv2.addWeighted(dark, 0.42 * e, frame, 1.0 - 0.42 * e, 0, dst=frame)
+
+        radius = max(2, int(12 * e))
+        mask_f, contours = self._rounded_panel_mask(pw, ph, radius)
+        content = cv2.resize(lab_image, (pw, ph), interpolation=cv2.INTER_LINEAR)
+        roi = frame[y1:y2, x1:x2]
+        roi[:] = (content * mask_f + roi * (1.0 - mask_f)).astype(np.uint8)
+        cv2.drawContours(roi, contours, -1, PALETTE["cyan_electric"], 1, lineType=cv2.LINE_AA)
+
+        if e < 0.985:
+            return  # chrome would be unreadable mid-flight
+
+        self._draw_lab_chrome(frame, (x1, y1, x2, y2), target_label, telemetry or {}, progress)
+
+    def _draw_lab_chrome(self, frame: np.ndarray, rect: tuple, target_label: str,
+                         telemetry: dict, progress: float) -> None:
+        """Header, corner brackets, and the live plan telemetry strip."""
+        x1, y1, x2, y2 = rect
+        pulse = 0.5 + 0.5 * float(np.sin(time.time() * 6.0))
+
+        for cx, cy, dx, dy in ((x1, y1, 1, 1), (x2, y1, -1, 1), (x1, y2, 1, -1), (x2, y2, -1, -1)):
+            cv2.line(frame, (cx, cy), (cx + dx * 16, cy), PALETTE["cyan_electric"], 2, cv2.LINE_AA)
+            cv2.line(frame, (cx, cy), (cx, cy + dy * 16), PALETTE["cyan_electric"], 2, cv2.LINE_AA)
+
+        # Header strip
+        hh = 22
+        head = frame[y1 + 1:y1 + 1 + hh, x1 + 1:x2 - 1]
+        if head.size:
+            cv2.addWeighted(np.full_like(head, PALETTE["dark_glass_bg"]), 0.78, head, 0.22, 0, dst=head)
+        cv2.circle(frame, (x1 + 14, y1 + 12), int(3 + 2 * pulse), PALETTE["cyan_electric"], -1, cv2.LINE_AA)
+        cv2.putText(frame, "SIMULATED LAB  -  REENACTMENT", (x1 + 26, y1 + 16),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, PALETTE["cyan_electric"], 1, cv2.LINE_AA)
+        label = (target_label or "object").replace("_", " ").upper()
+        (lw, _), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.36, 1)
+        cv2.putText(frame, label, (x2 - 12 - lw, y1 + 16),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.36, PALETTE["text_white"], 1, cv2.LINE_AA)
+
+        # Phase progress, hairline along the header's lower edge
+        bar_w = int((x2 - x1 - 4) * float(np.clip(progress, 0.0, 1.0)))
+        if bar_w > 0:
+            cv2.line(frame, (x1 + 2, y1 + hh), (x1 + 2 + bar_w, y1 + hh),
+                     PALETTE["cyan_electric"], 2, cv2.LINE_AA)
+
+        if not telemetry:
+            return
+
+        # Footer telemetry: every number here comes from the executed plan.
+        fh = 30
+        fy1 = y2 - 1 - fh
+        foot = frame[fy1:y2 - 1, x1 + 1:x2 - 1]
+        if foot.size:
+            cv2.addWeighted(np.full_like(foot, PALETTE["dark_glass_bg"]), 0.80, foot, 0.20, 0, dst=foot)
+
+        ty = fy1 + 12
+        cv2.putText(frame, f"STEP {telemetry.get('step', 0):02d}/{telemetry.get('num_steps', 0):02d}",
+                    (x1 + 12, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.34, PALETTE["text_white"], 1, cv2.LINE_AA)
+        cv2.putText(frame, f"T+{telemetry.get('sim_time', 0.0):.2f}s", (x1 + 92, ty),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.34, PALETTE["text_dim"], 1, cv2.LINE_AA)
+        cv2.putText(frame, f"LIFT {telemetry.get('lift_cm', 0.0):4.1f} cm", (x1 + 154, ty),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.34, PALETTE["amber_gold"], 1, cv2.LINE_AA)
+
+        # Gripper aperture bar
+        gx, gy, gw = x1 + 12, fy1 + 19, 96
+        cv2.putText(frame, "GRIP", (gx, gy + 7), cv2.FONT_HERSHEY_SIMPLEX, 0.30,
+                    PALETTE["text_dim"], 1, cv2.LINE_AA)
+        cv2.rectangle(frame, (gx + 32, gy), (gx + 32 + gw, gy + 6), (40, 50, 60), -1)
+        fill = int(gw * float(np.clip(telemetry.get("gripper", 0.0), 0.0, 1.0)))
+        if fill > 0:
+            cv2.rectangle(frame, (gx + 32, gy), (gx + 32 + fill, gy + 6),
+                          PALETTE["neon_green"], -1)
+
+        # Per-fingertip contact indicators
+        contact = float(np.clip(telemetry.get("contact", 0.0), 0.0, 1.0))
+        cx0 = gx + 32 + gw + 20
+        cv2.putText(frame, "CONTACT", (cx0, gy + 7), cv2.FONT_HERSHEY_SIMPLEX, 0.30,
+                    PALETTE["text_dim"], 1, cv2.LINE_AA)
+        for i in range(5):
+            on = contact > (i + 0.5) / 5.0
+            cv2.circle(frame, (cx0 + 60 + i * 11, gy + 3), 3,
+                       PALETTE["neon_green"] if on else (55, 62, 72), -1, cv2.LINE_AA)
 
     def draw_workflow_banner(
         self,
@@ -1283,6 +1434,17 @@ class LocalClientRunner:
         # visible (not mid-grasp), so the ghost afterimage can look like the
         # actual object instead of an abstract colored shape.
         self._object_sprite: Optional[np.ndarray] = None
+
+        # Simulated-lab reenactment for the Autonomous Demo. The plan is staged
+        # and rendered in a 3-D lab (src/simulation/lab_sim.py) rather than drawn
+        # as a flat overlay on the webcam image; `_lab_open` drives the iris that
+        # opens and closes the viewport.
+        self.lab_sim = LabSimulator()
+        self._lab_staged = False
+        self._lab_open = 0.0
+        self._lab_image: Optional[np.ndarray] = None
+        self._lab_anchor_rect: Optional[tuple] = None
+        self._lab_last_t = time.perf_counter()
         self._remote_snapshot = {
             "poses": [], "bboxes": [], "affordance_map": None, "foreseen_traj": None,
             "depth_heatmap": None, "gripper_cmd": 0.0, "residuals": None, "reward_score": 0.0,
@@ -1345,10 +1507,76 @@ class LocalClientRunner:
         if self.workflow._target_label in ("none", "", "idle", "clear"):
             logger.info("Autonomous Demo: no active intent - say what to pick up first.")
             return
+        self.lab_sim.invalidate()
+        self._lab_staged = False
         self.workflow.handle_control_command("START_AUTONOMOUS_DEMO")
         if self.mode == "mock_remote":
             self._control_cmd_to_send = "START_AUTONOMOUS_DEMO"
         logger.info(f"Autonomous Demo triggered for target: {self.workflow._target_label}")
+
+    def _update_lab_panel(
+        self,
+        frame: np.ndarray,
+        phase: ExecutionPhase,
+        progress: float,
+        foreseen_traj,
+        bboxes: List[BoundingBox3D],
+    ) -> None:
+        """Drive and composite the simulated-lab viewport.
+
+        Staging happens once, the first frame of the demo, from the plan the
+        server (or the local mock) just generated for the object's CURRENT
+        position - so the reenactment is of this attempt, not a canned animation.
+        The iris then opens over ~0.45 s, holds for the phase, and closes again,
+        which is why the open/close fraction is driven by wall-clock delta rather
+        than by frame count: the client's frame rate varies with what the
+        perception stack is doing.
+        """
+        now = time.perf_counter()
+        dt = min(max(now - self._lab_last_t, 0.0), 0.25)
+        self._lab_last_t = now
+        active = phase == ExecutionPhase.AUTONOMOUS_DEMO
+
+        if active and not self._lab_staged:
+            target_bbox = bboxes[0] if bboxes else None
+            if self.lab_sim.prepare(foreseen_traj, target_bbox, self._object_sprite):
+                self._lab_staged = True
+                if target_bbox is not None:
+                    h, w = frame.shape[:2]
+                    centre, px_w, px_h = self.visualizer._bbox_screen_rect(target_bbox, w, h)
+                    self._lab_anchor_rect = (
+                        int(centre[0] - px_w / 2), int(centre[1] - px_h / 2),
+                        int(centre[0] + px_w / 2), int(centre[1] + px_h / 2),
+                    )
+                else:
+                    self._lab_anchor_rect = None
+
+        # Open in ~0.45 s, close in ~0.30 s.
+        rate = (1.0 / 0.45) if (active and self._lab_staged) else -(1.0 / 0.30)
+        self._lab_open = float(np.clip(self._lab_open + rate * dt, 0.0, 1.0))
+
+        if self._lab_open <= 0.001:
+            if self._lab_image is not None and not active:
+                self._lab_image = None
+                self._lab_staged = False
+                self.lab_sim.invalidate()
+            return
+
+        if self._lab_staged and self.lab_sim.is_ready:
+            step = self.lab_sim.step_for_progress(progress)
+            rendered = self.lab_sim.render(step, elapsed=now, push_in=progress)
+            if rendered is not None:
+                self._lab_image = rendered
+            telemetry = self.lab_sim.telemetry(step)
+            label = self.lab_sim.target_label
+        else:
+            telemetry, label = {}, ""
+
+        self.visualizer.draw_lab_panel(
+            frame, self._lab_image, self._lab_open,
+            anchor_rect=self._lab_anchor_rect, target_label=label,
+            telemetry=telemetry, progress=progress,
+        )
 
     def save_checkpoint(self) -> None:
         """Save learned residual policy checkpoint."""
@@ -1958,22 +2186,10 @@ class LocalClientRunner:
                     replay_poses = self._last_completed_recording
                     replay_reanchor = False
                     ghost_label = "REPLAY: WHAT YOU JUST DID"
-                elif workflow_phase == ExecutionPhase.AUTONOMOUS_DEMO and foreseen_traj is not None and foreseen_traj.waypoints:
-                    # Hands-off showcase: the server generated this trajectory fresh
-                    # from wherever the object currently is and ran it through the
-                    # real trained policy's correction (see ws_server.py). Wrap each
-                    # waypoint as a HandPose so it can reuse the same replay renderer
-                    # as the real-motion afterimages above - it just needs .keypoints_2d/3d.
-                    replay_poses = [
-                        HandPose(
-                            hand_id=0, side=HandSide.RIGHT,
-                            keypoints_3d=wp.hand_keypoints_3d, keypoints_2d=wp.hand_keypoints_2d,
-                            confidence=1.0, timestamp=0.0,
-                        )
-                        for wp in foreseen_traj.waypoints
-                    ]
-                    replay_reanchor = False
-                    ghost_label = "AUTONOMOUS DEMO"
+                # The Autonomous Demo is deliberately absent from this list: it is
+                # not drawn as an overlay at all any more. It is staged and
+                # rendered as a 3-D reenactment inside the simulated lab, which is
+                # composited over the whole frame further down (_update_lab_panel).
 
                 foreseen_step = self.visualizer.draw_hand_replay(
                     frame, replay_poses, real_poses=poses, reanchor=replay_reanchor, label=ghost_label,
@@ -2031,6 +2247,12 @@ class LocalClientRunner:
                 # full telemetry dock is expanded, since it already fills the right column).
                 if not self.visualizer.show_telemetry_detail:
                     self.visualizer.draw_hotkey_panel(frame, top_y=100)
+
+                # Simulated-lab reenactment, composited last so it sits above the
+                # HUD it temporarily replaces. Its own header and footer carry the
+                # phase progress and plan telemetry while it is open.
+                self._update_lab_panel(frame, workflow_phase, phase_progress,
+                                       foreseen_traj, bboxes)
 
                 # Display frame window
                 cv2.imshow(self.config.visualization.window_name, self._prepare_display_frame(frame))

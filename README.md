@@ -14,7 +14,7 @@ Runs in real-time ($30+\text{ FPS}$) on resource-constrained **Intel Mac CPU** h
   |  |   Camera Ingestion  |  --->  |         OpenCV Visualizer         | <--- |    WS Client     |   |
   |  |  (Webcam/Synthetic)|        |  2D/3D Skeleton HUD & Color Inset |      |  (ws_client.py)  |   |
   |  +---------------------+        |  3D Bounding Box & Affordance Hot |      +------------------+   |
-  |                                 |  'Foreseen' Ghost Hand (tau_ref)  |               ^             |
+  |                                 |  Simulated Lab reenactment panel  |               ^             |
   |  +---------------------+        |  [1/3] Foresee -> [2/3] Execute   |               |             |
   |  | Audio STT (Whisper/ |  --->  |  [3/3] Discrepancy Adapt Banner   |               |             |
   |  |  MockTranscriber)   |        |  Co-Adaptation Benchmark Panel    |               |             |
@@ -109,7 +109,17 @@ Precognition/
 │   │   └── intent_parser.py           # ParsedIntent, MockLLMIntentParser, StructuredLLMIntentParser
 │   ├── simulation/
 │   │   ├── simulator.py               # SimulatorABC, SimState, SimAction, ObjectMesh
-│   │   └── trajectory_generator.py     # TrajectoryGeneratorABC, AffordanceMap, ForeseenTrajectory
+│   │   ├── trajectory_generator.py     # TrajectoryGeneratorABC, AffordanceMap, ForeseenTrajectory
+│   │   ├── lab_sim.py                 # LabSimulator: stages & renders the Autonomous Demo reenactment
+│   │   └── render/                    # Dependency-free software 3D renderer (numpy + cv2 only)
+│   │       ├── camera.py              # Perspective camera; LAB WORLD / VIEW / SCREEN frames
+│   │       ├── raster.py              # Z-buffered perspective-correct rasterizer, Mesh/Material
+│   │       ├── shading.py             # Deferred lighting, fog, filmic tone mapping
+│   │       ├── primitives.py          # box, cylinder, sphere, ring, tube, prism, quad
+│   │       ├── textures.py            # Procedural BGR lab surfaces (epoxy floor, steel, panels)
+│   │       ├── lab_scene.py           # The static lab: bench, backdrop, light rig, instruments
+│   │       ├── hand_mesh.py           # Solid hand mesh from the 21-joint skeleton
+│   │       └── object_mesh.py         # Silhouette-inflated, photo-textured mesh of the real object
 │   ├── policy/
 │   │   ├── policy.py                  # PolicyABC, PolicyObservation, PolicyAction
 │   │   ├── policy_base.py             # Policy interface compatibility
@@ -192,8 +202,67 @@ When running the visualizer HUD (`apps/local_client.py` or `apps/run_demo.py`), 
 | **`d`** | **Depth Inset** | Toggle metric depth picture-in-picture (PIP) inset |
 | **`s`** | **Screenshot** | Save timestamped PNG snapshot to disk |
 | **`z`** | **Fullscreen** | Toggle the visualizer window between windowed and true fullscreen |
-| **`a`** | **Autonomous Demo** | Hands-off simulated pick: replans fresh from the object's current position and runs the trained policy's correction over it (requires an active intent) |
+| **`a`** | **Autonomous Demo** | Hands-off simulated pick, reenacted inside the **Simulated Lab** viewport (see below): replans fresh from the object's current position and runs the trained policy's correction over it (requires an active intent) |
 | **`q`** / `ESC` | **Quit** | Gracefully disconnect and exit application |
+
+---
+
+## The Simulated Lab (Autonomous Demo)
+
+Pressing **`a`** no longer draws the plan as a flat ghost overlay on the webcam
+image. A viewport irises open from the target object's own position on screen,
+and the plan is **reenacted in 3D inside a rendered robotics lab** - workbench,
+backdrop, overhead light rig, calibration target, instrument rack - with the
+real target object reconstructed from its own photograph and a holographic hand
+mesh executing the trajectory.
+
+### What is real, and what is not
+
+| Element | Source |
+|---|---|
+| Object **silhouette** | GrabCut segmentation of a real photo-crop of the object, taken from the live camera while it was unoccluded |
+| Object **surface colour** | That same crop, used directly as the albedo texture - the object wears its own photograph |
+| Object **depth** | **Inferred.** A single RGB view carries no depth and this machine has no depth sensor (`MockDepthEstimator` is what runs locally), so the silhouette is *inflated* along its distance transform - thick where the object is wide, thin where it tapers |
+| Object **scale** | The detector's longest 3-D dimension. Only the scalar is used: its *aspect* comes from synthetic depth and is not trustworthy, so shape is taken from the silhouette instead |
+| **Hand pose** | The actual 21-joint trajectory the planner produced, policy-corrected, rescaled to anthropometric proportions |
+| **Lab environment** | Authored procedural geometry. It is a stage, not a reconstruction of your room - and it is labelled as such rather than implying a scan happened |
+| **Telemetry strip** | Step index, sim clock, gripper aperture, per-fingertip contact, and lift height, all read straight off the executed plan |
+
+Silhouette inflation assumes a roughly star-shaped silhouette. A remote, a
+bottle, or a box reconstruct faithfully; a mug handle or another deep concavity
+is smoothed over rather than hollowed. That is the ceiling of monocular
+single-view reconstruction, not a gap in the implementation.
+
+### Rendering
+
+The renderer is written from scratch in **numpy + cv2** - no OpenGL context, no
+CUDA, no new dependency - because every off-the-shelf option drags in an
+offscreen GL context that is fragile on exactly this Intel Mac target. It is a
+z-buffered, perspective-correct triangle rasterizer with **deferred shading**:
+the per-triangle loop writes only geometry into a G-buffer, and lighting runs
+once as a vectorised full-screen pass.
+
+Three things carry the frame budget:
+
+* the static lab is rasterized **and shaded** once per demo and cached, so each
+  frame re-shades only the pixels the object, its shadow, and the hand touch;
+* barycentrics and 1/depth are affine in screen space, so each is evaluated from
+  two 1-D arrays and one broadcast add rather than full 2-D grids;
+* closed meshes are back-face culled, with winding normalised automatically
+  (`orient_faces_outward`) rather than trusted to each builder.
+
+Roughly **45-60 ms/frame at 384x288** on the Intel Mac CPU target, capped at 20
+FPS (the plan holds far less than 30 FPS of new information), and it only runs
+during the six seconds the demo is on screen.
+
+### Previewing it without a camera
+
+```bash
+PYTHONPATH=. python tools/preview_lab.py --sprite path/to/object_crop.png --out /tmp/lab --video
+```
+
+Renders stills plus an optional MP4, reports per-frame cost, and checks that no
+part of the plan leaves the viewport.
 
 ---
 
