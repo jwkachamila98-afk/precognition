@@ -139,6 +139,10 @@ _CLASS_SIZE_PRIORS_M = {
     "phone": 0.15, "mouse": 0.11, "book": 0.24, "scissors": 0.16, "pen": 0.14,
     "stylus": 0.14, "toothbrush": 0.19, "clock": 0.20, "vase": 0.25,
     "sports ball": 0.22, "teddy bear": 0.28, "hair drier": 0.25,
+    # The weakest prior in the table by some distance - a "box" could be any
+    # size at all - but a shoebox-ish 20 cm beats the 67 cm the detector's
+    # back-projection produces for objects it cannot resolve.
+    "box": 0.20,
 }
 
 

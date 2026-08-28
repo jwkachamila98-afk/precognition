@@ -71,6 +71,11 @@ _BOXES: dict = {
     "pen": (0.10, 1.0, 0.10),
     "stylus": (0.09, 1.0, 0.09),
     "toothbrush": (0.14, 1.0, 0.10),
+    # Deliberately last-resort. Boxes run from matchbox to shipping carton, so
+    # no single proportion is right for most of them - this is a shoebox, chosen
+    # because it is graspable and unremarkable. It exists so an unrecognised
+    # rectangular thing gets a rectangular mesh rather than an inflated blob.
+    "box": (1.0, 0.55, 0.70),
 }
 
 # The upright axis of each profile is its height; a few classes are normally

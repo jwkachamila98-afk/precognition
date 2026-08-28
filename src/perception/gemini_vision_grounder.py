@@ -37,7 +37,11 @@ _PROMPT_TEMPLATE = (
 class GeminiVisionGrounder:
     """Open-vocabulary object grounding using Gemini's native bounding-box output."""
 
-    def __init__(self, api_key: str, model: str = "gemini-3.6-flash", timeout: float = 6.0) -> None:
+    def __init__(self, api_key: str, model: str = "gemini-3.6-flash",
+                 timeout: float = 15.0) -> None:
+        # 6 s was tight enough to drop requests on a machine already busy
+        # running depth and detection on CPU; a dropped grounding is the
+        # difference between finding an off-vocabulary object and not.
         self.api_key = api_key
         self.model = model
         self.timeout = timeout

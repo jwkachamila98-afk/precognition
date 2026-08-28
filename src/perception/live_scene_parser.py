@@ -153,6 +153,9 @@ class LiveSceneParser(SceneParserABC):
         self.vision_grounder = vision_grounder
         self._last_grounded_intent: Optional[str] = None
         self._last_grounded_detection: Optional[Detection2D] = None
+        # Failed groundings are retried on a cooldown rather than cached.
+        self._last_grounding_attempt = 0.0
+        self._grounding_retry_sec = 2.5
 
     def _extract_target_keyword(self, intent: str) -> Optional[str]:
         if not intent or intent.strip().lower() in ("none", "idle", "clear", "off", ""):
@@ -247,8 +250,18 @@ class LiveSceneParser(SceneParserABC):
                 # Open-vocabulary fallback: only actually call Gemini when the intent
                 # text has changed since the last attempt, reusing the cached result
                 # otherwise (re-projected against the current depth map each frame).
-                if intent != self._last_grounded_intent:
+                # A FAILED call must not be cached as a result. The intent key was
+                # being stamped before the call, so a single timeout made the
+                # condition below false forever and grounding was never retried
+                # for that phrase - one dropped request silently disabled
+                # open-vocabulary detection for the rest of the session.
+                stale = intent != self._last_grounded_intent
+                retry_due = (self._last_grounded_detection is None
+                             and time.time() - self._last_grounding_attempt
+                             >= self._grounding_retry_sec)
+                if stale or retry_due:
                     self._last_grounded_intent = intent
+                    self._last_grounding_attempt = time.time()
                     # Pass the full description (color, spatial context, etc.), not
                     # just the reduced single-noun keyword - Gemini grounds better with
                     # richer context than the COCO-vocabulary matcher needs.

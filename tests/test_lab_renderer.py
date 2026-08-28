@@ -781,3 +781,24 @@ def test_a_longer_demo_yields_proportionally_more_motion(staged_sim):
         return moved
 
     assert frames_with_motion(12.0) > 1.8 * frames_with_motion(6.0)
+
+
+def test_generic_box_gets_a_box_not_a_blob():
+    """An unrecognised rectangular object should at least be rectangular.
+
+    The weakest entry in the table on purpose: a box could be any size. It earns
+    its place only against the alternative, which is silhouette inflation at
+    whatever the detector's non-metric back-projection reports.
+    """
+    from src.simulation.render.object_library import build_class_mesh
+    from src.simulation.lab_sim import _object_longest_dimension, _REFERENCE_PALM_M
+
+    mesh = build_class_mesh("cardboard box", 0.20)
+    assert mesh is not None and mesh.num_faces == 12
+    w, h, d = (mesh.vertices.max(axis=0) - mesh.vertices.min(axis=0))
+    assert w == pytest.approx(0.20, abs=0.01)
+    assert h < w and d < w, "a shoebox, not a cube on end"
+
+    absurd = BoundingBox3D(label="cardboard box", center=np.zeros(3, np.float32),
+                           size=np.array([0.67, 0.67, 0.40], dtype=np.float32))
+    assert _object_longest_dimension(absurd, _REFERENCE_PALM_M) == pytest.approx(0.20, abs=1e-6)
