@@ -8,7 +8,7 @@ import numpy as np
 import websockets
 from websockets.exceptions import ConnectionClosed
 
-from src.perception.hand_tracker import HandTrackerABC
+from src.perception.hand_tracker import HandPose, HandSide, HandTrackerABC
 from src.perception.depth_estimator import DepthEstimatorABC
 from src.perception.scene_parser import SceneParserABC
 from src.perception.intent_parser import IntentParserABC, MockLLMIntentParser, ParsedIntent
@@ -101,6 +101,54 @@ class WSInferenceServer:
         # compilation + bias update runs exactly ONCE per episode, on the first frame
         # processed while in ADAPTING, rather than every frame during the hold.
         self._adaptation_computed_this_episode = False
+
+        # Autonomous Demo: a hands-off, on-demand simulated pick that regenerates
+        # a fresh plan from wherever the object CURRENTLY is and runs it through
+        # the real trained policy's correction, to showcase what co-adaptation
+        # has learned. Generated once per activation (same one-shot-then-hold
+        # pattern as ADAPTING above), not regenerated every frame.
+        self._autonomous_demo_generated = False
+        self._autonomous_demo_traj = None
+
+    def _apply_learned_correction(self, traj, target_box, image_shape: tuple) -> None:
+        """Run each waypoint of a freshly generated demo trajectory through the
+        REAL trained residual policy and apply its correction as a rigid 3D
+        shift to that waypoint's hand keypoints, so the Autonomous Demo visibly
+        reflects what the network has learned from this user's attempts - not
+        just the untouched synthetic plan.
+
+        The state fed to the policy is built with real_hand set to a HandPose
+        constructed FROM the waypoint's own keypoints (zero synthetic
+        discrepancy), rather than a missing/default hand - that keeps the state
+        in the same distribution the policy actually sees during real guidance
+        (small fluctuating errors around zero), instead of the large, arbitrary
+        "hand at the origin" discrepancy evaluate() falls back to when
+        real_hand=None. The correction is clipped to the same bound as the EMA
+        co-adaptation bias, for a visible-but-not-absurd shift.
+        """
+        h, w = image_shape[:2]
+        fx = fy = 0.8 * w
+        cx, cy = w / 2.0, h / 2.0
+
+        for wp in traj.waypoints:
+            dummy_hand = HandPose(
+                hand_id=0, side=HandSide.RIGHT,
+                keypoints_3d=wp.hand_keypoints_3d, keypoints_2d=wp.hand_keypoints_2d,
+                confidence=1.0, timestamp=0.0,
+            )
+            state = self.discrepancy_engine.evaluate(
+                real_hand=dummy_hand, foreseen_step=wp, target_object=target_box
+            ).state_vector
+            action = self.policy.evaluate(state)
+            delta = np.clip(action.joint_residuals[:3], -self._BIAS_MAX_METERS, self._BIAS_MAX_METERS)
+
+            wp.hand_keypoints_3d = wp.hand_keypoints_3d + delta
+            wp.wrist_pose[:3] = wp.wrist_pose[:3] + delta
+            z = np.clip(wp.hand_keypoints_3d[:, 2], 0.1, None)
+            wp.hand_keypoints_2d = np.stack([
+                fx * wp.hand_keypoints_3d[:, 0] / z + cx,
+                fy * wp.hand_keypoints_3d[:, 1] / z + cy,
+            ], axis=-1).astype(np.float32)
 
     async def handle_client(self, websocket: Any) -> None:
         client_address = getattr(websocket, "remote_address", "client")
@@ -200,6 +248,11 @@ class WSInferenceServer:
 
                 # 6. Workflow State Machine Lifecycle Stepping
                 current_phase = self.workflow.current_phase
+                if current_phase != ExecutionPhase.AUTONOMOUS_DEMO:
+                    # Covers being interrupted by any other command mid-demo, not just
+                    # the normal timeout - a stale flag would skip regeneration on the
+                    # NEXT activation and silently replay an old plan.
+                    self._autonomous_demo_generated = False
 
                 if current_phase == ExecutionPhase.FORESEEING:
                     self.workflow.step_foresee()
@@ -242,6 +295,25 @@ class WSInferenceServer:
                 elif current_phase == ExecutionPhase.RESTARTING:
                     self._adaptation_computed_this_episode = False
                     self.workflow.step_restarting()
+                elif current_phase == ExecutionPhase.AUTONOMOUS_DEMO:
+                    if not self._autonomous_demo_generated and target_box is not None:
+                        demo_traj = self.trajectory_diffusion.generate_foreseen_rollout(
+                            start_hand_pose=hand_poses[0] if hand_poses else None,
+                            target_object=target_box,
+                            affordance_map=affordance_map,
+                            intent=frame_msg.intent,
+                            num_steps=60,
+                            learned_bias=self._learned_wrist_bias,
+                        )
+                        self._apply_learned_correction(demo_traj, target_box, image.shape)
+                        self._autonomous_demo_traj = demo_traj
+                        self.workflow.stored_foreseen_trajectory = demo_traj
+                        self._autonomous_demo_generated = True
+                        logger.info(
+                            f"Autonomous Demo: generated a fresh {len(demo_traj.waypoints)}-step plan "
+                            f"for '{target_box.label}' at its current live position, policy-corrected."
+                        )
+                    self.workflow.step_autonomous_demo()
 
                 # 7. Discrepancy Engine & Policy Evaluation
                 real_h = hand_poses[0] if hand_poses else None
@@ -255,7 +327,14 @@ class WSInferenceServer:
                 action = self.policy.evaluate(discrepancy_state.state_vector)
                 self._last_action = action.joint_residuals.copy()
 
-                if hasattr(self.policy, "record_transition") and getattr(self.policy, "adaptation_active", True):
+                # Skip recording transitions during the Autonomous Demo: there's no real
+                # hand executing, so any "discrepancy" here is meaningless noise that
+                # would only dilute the training signal from real attempts.
+                if (
+                    hasattr(self.policy, "record_transition")
+                    and getattr(self.policy, "adaptation_active", True)
+                    and current_phase != ExecutionPhase.AUTONOMOUS_DEMO
+                ):
                     self.policy.record_transition(
                         state=discrepancy_state.state_vector,
                         action=action.joint_residuals,
@@ -297,6 +376,13 @@ class WSInferenceServer:
                 depth_b64 = encode_image_to_base64(depth_heatmap, quality=60)
 
                 proc_time_ms = (time.perf_counter() - t0) * 1000.0
+
+                # Autonomous Demo overrides the transmitted trajectory with its own
+                # policy-corrected plan, reusing the same foreseen_trajectory field
+                # the client already knows how to receive - it just means something
+                # different (a hands-off showcase) while this phase is active.
+                if current_phase == ExecutionPhase.AUTONOMOUS_DEMO and self._autonomous_demo_traj is not None:
+                    foreseen_dict = self._autonomous_demo_traj.to_dict()
 
                 step_cnt = getattr(self.policy, "step_count", 0)
                 p_loss = getattr(self.policy, "loss_history", [0.0])[-1]

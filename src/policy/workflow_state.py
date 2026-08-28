@@ -23,6 +23,9 @@ class ExecutionPhase(str, Enum):
     ADAPTING = "ADAPTING"                 # Compiling cumulative trajectory discrepancy & updating residual policy
     RESTARTING = "RESTARTING"             # Brief pause before looping back into FORESEEING with the
                                            # updated co-adaptation bias, so the same grasp visibly improves
+    AUTONOMOUS_DEMO = "AUTONOMOUS_DEMO"   # On-demand, hands-off simulated pick: replans fresh from
+                                           # wherever the object currently is and runs the trained
+                                           # residual policy's correction over it - no real hand needed
 
 
 class WorkflowControlSignal(str, Enum):
@@ -32,6 +35,7 @@ class WorkflowControlSignal(str, Enum):
     FINISH_EPISODE = "FINISH_EPISODE"
     RESET_IDLE = "RESET_IDLE"
     ADVANCE_PHASE = "ADVANCE_PHASE"
+    START_AUTONOMOUS_DEMO = "START_AUTONOMOUS_DEMO"
 
 
 @dataclass
@@ -60,6 +64,7 @@ class WorkflowController:
         execution_max_steps: int = 90,
         adapting_duration_sec: float = 3.5,
         restart_delay_sec: float = 2.5,
+        autonomous_demo_duration_sec: float = 6.0,
         auto_advance: bool = True,
         speaker: Optional[SpeechSynthesizerABC] = None,
         voice_guidance_enabled: bool = True
@@ -76,6 +81,9 @@ class WorkflowController:
         # "here's what you just did" review replay.
         self.adapting_duration_sec = adapting_duration_sec
         self.restart_delay_sec = restart_delay_sec
+        # Long enough for the ~2s synthetic plan to play through at least once,
+        # with a beat to register the final grasp/lift pose before returning to IDLE.
+        self.autonomous_demo_duration_sec = autonomous_demo_duration_sec
         self.auto_advance = auto_advance
         self.speaker = speaker
         self.voice_guidance_enabled = voice_guidance_enabled
@@ -112,6 +120,9 @@ class WorkflowController:
         elif self._phase == ExecutionPhase.RESTARTING:
             elapsed = time.time() - self._phase_start_time
             return min(1.0, elapsed / max(self.restart_delay_sec, 0.1))
+        elif self._phase == ExecutionPhase.AUTONOMOUS_DEMO:
+            elapsed = time.time() - self._phase_start_time
+            return min(1.0, elapsed / max(self.autonomous_demo_duration_sec, 0.1))
         return 0.0
 
     @property
@@ -144,6 +155,8 @@ class WorkflowController:
             return "Nice. Here's a replay of what you just did."
         elif phase == ExecutionPhase.RESTARTING:
             return f"Restarting with what I learned about how you grasp the {target}."
+        elif phase == ExecutionPhase.AUTONOMOUS_DEMO:
+            return f"Watch. Simulating how I'd grasp the {target}, using everything learned from your attempts."
         return None
 
     def transition_to(self, new_phase: ExecutionPhase) -> None:
@@ -253,6 +266,21 @@ class WorkflowController:
             return True
         return False
 
+    def step_autonomous_demo(self) -> bool:
+        """Hold the hands-off Autonomous Demo for a fixed wall-clock duration,
+        then return to IDLE - this is a one-off, on-demand showcase (triggered
+        by START_AUTONOMOUS_DEMO), not a step in the normal Foresee-Execute-Adapt
+        cycle, so it doesn't loop or chain into anything else. Returns True once
+        the demo has finished."""
+        if self._phase != ExecutionPhase.AUTONOMOUS_DEMO:
+            return False
+
+        elapsed = time.time() - self._phase_start_time
+        if elapsed >= self.autonomous_demo_duration_sec and self.auto_advance:
+            self.transition_to(ExecutionPhase.IDLE)
+            return True
+        return False
+
     def advance_phase(self) -> ExecutionPhase:
         """Manual trigger to jump to the subsequent phase."""
         if self._phase == ExecutionPhase.IDLE:
@@ -282,3 +310,11 @@ class WorkflowController:
             self.transition_to(ExecutionPhase.IDLE)
         elif cmd_upper == WorkflowControlSignal.ADVANCE_PHASE.value:
             self.advance_phase()
+        elif cmd_upper == WorkflowControlSignal.START_AUTONOMOUS_DEMO.value:
+            # Only meaningful with an active target, and not while a real attempt
+            # is actually in progress - an on-demand showcase shouldn't barge in
+            # mid-execution or mid-adaptation.
+            if self._target_label not in ("none", "idle", "clear", "") and self._phase not in (
+                ExecutionPhase.USER_EXECUTING, ExecutionPhase.ADAPTING
+            ):
+                self.transition_to(ExecutionPhase.AUTONOMOUS_DEMO)

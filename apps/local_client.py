@@ -377,6 +377,83 @@ class LocalVisualizer:
 
         cv2.addWeighted(overlay, alpha, frame, 1.0 - alpha, 0, dst=frame)
 
+    @staticmethod
+    def _bbox_screen_rect(target_bbox: BoundingBox3D, w: int, h: int) -> tuple:
+        """Project a BoundingBox3D's center + size to a 2D screen-space
+        (center_xy, px_w, px_h) rectangle, using the same default pinhole
+        convention used throughout this project (BoundingBox3D.project_to_2d)."""
+        depth = max(float(target_bbox.center[2]), 0.1)
+        fx = fy = 0.8 * w
+        cx, cy = w / 2.0, h / 2.0
+        center = np.array(
+            [fx * target_bbox.center[0] / depth + cx, fy * target_bbox.center[1] / depth + cy],
+            dtype=np.float32,
+        )
+        px_w = max(10, int(fx * float(target_bbox.size[0]) / depth))
+        px_h = max(10, int(fy * float(target_bbox.size[1]) / depth))
+        return center, px_w, px_h
+
+    def capture_object_sprite(self, frame: np.ndarray, target_bbox: BoundingBox3D) -> Optional[np.ndarray]:
+        """Crop a real snapshot of the target object out of the live camera frame.
+
+        This is what makes the ghost afterimage look like the actual object
+        instead of an abstract colored blob: rather than synthesizing a shape,
+        we grab a real photo of it while it's plainly visible (called only when
+        NOT mid-grasp, so the real hand isn't occluding it) and stamp that photo
+        into the afterimage later."""
+        h, w = frame.shape[:2]
+        center, px_w, px_h = self._bbox_screen_rect(target_bbox, w, h)
+        x0, y0 = int(center[0] - px_w / 2), int(center[1] - px_h / 2)
+        x1, y1 = x0 + px_w, y0 + px_h
+        x0c, y0c = max(0, x0), max(0, y0)
+        x1c, y1c = min(w, x1), min(h, y1)
+        if x1c - x0c < 6 or y1c - y0c < 6:
+            return None
+        return frame[y0c:y1c, x0c:x1c].copy()
+
+    def _stamp_object_sprite(
+        self,
+        frame: np.ndarray,
+        sprite: np.ndarray,
+        center: tuple,
+        px_w: int,
+        px_h: int,
+        tint: tuple = (0, 235, 255),
+        alpha: float = 0.80,
+    ) -> None:
+        """Blend a captured real photo of the object into the frame at (center),
+        resized to (px_w, px_h), soft-masked to an oval cutout, and lightly
+        tinted so it still reads as a holographic afterimage rather than a
+        second physical copy of the object sitting in the scene."""
+        h, w = frame.shape[:2]
+        px_w, px_h = max(6, px_w), max(6, px_h)
+        resized = cv2.resize(sprite, (px_w, px_h), interpolation=cv2.INTER_LINEAR)
+
+        tint_layer = np.full_like(resized, tint)
+        tinted = cv2.addWeighted(resized, 0.62, tint_layer, 0.38, 0)
+
+        mask = np.zeros((px_h, px_w), dtype=np.uint8)
+        cv2.ellipse(mask, (px_w // 2, px_h // 2), (px_w // 2, px_h // 2), 0, 0, 360, 255, -1, cv2.LINE_AA)
+        blur_sigma = max(1.0, px_w * 0.05)
+        mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=blur_sigma)
+        mask_f = (mask.astype(np.float32) / 255.0) * alpha
+
+        x0, y0 = int(center[0] - px_w / 2), int(center[1] - px_h / 2)
+        x1, y1 = x0 + px_w, y0 + px_h
+        fx0, fy0 = max(0, x0), max(0, y0)
+        fx1, fy1 = min(w, x1), min(h, y1)
+        if fx1 <= fx0 or fy1 <= fy0:
+            return
+        sx0, sy0 = fx0 - x0, fy0 - y0
+        sx1, sy1 = sx0 + (fx1 - fx0), sy0 + (fy1 - fy0)
+
+        roi = frame[fy0:fy1, fx0:fx1].astype(np.float32)
+        sprite_roi = tinted[sy0:sy1, sx0:sx1].astype(np.float32)
+        mask_roi = mask_f[sy0:sy1, sx0:sx1][..., None]
+        frame[fy0:fy1, fx0:fx1] = (roi * (1.0 - mask_roi) + sprite_roi * mask_roi).astype(np.uint8)
+
+        cv2.ellipse(frame, (int(center[0]), int(center[1])), (px_w // 2, px_h // 2), 0, 0, 360, tint, 2, cv2.LINE_AA)
+
     def _draw_object_replay_afterimage(
         self,
         frame: np.ndarray,
@@ -384,6 +461,7 @@ class LocalVisualizer:
         idx: int,
         xf,
         target_bbox: BoundingBox3D,
+        sprite: Optional[np.ndarray] = None,
     ) -> None:
         """Ghost afterimage of the object as it would be manipulated by the
         replayed hand motion.
@@ -401,18 +479,16 @@ class LocalVisualizer:
         undergoes since the contact moment (in the replay's own re-anchored
         space via xf) - approximating "the object moves rigidly with the hand
         once grasped" without a separate physics simulation.
+
+        The CURRENT step is rendered as a real photo-crop of the object (see
+        capture_object_sprite/_stamp_object_sprite) when one is available, so it
+        looks like the actual object rather than a flat colored shape. The
+        fading trail behind it stays a simple colored blob - stamping a full
+        image at every trail step would be visually busy and costly for what's
+        meant to be a quick motion cue.
         """
         h, w = frame.shape[:2]
-        depth = max(float(target_bbox.center[2]), 0.1)
-        px_w = max(10, int(0.8 * w * float(target_bbox.size[0]) / depth))
-        px_h = max(10, int(0.8 * w * float(target_bbox.size[1]) / depth))
-
-        fx = fy = 0.8 * w
-        cx, cy = w / 2.0, h / 2.0
-        bbox_2d = np.array(
-            [fx * target_bbox.center[0] / depth + cx, fy * target_bbox.center[1] / depth + cy],
-            dtype=np.float32,
-        )
+        bbox_2d, px_w, px_h = self._bbox_screen_rect(target_bbox, w, h)
 
         dists = [float(np.linalg.norm(p.keypoints_3d[0] - target_bbox.center)) for p in replay_poses]
         grasp_idx = int(np.argmin(dists))
@@ -430,20 +506,25 @@ class LocalVisualizer:
 
         overlay = frame.copy()
         for s in trail_steps:
+            if s == idx:
+                continue
             center = anchored_2d(s)
             cx_i, cy_i = int(np.clip(center[0], 0, w - 1)), int(np.clip(center[1], 0, h - 1))
             age = (idx - s) / float(trail_span)
             in_contact = s >= grasp_idx
             color = (0, 210, 255) if in_contact else (150, 210, 255)
             cv2.ellipse(overlay, (cx_i, cy_i), (px_w // 2, px_h // 2), 0, 0, 360, color, -1, cv2.LINE_AA)
-            if s != idx:
-                cv2.addWeighted(overlay, 0.30 * (1.0 - age), frame, 1.0 - 0.30 * (1.0 - age), 0, dst=frame)
-                overlay = frame.copy()
+            cv2.addWeighted(overlay, 0.30 * (1.0 - age), frame, 1.0 - 0.30 * (1.0 - age), 0, dst=frame)
+            overlay = frame.copy()
 
-        # Crisp outline + label on the current replay frame
+        # Current step: a real photo-crop of the object if we have one, else the
+        # same colored-ellipse fallback used before this feature existed.
         center = anchored_2d(idx)
         cx_i, cy_i = int(np.clip(center[0], 0, w - 1)), int(np.clip(center[1], 0, h - 1))
-        cv2.ellipse(frame, (cx_i, cy_i), (px_w // 2, px_h // 2), 0, 0, 360, (0, 235, 255), 2, cv2.LINE_AA)
+        if sprite is not None and sprite.size > 0:
+            self._stamp_object_sprite(frame, sprite, (cx_i, cy_i), px_w, px_h)
+        else:
+            cv2.ellipse(frame, (cx_i, cy_i), (px_w // 2, px_h // 2), 0, 0, 360, (0, 235, 255), 2, cv2.LINE_AA)
         label = target_bbox.label.replace("_", " ")
         cv2.putText(frame, label, (cx_i - px_w // 2, cy_i - px_h // 2 - 6),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.34, (0, 235, 255), 1, cv2.LINE_AA)
@@ -457,6 +538,7 @@ class LocalVisualizer:
         label: str = "",
         color: tuple = (255, 235, 100),
         target_bbox: Optional[BoundingBox3D] = None,
+        object_sprite: Optional[np.ndarray] = None,
     ) -> int:
         """Render an afterimage/replay of a REAL previously-recorded hand motion -
         never a synthetic generated plan. Two uses:
@@ -497,7 +579,7 @@ class LocalVisualizer:
 
         # Object afterimage (drawn first, underneath the hand)
         if target_bbox is not None:
-            self._draw_object_replay_afterimage(frame, replay_poses, idx, xf, target_bbox)
+            self._draw_object_replay_afterimage(frame, replay_poses, idx, xf, target_bbox, sprite=object_sprite)
 
         # Shimmering trail of the wrist path across the whole recorded motion.
         trail_pts_raw = xf(np.stack([p.keypoints_2d[0] for p in replay_poses]))
@@ -590,6 +672,10 @@ class LocalVisualizer:
             rew = episode_report.episode_reward if episode_report else 0.0
             msg = f"Adapted  -  {rew:+.2f} reward"
             cv2.putText(frame, msg, (bx1 + 30, by1 + 21), cv2.FONT_HERSHEY_SIMPLEX, 0.36, PALETTE["neon_violet"], 1, cv2.LINE_AA)
+        elif phase == ExecutionPhase.AUTONOMOUS_DEMO:
+            cv2.circle(frame, (bx1 + 18, by1 + 16), int(4 + 2 * pulse), PALETTE["cyan_electric"], -1, cv2.LINE_AA)
+            msg = f"Autonomous Demo  -  {int(progress*100)}%"
+            cv2.putText(frame, msg, (bx1 + 30, by1 + 21), cv2.FONT_HERSHEY_SIMPLEX, 0.38, PALETTE["cyan_electric"], 1, cv2.LINE_AA)
         else:
             cv2.circle(frame, (bx1 + 18, by1 + 16), 3, PALETTE["text_dim"], -1, cv2.LINE_AA)
             msg = "Standby - press 'i' or talk ('v')"
@@ -604,16 +690,17 @@ class LocalVisualizer:
         target = target_label.replace("_", " ") if target_label and target_label.lower() not in ("none", "") else "an object"
 
         foreseeing_body = (
-            f"Watch a replay of your last attempt at the {target}..." if has_replay
+            f"Watch a replay of your last attempt at the {target}, or press 'a' for the autonomous demo..." if has_replay
             else f"First try - go with your best guess for the {target}. Get ready..."
         )
         messages = {
             ExecutionPhase.IDLE: ("STANDBY", "Hold 'v' or SPACE and say what to pick up, e.g. \"wine glass\"", PALETTE["text_dim"]),
             ExecutionPhase.FORESEEING: ("PREVIEWING", foreseeing_body, PALETTE["amber_gold"]),
-            ExecutionPhase.WAIT_USER: ("YOUR TURN", "Get in position, then press 'c' when ready", PALETTE["cyan_electric"]),
+            ExecutionPhase.WAIT_USER: ("YOUR TURN", "Get in position and press 'c' - or press 'a' for the autonomous demo", PALETTE["cyan_electric"]),
             ExecutionPhase.USER_EXECUTING: ("GO", f"Reach for the {target} now - do it your way", PALETTE["neon_green"]),
             ExecutionPhase.ADAPTING: ("REVIEW", "Here's a replay of what you just did...", PALETTE["neon_violet"]),
             ExecutionPhase.RESTARTING: ("TRY AGAIN", f"Restarting with an improved plan for the {target}...", PALETTE["neon_violet"]),
+            ExecutionPhase.AUTONOMOUS_DEMO: ("AUTONOMOUS DEMO", f"Simulating the grasp on the {target}, using everything learned so far...", PALETTE["cyan_electric"]),
         }
         title, body, color = messages.get(phase, messages[ExecutionPhase.IDLE])
 
@@ -822,6 +909,7 @@ class LocalVisualizer:
             ExecutionPhase.WAIT_USER: PALETTE["text_white"],
             ExecutionPhase.USER_EXECUTING: PALETTE["neon_green"],
             ExecutionPhase.ADAPTING: PALETTE["neon_violet"],
+            ExecutionPhase.AUTONOMOUS_DEMO: PALETTE["cyan_electric"],
         }
         p_col = phase_colors.get(workflow_phase, PALETTE["text_dim"])
 
@@ -982,6 +1070,7 @@ class LocalVisualizer:
         ("d", "Depth PIP"),
         ("s", "Screenshot"),
         ("z", "Fullscreen"),
+        ("a", "Autonomous Demo"),
         ("q/ESC", "Quit"),
     ]
 
@@ -1190,6 +1279,10 @@ class LocalClientRunner:
         self._last_completed_recording: List[HandPose] = []
         self._last_recording_phase: Optional[ExecutionPhase] = None
         self._last_recording_target: Optional[str] = None
+        # A real photo-crop of the target object, refreshed whenever it's plainly
+        # visible (not mid-grasp), so the ghost afterimage can look like the
+        # actual object instead of an abstract colored shape.
+        self._object_sprite: Optional[np.ndarray] = None
         self._remote_snapshot = {
             "poses": [], "bboxes": [], "affordance_map": None, "foreseen_traj": None,
             "depth_heatmap": None, "gripper_cmd": 0.0, "residuals": None, "reward_score": 0.0,
@@ -1242,6 +1335,20 @@ class LocalClientRunner:
         if self.mode == "mock_remote":
             self._control_cmd_to_send = "ADVANCE_PHASE"
         logger.info(f"Manually advanced workflow to: [{new_phase.value}]")
+
+    def trigger_autonomous_demo(self) -> None:
+        """On-demand, hands-off simulated pick (the 'a' hotkey): replans fresh
+        from wherever the object currently is and runs it through the real
+        trained residual policy's correction, to showcase what co-adaptation
+        has learned so far. Requires an active intent - does nothing if the
+        user hasn't said what to pick up yet."""
+        if self.workflow._target_label in ("none", "", "idle", "clear"):
+            logger.info("Autonomous Demo: no active intent - say what to pick up first.")
+            return
+        self.workflow.handle_control_command("START_AUTONOMOUS_DEMO")
+        if self.mode == "mock_remote":
+            self._control_cmd_to_send = "START_AUTONOMOUS_DEMO"
+        logger.info(f"Autonomous Demo triggered for target: {self.workflow._target_label}")
 
     def save_checkpoint(self) -> None:
         """Save learned residual policy checkpoint."""
@@ -1752,6 +1859,14 @@ class LocalClientRunner:
                                 instruction = self.workflow._phase_instruction(workflow_phase)
                                 if instruction:
                                     self.speaker.speak(instruction)
+                        elif workflow_phase == ExecutionPhase.AUTONOMOUS_DEMO:
+                            # A one-off, explicitly requested action (the 'a' hotkey) -
+                            # announce every time it's triggered, not deduped per-target
+                            # like the training loop's FORESEEING entry above.
+                            if self.workflow.voice_guidance_enabled:
+                                instruction = self.workflow._phase_instruction(workflow_phase)
+                                if instruction:
+                                    self.speaker.speak(instruction)
                         elif workflow_phase == ExecutionPhase.IDLE:
                             self._training_target_announced = None  # a future new intent should announce again
 
@@ -1782,6 +1897,14 @@ class LocalClientRunner:
                     self._last_recording_phase = workflow_phase
                 if workflow_phase == ExecutionPhase.USER_EXECUTING and poses:
                     self._local_recorded_poses.append(poses[0])
+
+                # Refresh the real object photo-crop whenever the object is plainly
+                # visible and not mid-grasp (a real hand about to close on it would
+                # otherwise get baked into the snapshot).
+                if bboxes and workflow_phase not in (ExecutionPhase.USER_EXECUTING, ExecutionPhase.ADAPTING):
+                    sprite = self.visualizer.capture_object_sprite(frame, bboxes[0])
+                    if sprite is not None:
+                        self._object_sprite = sprite
 
                 # Session Recording
                 if self.recorder.is_recording:
@@ -1838,10 +1961,26 @@ class LocalClientRunner:
                     replay_poses = self._last_completed_recording
                     replay_reanchor = False
                     ghost_label = "REPLAY: WHAT YOU JUST DID"
+                elif workflow_phase == ExecutionPhase.AUTONOMOUS_DEMO and foreseen_traj is not None and foreseen_traj.waypoints:
+                    # Hands-off showcase: the server generated this trajectory fresh
+                    # from wherever the object currently is and ran it through the
+                    # real trained policy's correction (see ws_server.py). Wrap each
+                    # waypoint as a HandPose so it can reuse the same replay renderer
+                    # as the real-motion afterimages above - it just needs .keypoints_2d/3d.
+                    replay_poses = [
+                        HandPose(
+                            hand_id=0, side=HandSide.RIGHT,
+                            keypoints_3d=wp.hand_keypoints_3d, keypoints_2d=wp.hand_keypoints_2d,
+                            confidence=1.0, timestamp=0.0,
+                        )
+                        for wp in foreseen_traj.waypoints
+                    ]
+                    replay_reanchor = False
+                    ghost_label = "AUTONOMOUS DEMO"
 
                 foreseen_step = self.visualizer.draw_hand_replay(
                     frame, replay_poses, real_poses=poses, reanchor=replay_reanchor, label=ghost_label,
-                    target_bbox=bboxes[0] if bboxes else None
+                    target_bbox=bboxes[0] if bboxes else None, object_sprite=self._object_sprite
                 )
                 self.visualizer.draw_depth_pip(frame, depth_heatmap)
                 
@@ -1947,6 +2086,8 @@ class LocalClientRunner:
                     logger.info(f"Saved screenshot to {screenshot_name}")
                 elif key == ord("z"): # Toggle fullscreen
                     self.toggle_fullscreen()
+                elif key == ord("a"): # Autonomous Demo: hands-off simulated pick
+                    self.trigger_autonomous_demo()
 
                 # Maintain 30 FPS yielding to asyncio
                 elapsed = time.perf_counter() - t_frame_start

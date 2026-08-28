@@ -192,6 +192,7 @@ When running the visualizer HUD (`apps/local_client.py` or `apps/run_demo.py`), 
 | **`d`** | **Depth Inset** | Toggle metric depth picture-in-picture (PIP) inset |
 | **`s`** | **Screenshot** | Save timestamped PNG snapshot to disk |
 | **`z`** | **Fullscreen** | Toggle the visualizer window between windowed and true fullscreen |
+| **`a`** | **Autonomous Demo** | Hands-off simulated pick: replans fresh from the object's current position and runs the trained policy's correction over it (requires an active intent) |
 | **`q`** / `ESC` | **Quit** | Gracefully disconnect and exit application |
 
 ---
