@@ -1,4 +1,13 @@
-"""Synthetic Visuomotor Residual Adaptation Policy Mock (Phase 4)."""
+"""Fixed linear feedback residual policy - CPU-only fallback (Phase 4).
+
+This is NOT a neural network and does not really learn: `update()` nudges its
+weights by a fixed, hand-picked direction unrelated to any real loss gradient.
+It exists purely as a zero-dependency fallback for environments without torch
+(the Mac client's mock_local mode, and unit tests) and for interface parity
+testing. The real learned residual policy is NeuralResidualPolicy
+(src/policy/neural_policy.py), a genuine PyTorch MLP trained online via
+Reward-Weighted Regression, used by apps/remote_server.py whenever torch is
+available (i.e. on the GPU pod)."""
 
 import time
 from typing import Any, Dict, List, Optional
@@ -9,10 +18,11 @@ from src.policy.policy import PolicyABC, PolicyAction, PolicyObservation
 
 class MockResidualPolicy(PolicyABC):
     """
-    Lightweight CPU-friendly Residual Adaptation Policy.
-    Accepts 112D state vector s_t, outputs residual joint correction deltas
-    a_t = Delta theta_t in [-0.08, 0.08] radians, and simulates an online learning
-    update loop (mock PPO/SAC gradient step) to minimize tracking discrepancy over time.
+    Lightweight CPU-friendly residual policy with a fixed linear proportional
+    feedback term. Accepts a 112D state vector s_t, outputs residual joint
+    correction deltas a_t = Delta theta_t in [-0.08, 0.08] radians. `update()`
+    is a placeholder gradient step for interface parity with a real policy - it
+    does not minimize any actual loss (see module docstring).
     """
 
     def __init__(
@@ -124,8 +134,9 @@ class MockResidualPolicy(PolicyABC):
 
     def update(self, replay_buffer: Any) -> Dict[str, float]:
         """
-        Simulate an online PPO policy gradient update step.
-        Adjusts weights to minimize tracking discrepancy and maximize reward.
+        Placeholder update step kept for interface parity with NeuralResidualPolicy.
+        Nudges weights by a fixed direction (mean recent state) - NOT a real
+        gradient of any loss function, so this does not actually learn.
         """
         if not self.buffer:
             return {

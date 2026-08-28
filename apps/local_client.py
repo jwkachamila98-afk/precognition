@@ -775,7 +775,8 @@ class LocalVisualizer:
         buffer_steps: int = 0,
         is_recording: bool = False,
         recorded_frames: int = 0,
-        robot_connected: bool = True
+        robot_connected: bool = True,
+        policy_loss: float = 0.0
     ) -> None:
         """Render the status HUD: a minimal glance card by default, or the full
         telemetry dock when expanded via 'h'."""
@@ -786,6 +787,7 @@ class LocalVisualizer:
                 poses=poses, gripper_cmd=gripper_cmd, reward_score=reward_score,
                 discrepancy_norm=discrepancy_norm, adaptation_active=adaptation_active,
                 is_recording=is_recording, recorded_frames=recorded_frames, robot_connected=robot_connected,
+                policy_loss=policy_loss,
             )
         else:
             self._draw_telemetry_compact(
@@ -862,6 +864,7 @@ class LocalVisualizer:
         is_recording: bool,
         recorded_frames: int,
         robot_connected: bool,
+        policy_loss: float = 0.0,
     ) -> None:
         """Full telemetry dock, sized to its content - opt-in detail view (press 'h')."""
         h, w = frame.shape[:2]
@@ -917,7 +920,7 @@ class LocalVisualizer:
         r_col = PALETTE["neon_green"] if reward_score > 0.5 else (PALETTE["amber_gold"] if reward_score > 0.0 else PALETTE["laser_red"])
         cv2.putText(frame, f"reward - {reward_score:+0.2f}", (x1 + 12, y1 + 180), cv2.FONT_HERSHEY_SIMPLEX, 0.34, r_col, 1, cv2.LINE_AA)
 
-        cv2.putText(frame, f"error - {discrepancy_norm:.4f}", (x1 + 12, y1 + 200), cv2.FONT_HERSHEY_SIMPLEX, 0.34, PALETTE["text_white"], 1, cv2.LINE_AA)
+        cv2.putText(frame, f"error - {discrepancy_norm:.4f}  net loss - {policy_loss:.3f}", (x1 + 12, y1 + 200), cv2.FONT_HERSHEY_SIMPLEX, 0.30, PALETTE["text_white"], 1, cv2.LINE_AA)
 
         # Gripper Actuator Progress Bar
         cv2.putText(frame, "gripper", (x1 + 12, y1 + 222), cv2.FONT_HERSHEY_SIMPLEX, 0.34, PALETTE["text_white"], 1, cv2.LINE_AA)
@@ -1144,6 +1147,13 @@ class LocalClientRunner:
         self.local_trajectory_diffusion = MockTrajectoryDiffusion()
         self.local_discrepancy_engine = DiscrepancyEngine()
         self.local_physics_engine = MockPhysicsEngine()
+        # Deliberately NOT using NeuralResidualPolicy here even when torch happens
+        # to be installed: loading torch in the same process as faster-whisper
+        # (WhisperTranscriber, used by this same client) was observed to crash
+        # with a fatal native abort - almost certainly a conflicting bundled
+        # OpenMP/MKL runtime between the two libraries' native backends. The real
+        # neural policy runs server-side (apps/remote_server.py), in a process
+        # that never loads faster-whisper, where this conflict cannot occur.
         self.local_policy = MockResidualPolicy()
         self._last_action = np.zeros(7, dtype=np.float32)
         self._cached_foreseen_traj = None
@@ -1185,7 +1195,7 @@ class LocalClientRunner:
             "depth_heatmap": None, "gripper_cmd": 0.0, "residuals": None, "reward_score": 0.0,
             "discrepancy_norm": 0.0, "buffer_steps": 0, "parsed_intent": None,
             "workflow_phase": ExecutionPhase.IDLE, "phase_progress": 0.0,
-            "benchmark_summary": None,
+            "benchmark_summary": None, "policy_loss": 0.0,
         }
 
     def toggle_voice_mode(self) -> None:
@@ -1388,6 +1398,7 @@ class LocalClientRunner:
             "workflow_phase": workflow_phase,
             "phase_progress": response.phase_progress,
             "benchmark_summary": response.benchmark_summary or self._remote_snapshot["benchmark_summary"],
+            "policy_loss": response.policy_loss,
         })
 
     def _audio_callback(self, indata: np.ndarray, frames: int, time_info: Any, status: Any) -> None:
@@ -1551,6 +1562,7 @@ class LocalClientRunner:
                 reward_score = 0.0
                 discrepancy_norm = 0.0
                 buffer_steps = 0
+                policy_loss = 0.0
                 latency_ms = 0.0
                 state_vec: Optional[np.ndarray] = None
                 parsed_intent_resp: Optional[ParsedIntent] = self.current_parsed_intent
@@ -1686,6 +1698,7 @@ class LocalClientRunner:
                         self.robot.send_joint_commands(safety.clamped_joint_positions, gripper_command=action.gripper_action)
 
                         buffer_steps = self.local_policy.step_count
+                        policy_loss = getattr(self.local_policy, "loss_history", [0.0])[-1]
                         latency_ms = (time.perf_counter() - t0) * 1000.0
 
                 elif self.mode == "mock_remote":
@@ -1717,6 +1730,7 @@ class LocalClientRunner:
                     reward_score = snap["reward_score"]
                     discrepancy_norm = snap["discrepancy_norm"]
                     buffer_steps = snap["buffer_steps"]
+                    policy_loss = snap["policy_loss"]
                     parsed_intent_resp = snap["parsed_intent"] or self.current_parsed_intent
                     workflow_phase = snap["workflow_phase"]
                     phase_progress = snap["phase_progress"]
@@ -1873,7 +1887,8 @@ class LocalClientRunner:
                     buffer_steps=buffer_steps,
                     is_recording=self.recorder.is_recording,
                     recorded_frames=self.recorder.frame_count,
-                    robot_connected=self.robot.is_connected
+                    robot_connected=self.robot.is_connected,
+                    policy_loss=policy_loss
                 )
 
                 # Always-on hotkey cheat sheet, docked below the glance card (skipped when the

@@ -9,7 +9,7 @@ Runs an async WebSocket server on port 8765, executing the full Phase 8 visuomot
 - MockAffordanceExtractor (Contact probability maps)
 - MockTrajectoryDiffusion (60-step foreseen reference trajectory rollout)
 - DiscrepancyEngine (112D state vector & episode discrepancy compilation)
-- MockResidualPolicy (online PPO learning loop & residual joint corrections)
+- NeuralResidualPolicy (real online-learning MLP, Reward-Weighted Regression -> MockResidualPolicy fallback)
 - MockRobotHardware (7-DOF robotic manipulator & actuator dynamic constraints)
 - PolicyCheckpointManager (Persistent profile & weight storage)
 - CoAdaptationBenchmark (Multi-trial analytics & convergence curves)
@@ -177,7 +177,20 @@ def main() -> None:
     trajectory_diffusion = MockTrajectoryDiffusion()
     discrepancy_engine = DiscrepancyEngine()
     physics_engine = MockPhysicsEngine()
-    policy = MockResidualPolicy()
+
+    # --- Residual policy: real online-learning neural network (GPU) -> fixed
+    # linear feedback fallback (CPU-only environments without torch) ---
+    try:
+        from src.policy.neural_policy import NeuralResidualPolicy
+        policy = NeuralResidualPolicy()
+        logger.info(
+            f"RemoteServer: Using real NeuralResidualPolicy (device={policy.device}), "
+            "trained online via Reward-Weighted Regression."
+        )
+    except ImportError as e:
+        logger.warning(f"NeuralResidualPolicy unavailable ({e}); falling back to MockResidualPolicy.")
+        policy = MockResidualPolicy()
+
     workflow = WorkflowController(foresee_steps=60, wait_user_timeout=2.0, auto_advance=True)
     robot = MockRobotHardware(dof=7)
     checkpoint_manager = PolicyCheckpointManager()

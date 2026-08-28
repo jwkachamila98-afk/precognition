@@ -50,8 +50,8 @@ Runs in real-time ($30+\text{ FPS}$) on resource-constrained **Intel Mac CPU** h
   |                         | (60-step tau_ref)  |                                     |              |
   |                         +--------------------+                                     v              |
   |                                    |                                     +--------------------+   |
-  |                                    |                                     | MockResidualPolicy |   |
-  |                                    |                                     | (Online PPO buffer |   |
+  |                                    |                                     | NeuralPolicy (RWR) |   |
+  |                                    |                                     | RWR-trained online |   |
   |                                    |                                     |  & Delta theta_t)  |   |
   |                                    |                                     +--------------------+   |
   |                                    |                                               |              |
@@ -113,6 +113,7 @@ Precognition/
 │   ├── policy/
 │   │   ├── policy.py                  # PolicyABC, PolicyObservation, PolicyAction
 │   │   ├── policy_base.py             # Policy interface compatibility
+│   │   ├── neural_policy.py           # NeuralResidualPolicy: real PyTorch MLP, online Reward-Weighted Regression
 │   │   ├── discrepancy.py             # DiscrepancyEngine, 112D s_t, EpisodeDiscrepancyReport
 │   │   ├── workflow_state.py          # ExecutionPhase enum, WorkflowController state machine
 │   │   └── checkpointing.py           # PolicyCheckpointManager for persistent weights
@@ -132,13 +133,13 @@ Precognition/
 │       ├── mock_affordance_extractor.py # Surface contact probability grounding A(v_i)
 │       ├── mock_trajectory_diffusion.py # 60-step foreseen reference trajectory rollout
 │       ├── mock_physics_engine.py     # Analytical CPU physics simulator & contacts
-│       └── mock_policy.py             # MockResidualPolicy with online PPO learning loop
+│       └── mock_policy.py             # MockResidualPolicy: fixed linear feedback, CPU/test fallback
 └── tests/
     ├── test_mocks.py                  # Core mocks and serialization unit tests
     ├── test_mediapipe_tracker.py      # MediaPipe tracker tests
     ├── test_e2e_headless.py           # End-to-end WebSocket streaming tests
     ├── test_phase3.py                 # Affordance, diffusion, and physics tests
-    ├── test_policy_discrepancy.py     # 112D state vector, reward, and PPO policy tests
+    ├── test_policy_discrepancy.py     # 112D state vector, reward, and residual policy tests
     ├── test_profiler_recorder.py      # Latency profiler and session recorder tests
     ├── test_audio_intent.py           # Audio STT and Structured LLM intent tests
     ├── test_workflow_state.py         # Workflow state machine and episode compilation tests
@@ -183,7 +184,7 @@ When running the visualizer HUD (`apps/local_client.py` or `apps/run_demo.py`), 
 | **`v`** / `SPACE` | **Voice Push-To-Talk** | Toggle voice speech-to-text listening / transcribing |
 | **`g`** | **Voice Guidance** | Mute/unmute spoken workflow instructions on each phase transition |
 | **`i`** | **Cycle Intent Prompt** | Cycle target object intent (`remote control`, `coffee cup`, `water bottle`) |
-| **`p`** | **Toggle Adaptation** | Enable / pause online residual PPO learning loop |
+| **`p`** | **Toggle Adaptation** | Enable / pause the online residual policy's learning (Reward-Weighted Regression) |
 | **`r`** | **Toggle Recording** | Save MP4 webcam video & JSONL telemetry dataset |
 | **`f`** | **Ghost Hand Replay** | Toggle the real-motion afterimage overlay (replays your own recorded attempts) |
 | **`t`** | **Toggle Tracker** | Switch between `MEDIAPIPE (LIVE)` and `MOCK (SYNTHETIC)` in real time |

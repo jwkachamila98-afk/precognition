@@ -162,7 +162,7 @@ Compiled upon completion of each physical manipulation execution:
 - `smoothness_variance`: 2nd-order motion jerk variance.
 - `contact_misalignment`: Final contact distance error in meters.
 - `episode_reward`: Aggregate scalar reward $R_{\text{episode}} \in [-1.0, 1.0]$.
-- `loss_delta`: PPO policy update gradient loss improvement.
+- `loss_delta`: Residual policy update gradient loss improvement (Reward-Weighted Regression step).
 
 ---
 
