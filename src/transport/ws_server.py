@@ -205,10 +205,20 @@ class WSInferenceServer:
                     parsed_intent = self._cached_parsed_intent
 
                 # 4. Perception: Grounded 3D Scene Parsing
+                # Ground on the PARSED TARGET, not the raw utterance. Passing the
+                # whole sentence queried the open-vocabulary grounder with
+                # "I'm going to pick up this glass cup", labelled the resulting
+                # detection with that sentence (which then surfaces as the object's
+                # name downstream), and re-invoked Gemini whenever the phrasing
+                # changed even though the object had not. local_client.py already
+                # does it this way; the server did not.
+                scene_prompt = (parsed_intent.target_object
+                                if parsed_intent is not None and parsed_intent.is_active
+                                else frame_msg.intent)
                 parsed_scene = self.scene_parser.parse_scene(
                     image=image,
                     depth=depth_map,
-                    intent=frame_msg.intent
+                    intent=scene_prompt
                 )
 
                 # 5. Affordance & Foreseen Trajectory Rollout

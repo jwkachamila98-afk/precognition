@@ -22,7 +22,10 @@ network:
   server_port: 8765
   compression_format: "jpeg"
   compression_quality: 80
-  timeout_seconds: 5.0
+  # A single round-trip can legitimately include a vision-LLM grounding call
+  # plus CPU depth and detection, which exceeds 5 s on a machine without a GPU.
+  # Too tight a timeout drops the connection mid-session and forces a reconnect.
+  timeout_seconds: 20.0
   reconnect_interval_seconds: 2.0
 
 perception:
