@@ -247,6 +247,9 @@ class WSInferenceServer:
                     current_foreseen_step = self._cached_foreseen_traj.waypoints[step_idx]
 
                 # 6. Workflow State Machine Lifecycle Stepping
+                # A demo asked for while the workflow was mid-episode starts here,
+                # as soon as a phase will accept it.
+                self.workflow.poll_pending_demo()
                 current_phase = self.workflow.current_phase
                 if current_phase != ExecutionPhase.AUTONOMOUS_DEMO:
                     # Covers being interrupted by any other command mid-demo, not just

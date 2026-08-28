@@ -206,3 +206,52 @@ def test_withdrawing_the_intent_still_clears_the_target():
     wf.trigger_intent("none")
     assert wf._target_label == "none"
     assert wf.current_phase == ExecutionPhase.IDLE
+
+
+def test_autonomous_demo_request_is_deferred_not_dropped():
+    """A demo asked for mid-episode must run when a phase will accept it.
+
+    Regression from a live run. The request travels a frame behind the keypress
+    and the phases auto-advance on their own timers, so on a slow host the
+    workflow routinely moves into a refusing phase in that gap. Pressing the key
+    then did nothing whatsoever - indistinguishable from a broken feature. It
+    was hit four times in twenty seconds before the user gave up.
+    """
+    wf = WorkflowController(auto_advance=False)
+    wf.trigger_intent("coffee cup")
+    wf.transition_to(ExecutionPhase.USER_EXECUTING)
+
+    wf.handle_control_command("START_AUTONOMOUS_DEMO")
+    assert wf.current_phase == ExecutionPhase.USER_EXECUTING, "must not barge in mid-attempt"
+    assert wf.poll_pending_demo() is False, "still executing; nothing to start yet"
+
+    wf.transition_to(ExecutionPhase.ADAPTING)
+    assert wf.poll_pending_demo() is False, "still adapting; nothing to start yet"
+
+    wf.transition_to(ExecutionPhase.WAIT_USER)
+    assert wf.poll_pending_demo() is True
+    assert wf.current_phase == ExecutionPhase.AUTONOMOUS_DEMO
+
+
+def test_deferred_demo_request_expires():
+    """A swallowed request must not surprise the user minutes later."""
+    wf = WorkflowController(auto_advance=False)
+    wf.pending_demo_ttl_sec = 0.05
+    wf.trigger_intent("coffee cup")
+    wf.transition_to(ExecutionPhase.USER_EXECUTING)
+    wf.handle_control_command("START_AUTONOMOUS_DEMO")
+
+    time.sleep(0.08)
+    wf.transition_to(ExecutionPhase.WAIT_USER)
+    assert wf.poll_pending_demo() is False
+    assert wf.current_phase == ExecutionPhase.WAIT_USER
+
+
+def test_demo_available_immediately_when_the_phase_allows():
+    """The deferral path must not slow down the normal case."""
+    wf = WorkflowController(auto_advance=False)
+    wf.trigger_intent("coffee cup")
+    wf.transition_to(ExecutionPhase.WAIT_USER)
+    wf.handle_control_command("START_AUTONOMOUS_DEMO")
+    assert wf.current_phase == ExecutionPhase.AUTONOMOUS_DEMO
+    assert wf._pending_demo_at is None

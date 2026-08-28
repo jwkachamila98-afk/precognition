@@ -85,6 +85,10 @@ class WorkflowController:
         # with a beat to register the final grasp/lift pose before returning to IDLE.
         self.autonomous_demo_duration_sec = autonomous_demo_duration_sec
         self.auto_advance = auto_advance
+        # A demo requested while the workflow was mid-episode, waiting for a
+        # phase that will accept it. See handle_control_command.
+        self._pending_demo_at: Optional[float] = None
+        self.pending_demo_ttl_sec = 20.0
         self.speaker = speaker
         self.voice_guidance_enabled = voice_guidance_enabled
 
@@ -274,6 +278,33 @@ class WorkflowController:
             return True
         return False
 
+    def poll_pending_demo(self) -> bool:
+        """Start a deferred Autonomous Demo once the workflow will accept one.
+
+        Call once per frame. Returns True if a deferred request was started.
+        Requests expire so that one swallowed during a long episode cannot
+        surprise the user by firing minutes later.
+        """
+        if self._pending_demo_at is None:
+            return False
+
+        if time.time() - self._pending_demo_at > self.pending_demo_ttl_sec:
+            self._pending_demo_at = None
+            logger.info("Autonomous Demo request expired before a phase would accept it.")
+            return False
+
+        if self._target_label in ("none", "idle", "clear", ""):
+            self._pending_demo_at = None
+            return False
+        if self._phase in (ExecutionPhase.USER_EXECUTING, ExecutionPhase.ADAPTING,
+                           ExecutionPhase.AUTONOMOUS_DEMO):
+            return False
+
+        self._pending_demo_at = None
+        logger.info("Starting the Autonomous Demo that was deferred earlier.")
+        self.transition_to(ExecutionPhase.AUTONOMOUS_DEMO)
+        return True
+
     def step_autonomous_demo(self) -> bool:
         """Hold the hands-off Autonomous Demo for a fixed wall-clock duration,
         then return to IDLE - this is a one-off, on-demand showcase (triggered
@@ -322,7 +353,19 @@ class WorkflowController:
             # Only meaningful with an active target, and not while a real attempt
             # is actually in progress - an on-demand showcase shouldn't barge in
             # mid-execution or mid-adaptation.
-            if self._target_label not in ("none", "idle", "clear", "") and self._phase not in (
-                ExecutionPhase.USER_EXECUTING, ExecutionPhase.ADAPTING
-            ):
+            if self._target_label in ("none", "idle", "clear", ""):
+                logger.info("Autonomous Demo requested with no active target; ignoring.")
+            elif self._phase in (ExecutionPhase.USER_EXECUTING, ExecutionPhase.ADAPTING):
+                # DEFER rather than drop. The request travels a frame behind the
+                # keypress, and the phases auto-advance on their own timers, so
+                # on a slow host the workflow routinely moves into a refusing
+                # phase in the gap - the user presses the key and nothing at all
+                # happens, with no way to tell that from a broken feature.
+                self._pending_demo_at = time.time()
+                logger.info(
+                    f"Autonomous Demo requested during [{self._phase.value}]; "
+                    f"deferred until the current attempt finishes."
+                )
+            else:
+                self._pending_demo_at = None
                 self.transition_to(ExecutionPhase.AUTONOMOUS_DEMO)
