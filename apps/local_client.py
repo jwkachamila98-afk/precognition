@@ -1599,8 +1599,14 @@ class LocalClientRunner:
             # for how far through the animation is, because it arrives in steps.
             if self._lab_demo_started_at is not None:
                 span = max(self.workflow.autonomous_demo_duration_sec, 0.1)
-                smooth = (now - self._lab_demo_started_at) / span
-                play = float(np.clip(max(smooth, progress), 0.0, 1.0))
+                # Purely the local clock. Taking max() with the server's progress
+                # to avoid lagging it defeated the entire point: the server starts
+                # its phase timer when the plan is generated, which is ~0.8 s
+                # before this client finishes staging, so its value is always the
+                # larger one and the max() picked the stepped source every time.
+                # A small lag behind the server is invisible - the plan finishes
+                # at 82% of the phase and holds - whereas the stepping is not.
+                play = float(np.clip((now - self._lab_demo_started_at) / span, 0.0, 1.0))
             else:
                 play = progress
             step = self.lab_sim.step_for_progress(play)

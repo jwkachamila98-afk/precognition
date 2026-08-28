@@ -32,6 +32,7 @@ import numpy as np
 from src.perception.scene_parser import BoundingBox3D
 from src.simulation.render import hand_mesh as HM
 from src.simulation.render import lab_scene as LS
+from src.simulation.render import object_library as OL
 from src.simulation.render import object_mesh as OM
 from src.simulation.render import shading as SH
 from src.simulation.render.camera import Camera
@@ -54,6 +55,20 @@ _REFERENCE_PALM_M = 0.092
 # final height) can be framed.
 _CAM_AZ_DEG = 17.0
 _CAM_EL_DEG = 21.0
+
+# Where the hand comes from, as an azimuth OFFSET from the camera. The plan's
+# own grasp azimuth is arbitrary - a canned orientation, not a measurement - so
+# against a locked camera it is as likely to be unreadable as not.
+#
+# Chosen by measuring, because the two obvious criteria disagree. Aligning the
+# palm to the camera peaks at 150-180 degrees, but that puts the hand BEHIND the
+# object, where it is occluded down to a sliver: best-facing scored the worst
+# visible area of any angle tested (0.55% of frame against 2.12%). Meanwhile the
+# 40-80 degree band turns the palm edge-on, rendering the hand as a featureless
+# slab. What actually matters is hand pixels that survive the depth test, which
+# peaks near 330 degrees - the viewer's side of the object, off-axis enough to
+# show the grasp closing, with the palm well clear of edge-on.
+_HAND_APPROACH_OFFSET_DEG = 330.0
 
 # The lab camera is LOCKED: one pose, identical for every demo, regardless of
 # object or plan. Framing the shot adaptively made each reenactment look like a
@@ -285,19 +300,33 @@ class LabSimulator:
 
         origin_cam = (np.asarray(target_bbox.center, dtype=np.float32) if target_bbox is not None
                       else np.asarray(waypoints[0].object_pose[:3], dtype=np.float32))
+        # Shape, in descending order of how much it is actually known:
+        #   1. the class's canonical geometry, when the label names something
+        #      we can model - a bottle is a turned profile, not a guess;
+        #   2. silhouette inflation from the photo-crop, for anything else;
+        #   3. a plain box.
+        # Colour comes from the real crop in cases 1 and 2 either way.
         mesh = None
-        if sprite is not None and sprite.size > 0:
+        self.object_is_reconstructed = False
+        try:
+            mesh = OL.build_class_mesh(target_bbox.label if target_bbox else None,
+                                       longest, sprite)
+        except Exception as exc:
+            logger.warning(f"LabSimulator: class mesh failed ({exc}); trying the silhouette.")
+
+        if mesh is None and sprite is not None and sprite.size > 0:
             try:
                 mesh = OM.build_object_mesh(sprite, longest,
                                             contour_points=24, rings=2)
+                self.object_is_reconstructed = mesh is not None
             except Exception as exc:                      # reconstruction is best-effort
                 logger.warning(f"LabSimulator: object reconstruction failed ({exc}); using primitive.")
-        self.object_is_reconstructed = mesh is not None
         if mesh is None:
             mesh = OM.fallback_object_mesh(longest)
         # Orient BEFORE measuring: turning the object changes its height, and the
         # anchor that rests it on the pedestal is derived from that height. Only
-        # the RECONSTRUCTED mesh is turned - see _orient_to_camera.
+        # the view-aligned silhouette relief is turned - a class mesh is modelled
+        # upright in lab space already. See _orient_to_camera.
         if self.object_is_reconstructed:
             mesh = self._orient_to_camera(mesh)
         else:
@@ -319,6 +348,7 @@ class LabSimulator:
         rest_y = float(anchor_lab[1])
         self._object_path_lab[:, 1] += rest_y - float(self._object_path_lab[0, 1])
 
+        self._present_hand_to_the_camera()
         self._seat_grasp_on_the_staged_object()
         self.camera = self._fit_camera()
         self._ensure_static_background()
@@ -333,6 +363,33 @@ class LabSimulator:
             f"{(time.perf_counter() - t0)*1000:.0f} ms."
         )
         return True
+
+    def _present_hand_to_the_camera(self) -> None:
+        """Rotate the whole hand path about the object's vertical axis so the
+        grasp is seen at a three-quarter view rather than edge-on.
+
+        A rigid rotation about the axis the object stands on: the hand's motion
+        relative to the object, its distance, and the grasp itself are all
+        unchanged - only which side it comes from. That is not information the
+        plan actually carries, since the grasp orientation is canned rather than
+        measured, so choosing it to suit a locked camera costs nothing real.
+        """
+        grasp = self._contact_step()
+        obj = self._object_path_lab[grasp]
+        wrist = self._hand_paths_lab[grasp][HM.WRIST]
+
+        offset = wrist - obj
+        current = math.atan2(float(offset[0]), float(offset[2]))
+        if abs(offset[0]) < 1e-4 and abs(offset[2]) < 1e-4:
+            return                                    # directly overhead; no azimuth
+        target = math.radians(_CAM_AZ_DEG + _HAND_APPROACH_OFFSET_DEG)
+        turn = target - current
+
+        c, s_ = math.cos(turn), math.sin(turn)
+        R = np.array([[c, 0.0, s_], [0.0, 1.0, 0.0], [-s_, 0.0, c]], dtype=np.float32)
+        pivot = np.array([obj[0], 0.0, obj[2]], dtype=np.float32)
+        flat = self._hand_paths_lab.reshape(-1, 3) - pivot
+        self._hand_paths_lab = (flat @ R.T + pivot).reshape(self._hand_paths_lab.shape)
 
     def _seat_grasp_on_the_staged_object(self) -> None:
         """Re-seat the hand so its grasp lands on the object as STAGED.
@@ -495,6 +552,25 @@ class LabSimulator:
             return 0.0
         screen, _ = self.camera.project(self._hand_paths_lab[int(step)])
         return float(screen[:, 1].max() - screen[:, 1].min())
+
+    def visible_hand_fraction(self, step: float) -> float:
+        """Fraction of the viewport the hand actually occupies AFTER occlusion.
+
+        The readability metric that matters. Screen height is a poor proxy: an
+        approach angled toward the viewer is shorter in screen-Y while showing
+        considerably more of itself, and an angle that maximises palm alignment
+        can put the hand behind the object where almost none of it survives the
+        depth test at all.
+        """
+        if not self.is_ready:
+            return 0.0
+        self._rast.restore(self._static_snapshot)
+        self._rast.draw(self._object_mesh_for(step), self.camera)
+        self._ghost.clear()
+        self._ghost.seed_depth(self._rast.depth)
+        self._ghost.draw(self._hand_mesh_for(step), self.camera)
+        visible = int((self._ghost.gbuffer[:, :, 12] > 0.5).sum())
+        return visible / float(self.width * self.height)
 
     def telemetry(self, step: float) -> Dict[str, float]:
         """Per-step numbers for the caller's HUD - all from the real plan.

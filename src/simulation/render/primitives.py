@@ -196,6 +196,70 @@ def uv_sphere(center, radius: float, color, segments: int = 10, rings: int = 6,
              material=material or Material()))
 
 
+def lathe(profile, color, segments: int = 20, close_bottom: bool = True,
+          close_top: bool = True, material: Optional[Material] = None) -> Mesh:
+    """Surface of revolution about +Y from a (radius, height) profile.
+
+    Nearly everything a hand picks up off a bench is turned: bottles, cups,
+    cans, glasses, bowls, fruit. Given the object's class we know its profile,
+    which produces real geometry instead of guessing depth from a silhouette.
+
+    `profile` runs bottom to top as [(radius, y), ...]; a zero radius at either
+    end closes that end to a point, so a cap is expressed in the profile itself
+    rather than as a separate primitive.
+    """
+    prof = np.asarray(profile, dtype=np.float32).reshape(-1, 2)
+    if len(prof) < 2:
+        raise ValueError("lathe: profile needs at least two points")
+
+    ang = np.linspace(0.0, 2.0 * math.pi, segments, endpoint=False, dtype=np.float32)
+    ca, sa = np.cos(ang), np.sin(ang)
+
+    rings, normals = [], []
+    for i, (r, y) in enumerate(prof):
+        rings.append(np.stack([ca * r, np.full(segments, y, np.float32), sa * r], axis=1))
+        # Normal is perpendicular to the profile tangent, revolved outward, so a
+        # shoulder or a taper shades as a slope rather than a hard step.
+        j0, j1 = max(i - 1, 0), min(i + 1, len(prof) - 1)
+        dr, dy = prof[j1][0] - prof[j0][0], prof[j1][1] - prof[j0][1]
+        n_len = max(math.hypot(dr, dy), 1e-8)
+        nr, ny = dy / n_len, -dr / n_len
+        normals.append(np.stack([ca * nr, np.full(segments, ny, np.float32), sa * nr], axis=1))
+
+    verts = list(rings)
+    norms = list(normals)
+    faces = []
+    for i in range(len(prof) - 1):
+        for s_i in range(segments):
+            s_j = (s_i + 1) % segments
+            a = i * segments + s_i
+            b = i * segments + s_j
+            c = (i + 1) * segments + s_i
+            d = (i + 1) * segments + s_j
+            faces.append([a, b, d])
+            faces.append([a, d, c])
+
+    off = len(prof) * segments
+    for close, idx, up in ((close_bottom, 0, -1.0), (close_top, len(prof) - 1, 1.0)):
+        if not close or prof[idx][0] <= 1e-6:
+            continue
+        centre = np.array([[0.0, prof[idx][1], 0.0]], dtype=np.float32)
+        verts.append(centre)
+        norms.append(np.array([[0.0, up, 0.0]], dtype=np.float32))
+        ring0 = idx * segments
+        for s_i in range(segments):
+            s_j = (s_i + 1) % segments
+            faces.append([off, ring0 + s_i, ring0 + s_j])
+        off += 1
+
+    v = np.concatenate(verts).astype(np.float32)
+    n = np.concatenate(norms).astype(np.float32)
+    return orient_faces_outward(
+        Mesh(v, np.array(faces, dtype=np.int32), n,
+             np.tile(_as_color(color), (len(v), 1)),
+             material=material or Material()))
+
+
 def _parallel_transport_frames(points: np.ndarray) -> tuple:
     """Rotation-minimising (U, V) frames along a polyline.
 

@@ -241,10 +241,17 @@ def test_the_hand_is_in_frame_for_the_grasp_and_the_lift(staged_sim):
 
 
 def test_hand_is_large_enough_to_read(staged_sim):
-    """The locked camera must still leave the hand a meaningful fraction of the
-    viewport at the grasp, or the reenactment is unreadable however correct."""
+    """Enough of the hand must SURVIVE OCCLUSION at the grasp to read as a hand.
+
+    Deliberately not screen height, which this used to assert. Height is a poor
+    proxy: an approach angled toward the viewer is shorter in screen-Y while
+    showing more of itself, and the angle that best aligns the palm to the
+    camera puts the hand behind the object, where measured visibility collapsed
+    to a quarter of its best value while height barely moved.
+    """
     sim, _, _ = staged_sim
-    assert sim.hand_screen_height(sim._contact_step()) > 0.18 * sim.height
+    visible = sim.visible_hand_fraction(sim._contact_step())
+    assert visible > 0.012, f"only {visible:.2%} of the viewport shows hand"
 
 
 def test_camera_is_locked_across_different_objects_and_plans():
@@ -391,9 +398,9 @@ def test_oversized_detection_still_frames_readably():
     assert sim.prepare(traj, bbox, sprite=None)
     # The object must fit on the staging pedestal it is sitting on.
     assert float(sim.object_size.max()) < 2 * 0.135
-    # A max-size manipuland is the worst case for framing: the camera must pull
-    # back to keep it in shot, but the hand still has to read.
-    assert sim.hand_screen_height(sim._contact_step()) > 0.20 * sim.height
+    # A max-size manipuland is the worst case: it is the most likely to occlude
+    # the hand that is grasping it.
+    assert sim.visible_hand_fraction(sim._contact_step()) > 0.010
     half = sim.object_size.astype(np.float32) * 0.5
     corners = np.array([[a, b, c] for a in (-1, 1) for b in (-1, 1) for c in (-1, 1)],
                        dtype=np.float32) * half
@@ -595,3 +602,74 @@ def test_telemetry_reads_a_fractional_position(staged_sim):
     assert 1 <= tel["step"] <= len(traj.waypoints)
     lifts = [sim.telemetry(s)["lift_cm"] for s in np.linspace(40.0, 59.0, 12)]
     assert any(abs(v - round(v, 1)) > 1e-9 for v in lifts) or len(set(lifts)) > 6
+
+
+# ------------------------------------------------- class-parametric geometry
+
+def test_known_classes_get_real_geometry_not_an_inflated_silhouette():
+    """A bottle should be a bottle. Silhouette inflation makes no assumption
+    about the object, which is right for the unrecognised and wrong for
+    everything else - a single view has no depth in it, so a bottle came out a
+    lumpy slab. The class is better evidence than that measurement.
+    """
+    from src.simulation.render.object_library import build_class_mesh
+
+    bottle = build_class_mesh("water bottle", 0.25)
+    assert bottle is not None and bottle.num_faces > 100
+    sx, sy, sz = (bottle.vertices.max(axis=0) - bottle.vertices.min(axis=0))
+    assert sy == pytest.approx(0.25, abs=0.01), "height must match the staged size"
+    assert sx == pytest.approx(sz, abs=0.01), "a turned object is round in plan"
+    assert sx < 0.5 * sy, "a bottle is taller than it is wide"
+
+    # The neck must actually be narrower than the body.
+    v = bottle.vertices
+    body = v[v[:, 1] < v[:, 1].min() + 0.10]
+    neck = v[v[:, 1] > v[:, 1].max() - 0.03]
+    assert np.hypot(neck[:, 0], neck[:, 2]).max() < np.hypot(body[:, 0], body[:, 2]).max()
+
+
+def test_unknown_classes_fall_through_to_the_silhouette():
+    from src.simulation.render.object_library import build_class_mesh
+    assert build_class_mesh("aardvark", 0.2) is None
+    assert build_class_mesh(None, 0.2) is None
+
+
+def test_flat_classes_lie_down_on_the_bench():
+    """A remote rests on its back; its long axis is horizontal, not vertical."""
+    from src.simulation.render.object_library import build_class_mesh
+    remote = build_class_mesh("remote control", 0.16)
+    extent = remote.vertices.max(axis=0) - remote.vertices.min(axis=0)
+    assert extent[1] < extent[2], "a remote should not be standing on end"
+
+
+def test_colour_comes_from_the_real_crop():
+    """Shape is canonical, so colour is what keeps the object recognisable."""
+    from src.simulation.render.object_library import build_class_mesh, colour_ramp
+
+    sprite = np.zeros((60, 20, 3), dtype=np.uint8)
+    sprite[:20] = (40, 40, 200)          # red cap (BGR), image top
+    sprite[20:] = (60, 180, 60)          # green body
+    ramp = colour_ramp(sprite)
+    assert ramp is not None
+    assert ramp[-1][2] > ramp[-1][1], "mesh top should take the cap's red"
+    assert ramp[0][1] > ramp[0][2], "mesh bottom should take the body's green"
+
+    mesh = build_class_mesh("water bottle", 0.25, sprite)
+    top = mesh.colors[mesh.vertices[:, 1] > mesh.vertices[:, 1].max() - 0.01]
+    bottom = mesh.colors[mesh.vertices[:, 1] < mesh.vertices[:, 1].min() + 0.01]
+    assert top[:, 2].mean() > bottom[:, 2].mean(), "colour ramp not applied bottom-to-top"
+
+
+def test_class_mesh_is_preferred_over_the_silhouette():
+    """A recognised class must not go through inflation even with a crop present."""
+    bbox = BoundingBox3D(label="water bottle", center=np.array([0.03, 0.02, 0.55], np.float32),
+                         size=np.array([0.09, 0.28, 0.09], dtype=np.float32))
+    traj = MockTrajectoryDiffusion().generate_foreseen_rollout(
+        start_hand_pose=None, target_object=bbox,
+        affordance_map=MockAffordanceExtractor().extract_affordance(bbox, "pick"),
+        intent="pick", num_steps=60)
+    sprite = np.full((80, 30, 3), 120, dtype=np.uint8)
+    sim = LabSimulator(width=192, height=144)
+    assert sim.prepare(traj, bbox, sprite)
+    assert sim.object_is_reconstructed is False, "should have used the class mesh"
+    assert sim.object_size[1] > sim.object_size[0], "bottle staged upright"
