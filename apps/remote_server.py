@@ -136,7 +136,7 @@ def main() -> None:
         try:
             from src.perception.gemini_vision_grounder import GeminiVisionGrounder
             vision_grounder = GeminiVisionGrounder(api_key=gemini_api_key)
-            logger.info("RemoteServer: GEMINI_API_KEY found. Open-vocabulary vision grounding enabled (gemini-2.5-flash).")
+            logger.info(f"RemoteServer: GEMINI_API_KEY found. Open-vocabulary vision grounding enabled ({vision_grounder.model}).")
         except Exception as e:
             logger.warning(f"GeminiVisionGrounder initialization failed: {e}")
     else:
