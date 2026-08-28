@@ -19,6 +19,7 @@ Runs an async WebSocket server on port 8765, executing the full Phase 8 visuomot
 import argparse
 import asyncio
 import logging
+import os
 import signal
 import sys
 import urllib.request
@@ -127,6 +128,20 @@ def main() -> None:
         endpoint_url=ollama_url, model_name=ollama_model, timeout=8.0
     )
 
+    # --- Open-vocabulary fallback: Gemini vision grounding for descriptions that
+    # don't resolve to a COCO-80 class (only called on intent change, see LiveSceneParser) ---
+    vision_grounder = None
+    gemini_api_key = os.environ.get("GEMINI_API_KEY")
+    if gemini_api_key:
+        try:
+            from src.perception.gemini_vision_grounder import GeminiVisionGrounder
+            vision_grounder = GeminiVisionGrounder(api_key=gemini_api_key)
+            logger.info("RemoteServer: GEMINI_API_KEY found. Open-vocabulary vision grounding enabled (gemini-2.5-flash).")
+        except Exception as e:
+            logger.warning(f"GeminiVisionGrounder initialization failed: {e}")
+    else:
+        logger.info("RemoteServer: GEMINI_API_KEY not set. Open-vocabulary vision grounding disabled (COCO-80 only).")
+
     # --- Object detection: GPU YOLO -> CPU MediaPipe EfficientDet -> mock canned bbox ---
     scene_parser = None
     try:
@@ -135,7 +150,8 @@ def main() -> None:
         object_detector = YoloObjectDetector(model_name="yolov8s.pt", conf_threshold=0.30)
         scene_parser = LiveSceneParser(
             object_detector=object_detector,
-            num_points=app_config.perception.scene_parser.num_points
+            num_points=app_config.perception.scene_parser.num_points,
+            vision_grounder=vision_grounder
         )
         logger.info("RemoteServer: Using live YoloObjectDetector-backed LiveSceneParser (real GPU object recognition).")
     except Exception as e:
@@ -146,7 +162,8 @@ def main() -> None:
             object_detector = MediaPipeObjectDetector(score_threshold=0.30)
             scene_parser = LiveSceneParser(
                 object_detector=object_detector,
-                num_points=app_config.perception.scene_parser.num_points
+                num_points=app_config.perception.scene_parser.num_points,
+                vision_grounder=vision_grounder
             )
             logger.info("RemoteServer: Using live MediaPipeObjectDetector-backed LiveSceneParser (real CPU object recognition).")
         except Exception as e2:

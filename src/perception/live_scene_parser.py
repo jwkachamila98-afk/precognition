@@ -13,6 +13,7 @@ from typing import List, Optional
 import numpy as np
 
 from src.perception.depth_estimator import DepthMap
+from src.perception.gemini_vision_grounder import GeminiVisionGrounder
 from src.perception.object_detector import Detection2D, ObjectDetectorABC
 from src.perception.scene_parser import (
     BoundingBox3D,
@@ -137,9 +138,21 @@ class LiveSceneParser(SceneParserABC):
     sees in the current frame and that matches the current intent.
     """
 
-    def __init__(self, object_detector: ObjectDetectorABC, num_points: int = 400) -> None:
+    def __init__(
+        self,
+        object_detector: ObjectDetectorABC,
+        num_points: int = 400,
+        vision_grounder: Optional[GeminiVisionGrounder] = None,
+    ) -> None:
         self.object_detector = object_detector
         self.num_points = num_points
+        # Open-vocabulary fallback for descriptions that don't resolve to a COCO-80
+        # class (YOLO structurally can't detect those). Only ever called when the
+        # local detector finds nothing AND the intent text has changed since the last
+        # grounding call - never per-frame, since it's a real network API call.
+        self.vision_grounder = vision_grounder
+        self._last_grounded_intent: Optional[str] = None
+        self._last_grounded_detection: Optional[Detection2D] = None
 
     def _extract_target_keyword(self, intent: str) -> Optional[str]:
         if not intent or intent.strip().lower() in ("none", "idle", "clear", "off", ""):
@@ -229,6 +242,19 @@ class LiveSceneParser(SceneParserABC):
         if target_keyword is not None:
             detections = self.object_detector.detect(image)
             matched = self._find_matching_detection(detections, target_keyword)
+
+            if matched is None and self.vision_grounder is not None:
+                # Open-vocabulary fallback: only actually call Gemini when the intent
+                # text has changed since the last attempt, reusing the cached result
+                # otherwise (re-projected against the current depth map each frame).
+                if intent != self._last_grounded_intent:
+                    self._last_grounded_intent = intent
+                    # Pass the full description (color, spatial context, etc.), not
+                    # just the reduced single-noun keyword - Gemini grounds better with
+                    # richer context than the COCO-vocabulary matcher needs.
+                    self._last_grounded_detection = self.vision_grounder.ground(image, intent)
+                matched = self._last_grounded_detection
+
             if matched is not None:
                 bboxes.append(self._detection_to_3d(matched, depth, image.shape, intrinsics))
 
