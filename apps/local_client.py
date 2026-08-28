@@ -129,6 +129,29 @@ def get_bone_color(idx1: int, idx2: int) -> tuple:
     return FINGER_COLORS["palm"]
 
 
+_FINGER_BASE_JOINT = {
+    1: 1, 2: 1, 3: 1, 4: 1,        # thumb
+    5: 5, 6: 5, 7: 5, 8: 5,        # index
+    9: 9, 10: 9, 11: 9, 12: 9,     # middle
+    13: 13, 14: 13, 15: 13, 16: 13,  # ring
+    17: 17, 18: 17, 19: 17, 20: 17,  # pinky
+}
+
+
+def bone_radius(idx1: int, idx2: int) -> float:
+    """Approximate anatomical taper: thick at the palm/MCP, narrowing toward
+    fingertips, used to give the procedural hand mesh real proportions instead of
+    uniform-width bones."""
+    lo = min(idx1, idx2)
+    if lo == 0:
+        return 7.0
+    base = _FINGER_BASE_JOINT.get(lo)
+    if base is None:
+        return 5.0  # palm cross-connections
+    tip_dist = lo - base
+    return max(3.0, 7.0 - tip_dist * 1.3)
+
+
 class LocalVisualizer:
     """Renders modern glassmorphism HUD, glowing hand skeletons, holographic ghost trajectories, and sci-fi telemetry."""
 
@@ -353,6 +376,63 @@ class LocalVisualizer:
         cv2.putText(frame, label, (cx_i - px_w // 2, cy_i - px_h // 2 - 6),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.34, (0, 235, 255), 1, cv2.LINE_AA)
 
+    def _draw_hand_mesh(
+        self,
+        frame: np.ndarray,
+        kpts_2d: np.ndarray,
+        base_color: tuple,
+        alpha: float = 0.85,
+        light_dir: np.ndarray = np.array([-0.6, -0.8], dtype=np.float32),
+    ) -> None:
+        """Procedurally-shaded 'solid' hand: capsule bones (tapered per bone_radius)
+        plus spherical joints, each with a directional highlight/shadow stripe to fake
+        cylindrical/spherical volume. This is real anatomical-ish geometry and shading,
+        not a flat wireframe - but it is NOT an anatomically exact mesh. That would be
+        MANO, the actual academic hand model already referenced throughout this
+        codebase's naming (MANOParameters) - MANO requires registering for a license at
+        the MPI project site and isn't something this project can legally ship or fetch
+        automatically, so it's out of scope here by design, not oversight."""
+        h, w = frame.shape[:2]
+        overlay = frame.copy()
+        light = light_dir / (np.linalg.norm(light_dir) + 1e-6)
+
+        def clip_pt(p: np.ndarray) -> tuple:
+            return (int(np.clip(p[0], 0, w - 1)), int(np.clip(p[1], 0, h - 1)))
+
+        darker = tuple(max(0, int(c * 0.45)) for c in base_color)
+        lighter = tuple(min(255, int(c * 1.7)) for c in base_color)
+
+        for idx1, idx2 in HAND_CONNECTIONS:
+            p1, p2 = kpts_2d[idx1], kpts_2d[idx2]
+            radius = bone_radius(idx1, idx2)
+            direction = p2 - p1
+            length = float(np.linalg.norm(direction))
+            p1c, p2c = clip_pt(p1), clip_pt(p2)
+
+            cv2.line(overlay, p1c, p2c, base_color, thickness=int(radius * 2), lineType=cv2.LINE_AA)
+            cv2.circle(overlay, p1c, int(radius), base_color, -1, cv2.LINE_AA)
+            cv2.circle(overlay, p2c, int(radius), base_color, -1, cv2.LINE_AA)
+
+            if length > 1e-3:
+                unit = direction / length
+                normal = np.array([-unit[1], unit[0]], dtype=np.float32)
+                side = 1.0 if np.dot(normal, light) < 0 else -1.0
+                hi_off = normal * side * radius * 0.4
+                sh_off = -normal * side * radius * 0.4
+                thick = max(1, int(radius * 0.5))
+                cv2.line(overlay, clip_pt(p1 + hi_off), clip_pt(p2 + hi_off), lighter, thickness=thick, lineType=cv2.LINE_AA)
+                cv2.line(overlay, clip_pt(p1 + sh_off), clip_pt(p2 + sh_off), darker, thickness=thick, lineType=cv2.LINE_AA)
+
+        for j_idx in range(21):
+            p = kpts_2d[j_idx]
+            pc = clip_pt(p)
+            radius = 8 if j_idx == 0 else max(3, int(bone_radius(j_idx, j_idx) * 1.15))
+            cv2.circle(overlay, pc, radius, darker, -1, cv2.LINE_AA)
+            hi_pc = clip_pt(p - light * radius * 0.4)
+            cv2.circle(overlay, hi_pc, max(1, int(radius * 0.5)), lighter, -1, cv2.LINE_AA)
+
+        cv2.addWeighted(overlay, alpha, frame, 1.0 - alpha, 0, dst=frame)
+
     def draw_foreseen_ghost_trajectory(
         self,
         frame: np.ndarray,
@@ -419,16 +499,7 @@ class LocalVisualizer:
             self._smoothed_ghost_kpts = self._smoothed_ghost_kpts + 0.35 * (target_kpts_2d - self._smoothed_ghost_kpts)
         ghost_kpts_2d = self._smoothed_ghost_kpts
         ghost_color = (255, 235, 100) # Bright Ice Cyan
-
-        for u, v in HAND_CONNECTIONS:
-            pt1 = (int(np.clip(ghost_kpts_2d[u, 0], 0, w - 1)), int(np.clip(ghost_kpts_2d[u, 1], 0, h - 1)))
-            pt2 = (int(np.clip(ghost_kpts_2d[v, 0], 0, w - 1)), int(np.clip(ghost_kpts_2d[v, 1], 0, h - 1)))
-            cv2.line(frame, pt1, pt2, ghost_color, thickness=2, lineType=cv2.LINE_AA)
-
-        for j_idx in range(21):
-            pt = (int(np.clip(ghost_kpts_2d[j_idx, 0], 0, w - 1)), int(np.clip(ghost_kpts_2d[j_idx, 1], 0, h - 1)))
-            cv2.circle(frame, pt, 4, (10, 30, 45), -1, lineType=cv2.LINE_AA)
-            cv2.circle(frame, pt, 3, (255, 255, 255), -1, lineType=cv2.LINE_AA)
+        self._draw_hand_mesh(frame, ghost_kpts_2d, ghost_color, alpha=0.80)
 
         wrist_pt = (int(np.clip(ghost_kpts_2d[0, 0], 0, w - 1)), int(np.clip(ghost_kpts_2d[0, 1], 0, h - 1)))
         cv2.putText(frame, label, (wrist_pt[0] - 60, wrist_pt[1] - 14),
