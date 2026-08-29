@@ -52,6 +52,8 @@ from src.audio.speech_to_text import AudioTranscriberABC, GeminiTranscriber, Moc
 from src.audio.text_to_speech import GeminiSpeaker, SpeechSynthesizerABC, SystemSpeaker
 from src.simulation.trajectory_generator import AffordanceMap, ForeseenTrajectory
 from src.simulation.lab_sim import LabSimulator
+from src.simulation.render import object_library as OL
+from src.perception.gemini_mesh_author import GeminiMeshAuthor
 from src.policy.discrepancy import DiscrepancyEngine, DiscrepancyState, EpisodeDiscrepancyReport
 from src.policy.workflow_state import ExecutionPhase, WorkflowController
 from src.policy.checkpointing import PolicyCheckpointManager
@@ -920,8 +922,15 @@ class LocalVisualizer:
         cv2.putText(frame, "HOTKEYS: 'k':Save | 'l':Load | 'x':Reset", (px1 + 12, py1 + 175), cv2.FONT_HERSHEY_SIMPLEX, 0.32, PALETTE["text_white"], 1, cv2.LINE_AA)
         cv2.putText(frame, "SAVED IN: config/profiles/default_user", (px1 + 12, py1 + 195), cv2.FONT_HERSHEY_SIMPLEX, 0.28, PALETTE["text_dim"], 1, cv2.LINE_AA)
 
-    def draw_3d_bounding_boxes(self, frame: np.ndarray, bboxes: List[BoundingBox3D]) -> None:
-        """Render futuristic 3D bounding wireframes with corner brackets and scanning reticle."""
+    def draw_3d_bounding_boxes(self, frame: np.ndarray, bboxes: List[BoundingBox3D],
+                               simplified: bool = False) -> None:
+        """Render 3D bounding wireframes with corner brackets and a target badge.
+
+        `simplified` collapses the 12-edge wireframe to a plain 2-D rectangle.
+        Used while a ghost hand is grasping on the live view: the wireframe's
+        pillars and corner nodes run straight through the fingers, and at that
+        moment the hand is the thing to look at, not the box around it.
+        """
         if not self.show_bounding_box or not bboxes:
             return
 
@@ -929,6 +938,17 @@ class LocalVisualizer:
 
         for bbox in bboxes:
             corners_2d = bbox.project_to_2d(image_shape=(h, w))
+
+            if simplified:
+                x0 = int(np.clip(corners_2d[:, 0].min(), 0, w - 1))
+                x1 = int(np.clip(corners_2d[:, 0].max(), 0, w - 1))
+                y0 = int(np.clip(corners_2d[:, 1].min(), 0, h - 1))
+                y1 = int(np.clip(corners_2d[:, 1].max(), 0, h - 1))
+                cv2.rectangle(frame, (x0, y0), (x1, y1), (0, 215, 255), 1, cv2.LINE_AA)
+                label_text = bbox.label.replace("_", " ").upper()
+                cv2.putText(frame, label_text, (x0, max(12, y0 - 6)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.34, (0, 215, 255), 1, cv2.LINE_AA)
+                continue
 
             # Draw translucent base wireframe
             for u, v in BBOX_EDGES:
@@ -1471,6 +1491,12 @@ class LocalClientRunner:
         # host), so animating from it held each pose for a beat and then jumped,
         # however fast this client was actually drawing.
         self._lab_demo_started_at: Optional[float] = None
+        # Mesh authoring runs off the render thread: the call takes 1-3 s and the
+        # loop cannot stall on it. The canonical class shape is used until an
+        # authored profile lands, and the next staging of that object picks it up.
+        self._mesh_author = (GeminiMeshAuthor(api_key=gemini_api_key)
+                             if gemini_api_key else None)
+        self._mesh_author_busy: set = set()
         self._remote_snapshot = {
             "poses": [], "bboxes": [], "affordance_map": None, "foreseen_traj": None,
             "depth_heatmap": None, "gripper_cmd": 0.0, "residuals": None, "reward_score": 0.0,
@@ -1540,6 +1566,27 @@ class LocalClientRunner:
             self._control_cmd_to_send = "START_AUTONOMOUS_DEMO"
         logger.info(f"Autonomous Demo triggered for target: {self.workflow._target_label}")
 
+    def _request_authored_mesh(self, label: str, sprite: Optional[np.ndarray]) -> None:
+        """Kick off Gemini profile authoring for `label`, at most once per object."""
+        if (self._mesh_author is None or sprite is None or not label
+                or label in self._mesh_author_busy
+                or OL.authored_profile(label) is not None):
+            return
+        self._mesh_author_busy.add(label)
+        crop = sprite.copy()
+
+        def _work() -> None:
+            try:
+                profile = self._mesh_author.author(crop, label)
+                if profile:
+                    OL.remember_authored_profile(label, profile)
+            except Exception as exc:                       # best-effort by design
+                logger.warning(f"Mesh authoring failed for '{label}': {exc}")
+            finally:
+                self._mesh_author_busy.discard(label)
+
+        threading.Thread(target=_work, name=f"mesh-author:{label}", daemon=True).start()
+
     def _update_lab_panel(
         self,
         frame: np.ndarray,
@@ -1566,7 +1613,19 @@ class LocalClientRunner:
         if active and not self._lab_staged:
             target_bbox = bboxes[0] if bboxes else None
             self.lab_sim.demo_duration_sec = self.workflow.autonomous_demo_duration_sec
-            if self.lab_sim.prepare(foreseen_traj, target_bbox, self._object_sprite):
+            if target_bbox is not None:
+                self._request_authored_mesh(target_bbox.label, self._object_sprite)
+
+            # Prefer the user's OWN recorded motion. The plan is a fallback for
+            # the first attempt at an object, before there is a demonstration to
+            # replay - it is a generated approach, not something they did.
+            staged = False
+            if self._last_completed_recording:
+                staged = self.lab_sim.prepare_from_demonstration(
+                    self._last_completed_recording, target_bbox, self._object_sprite)
+            if not staged:
+                staged = self.lab_sim.prepare(foreseen_traj, target_bbox, self._object_sprite)
+            if staged:
                 self._lab_staged = True
                 # Back-date the local clock onto the SERVER's phase clock. Starting
                 # it at the moment of staging left the playback trailing the phase
@@ -2270,7 +2329,14 @@ class LocalClientRunner:
                 # Render Visualizations
                 fps = self.visualizer.update_fps()
                 self.visualizer.draw_hand_skeleton(frame, poses, residuals=residuals, adaptation_active=self.adaptation_active)
-                self.visualizer.draw_3d_bounding_boxes(frame, bboxes)
+                # While a ghost hand is grasping on the live view, drop the 3-D
+                # wireframe to a plain rectangle - its pillars cut through the
+                # fingers exactly where the grasp needs to be legible.
+                ghost_is_grasping = workflow_phase in (
+                    ExecutionPhase.FORESEEING, ExecutionPhase.ADAPTING
+                ) and bool(self._last_completed_recording)
+                self.visualizer.draw_3d_bounding_boxes(frame, bboxes,
+                                                       simplified=ghost_is_grasping)
                 self.visualizer.draw_affordance_hotspots(frame, affordance_map)
                 
                 # Ghost hand is an afterimage/replay of the user's OWN real recorded

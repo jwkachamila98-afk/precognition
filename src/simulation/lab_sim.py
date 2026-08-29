@@ -83,9 +83,13 @@ _END_HOLD_SEC = 1.4
 # most ~20 cm by the hand-size guard), the wrist at full lift, and enough bench
 # and backdrop to place them. A very small object underfills it rather than
 # pulling the camera in, which is the deliberate trade for consistency.
-_CAM_DISTANCE_M = 0.87
-_CAM_TARGET_HEIGHT_M = 0.20      # above the staging pedestal
 _CAM_FOV_Y_DEG = 42.0
+# The camera now follows the real viewpoint (see _fit_camera), so distance is
+# derived from the object rather than fixed, and elevation is floored so a
+# webcam level with the object does not put the lab camera inside the bench.
+_MIN_CAMERA_ELEVATION_DEG = 14.0
+_FRAMING_SPAN_MULTIPLE = 3.4
+_CAM_TARGET_LIFT_M = 0.11
 
 
 def _view_direction() -> np.ndarray:
@@ -239,6 +243,9 @@ class LabSimulator:
         self.object_size = np.array([0.13, 0.08, 0.05], dtype=np.float32)
         self.object_is_reconstructed = False
         self.target_label = "object"
+        self._contact_override: Optional[int] = None
+        self._is_demonstration = False
+        self._timestamps: Optional[np.ndarray] = None
         self._hand_paths_lab: Optional[np.ndarray] = None      # (T, 21, 3)
         self._object_path_lab: Optional[np.ndarray] = None     # (T, 3)
         self._ready = False
@@ -284,10 +291,54 @@ class LabSimulator:
         )
         return lights, env
 
+    def prepare_from_demonstration(
+        self,
+        recorded_poses: Optional[List[HandPose]],
+        target_bbox: Optional[BoundingBox3D],
+        sprite: Optional[np.ndarray],
+    ) -> bool:
+        """Stage the user's OWN recorded motion, carrying the object with it.
+
+        The hand is the 21-joint pose actually tracked while they performed the
+        grasp - not a plan, not a policy correction. The object stands still
+        until the hand reaches it and then travels with it, which is the only
+        object motion a hand recording can honestly support: a tracked hand
+        carries no object physics of its own.
+
+        Contact is taken as the frame where the fingertips come closest to the
+        object in 3-D. From there the object inherits the hand's displacement
+        since that frame, so it is carried rather than scripted.
+        """
+        if not recorded_poses or len(recorded_poses) < 4 or target_bbox is None:
+            self._ready = False
+            return False
+
+        kpts = np.stack([p.keypoints_3d for p in recorded_poses]).astype(np.float32)
+        centre = np.asarray(target_bbox.center, dtype=np.float32)
+
+        tips = kpts[:, _FINGERTIPS].mean(axis=1)
+        contact = int(np.argmin(np.linalg.norm(tips - centre[None, :], axis=1)))
+
+        # Object: fixed at its detected position until contact, then carried.
+        hand_ref = kpts[:, HM.WRIST]
+        object_path_cam = np.tile(centre, (len(kpts), 1)).astype(np.float32)
+        object_path_cam[contact:] += hand_ref[contact:] - hand_ref[contact]
+
+        self._contact_override = contact
+        return self._stage(
+            raw_kpts=kpts,
+            object_path_cam=object_path_cam,
+            label=target_bbox.label or "object",
+            target_bbox=target_bbox,
+            sprite=sprite,
+            source="your recorded demonstration",
+            timestamps=np.array([p.timestamp for p in recorded_poses], dtype=np.float32),
+        )
+
     def prepare(self, trajectory: Optional[ForeseenTrajectory],
                 target_bbox: Optional[BoundingBox3D],
                 sprite: Optional[np.ndarray]) -> bool:
-        """Stage a trajectory in the lab. Call once when the demo starts.
+        """Stage a generated plan in the lab. Call once when the demo starts.
 
         Returns False if there is nothing renderable, in which case the caller
         should fall back to the 2-D overlay.
@@ -296,109 +347,123 @@ class LabSimulator:
             self._ready = False
             return False
 
-        t0 = time.perf_counter()
-        waypoints = trajectory.waypoints
         self.trajectory = trajectory
-        self.target_label = (trajectory.target_label or
-                             (target_bbox.label if target_bbox else "object"))
+        self._contact_override = None
+        wp = trajectory.waypoints
+        return self._stage(
+            raw_kpts=np.stack([w.hand_keypoints_3d for w in wp]).astype(np.float32),
+            object_path_cam=np.stack([w.object_pose[:3] for w in wp]).astype(np.float32),
+            label=(trajectory.target_label or
+                   (target_bbox.label if target_bbox else "object")),
+            target_bbox=target_bbox,
+            sprite=sprite,
+            source="a generated plan",
+            timestamps=np.array([w.time_offset for w in wp], dtype=np.float32),
+        )
+
+    def _stage(self, raw_kpts: np.ndarray, object_path_cam: np.ndarray,
+               label: str, target_bbox: Optional[BoundingBox3D],
+               sprite: Optional[np.ndarray], source: str,
+               timestamps: np.ndarray) -> bool:
+        """Everything common to staging a plan and staging a demonstration."""
+        t0 = time.perf_counter()
+        self.target_label = label
+        self._timestamps = timestamps
+        self._is_demonstration = self._contact_override is not None
 
         # Hand scale first: it is the metric reference the object is sized against.
-        raw_kpts = np.stack([wp.hand_keypoints_3d for wp in waypoints]).astype(np.float32)
         measured_palm = float(np.median(
             np.linalg.norm(raw_kpts[:, HM._MCP["middle"]] - raw_kpts[:, HM.WRIST], axis=1)))
         scale = float(np.clip(_REFERENCE_PALM_M / max(measured_palm, 1e-4), 0.15, 8.0))
-        # The label comes from the PLAN, not from whatever the detector happens
-        # to see in the frame this client stages on - those are different frames,
-        # and using the latter staged one object's geometry against another
-        # object's trajectory.
-        longest = _object_longest_dimension(target_bbox, _REFERENCE_PALM_M,
-                                            label=self.target_label)
+        longest = _object_longest_dimension(target_bbox, _REFERENCE_PALM_M, label=label)
 
-        origin_cam = (np.asarray(target_bbox.center, dtype=np.float32) if target_bbox is not None
-                      else np.asarray(waypoints[0].object_pose[:3], dtype=np.float32))
-        # Shape, in descending order of how much it is actually known:
-        #   1. the class's canonical geometry, when the label names something
-        #      we can model - a bottle is a turned profile, not a guess;
-        #   2. silhouette inflation from the photo-crop, for anything else;
-        #   3. a plain box.
-        # Colour comes from the real crop in cases 1 and 2 either way.
+        origin_cam = (np.asarray(target_bbox.center, dtype=np.float32)
+                      if target_bbox is not None else object_path_cam[0].copy())
+
+        # Shape, in descending order of how much is actually known:
+        #   1. a profile authored for THIS object, when one is available;
+        #   2. the class's canonical geometry;
+        #   3. silhouette inflation from the photo-crop;
+        #   4. a plain box.
         mesh = None
         self.object_is_reconstructed = False
         try:
-            mesh = OL.build_class_mesh(self.target_label, longest, sprite)
+            mesh = OL.build_class_mesh(label, longest, sprite,
+                                       profile_cm=OL.authored_profile(label))
         except Exception as exc:
             logger.warning(f"LabSimulator: class mesh failed ({exc}); trying the silhouette.")
 
         if mesh is None and sprite is not None and sprite.size > 0:
             try:
-                mesh = OM.build_object_mesh(sprite, longest,
-                                            contour_points=24, rings=2)
+                mesh = OM.build_object_mesh(sprite, longest, contour_points=24, rings=2)
                 self.object_is_reconstructed = mesh is not None
             except Exception as exc:                      # reconstruction is best-effort
                 logger.warning(f"LabSimulator: object reconstruction failed ({exc}); using primitive.")
         if mesh is None:
             mesh = OM.fallback_object_mesh(longest)
-        # Orient BEFORE measuring: turning the object changes its height, and the
-        # anchor that rests it on the pedestal is derived from that height. Only
-        # the view-aligned silhouette relief is turned - a class mesh is modelled
-        # upright in lab space already. See _orient_to_camera.
-        if self.object_is_reconstructed:
-            mesh = self._orient_to_camera(mesh)
-        else:
-            mesh = self._centre_mesh(mesh)
+
+        mesh = self._orient_to_camera(mesh) if self.object_is_reconstructed \
+            else self._centre_mesh(mesh)
         self.object_mesh = mesh
         self.object_size = OM.mesh_extent(mesh)
 
         anchor_lab = LS.OBJECT_ANCHOR + np.array(
             [0.0, float(self.object_size[1]) * 0.5, 0.0], dtype=np.float32)
-
         self.transform = LabTransform(origin_cam=origin_cam, anchor_lab=anchor_lab,
                                       scale=scale)
+
         self._hand_paths_lab = self.transform(raw_kpts.reshape(-1, 3)).reshape(raw_kpts.shape)
-        self._object_path_lab = self.transform(
-            np.stack([wp.object_pose[:3] for wp in waypoints]).astype(np.float32))
-
+        self._object_path_lab = self.transform(object_path_cam)
         # Keep the staged object from sinking through or floating above the bench:
-        # the plan's own lift is preserved, its resting height is corrected.
-        rest_y = float(anchor_lab[1])
-        self._object_path_lab[:, 1] += rest_y - float(self._object_path_lab[0, 1])
+        # its own motion is preserved, its resting height corrected.
+        self._object_path_lab[:, 1] += float(anchor_lab[1]) - float(self._object_path_lab[0, 1])
 
-        self._present_hand_to_the_camera()
-        self._seat_grasp_on_the_staged_object()
+        # A DEMONSTRATION is left exactly as recorded. Rotating it to suit the
+        # camera, or sliding the grasp onto the staged object, would be editing
+        # the very thing it exists to show. A generated plan carries no such
+        # claim - its orientation is canned - so it is still posed for legibility.
+        if not self._is_demonstration:
+            self._present_hand_to_the_camera()
+            self._seat_grasp_on_the_staged_object()
+
         self.camera = self._fit_camera()
         self._ensure_static_background()
         self._ready = True
 
         logger.info(
-            f"LabSimulator: staged '{self.target_label}' "
+            f"LabSimulator: staged '{self.target_label}' from {source} "
             f"({self.object_size[0]*100:.0f}x{self.object_size[1]*100:.0f}x"
             f"{self.object_size[2]*100:.0f} cm, hand scale x{scale:.2f}) across "
-            f"{len(waypoints)} steps - lab {self.scene.triangle_count} tris static, "
+            f"{len(raw_kpts)} steps - lab {self.scene.triangle_count} tris static, "
             f"{self.object_mesh.num_faces} object tris, prepared in "
             f"{(time.perf_counter() - t0)*1000:.0f} ms."
         )
         return True
 
     def _present_hand_to_the_camera(self) -> None:
-        """Rotate the whole hand path about the object's vertical axis so the
-        grasp is seen at a three-quarter view rather than edge-on.
+        """Rotate a GENERATED plan's hand path about the object's vertical axis so
+        the grasp is seen at a three-quarter view rather than edge-on.
 
         A rigid rotation about the axis the object stands on: the hand's motion
         relative to the object, its distance, and the grasp itself are all
-        unchanged - only which side it comes from. That is not information the
-        plan actually carries, since the grasp orientation is canned rather than
-        measured, so choosing it to suit a locked camera costs nothing real.
+        unchanged - only which side it comes from. That is not information a
+        canned plan actually carries. It is NOT applied to a recorded
+        demonstration, where the approach direction is real.
+
+        Chosen by measurement: aligning the palm to the camera peaks at 150-180
+        degrees, but that puts the hand behind the object where it occludes down
+        to a sliver (0.55% of frame against 2.12%); 40-80 degrees turns the palm
+        edge-on. Visible pixels after depth testing peak near 330 degrees.
         """
         grasp = self._contact_step()
         obj = self._object_path_lab[grasp]
         wrist = self._hand_paths_lab[grasp][HM.WRIST]
 
         offset = wrist - obj
-        current = math.atan2(float(offset[0]), float(offset[2]))
         if abs(offset[0]) < 1e-4 and abs(offset[2]) < 1e-4:
             return                                    # directly overhead; no azimuth
-        target = math.radians(_CAM_AZ_DEG + _HAND_APPROACH_OFFSET_DEG)
-        turn = target - current
+        current = math.atan2(float(offset[0]), float(offset[2]))
+        turn = math.radians(_CAM_AZ_DEG + _HAND_APPROACH_OFFSET_DEG) - current
 
         c, s_ = math.cos(turn), math.sin(turn)
         R = np.array([[c, 0.0, s_], [0.0, 1.0, 0.0], [-s_, 0.0, c]], dtype=np.float32)
@@ -407,22 +472,21 @@ class LabSimulator:
         self._hand_paths_lab = (flat @ R.T + pivot).reshape(self._hand_paths_lab.shape)
 
     def _seat_grasp_on_the_staged_object(self) -> None:
-        """Re-seat the hand so its grasp lands on the object as STAGED.
+        """Re-seat a GENERATED plan's hand so its grasp lands on the object as
+        staged.
 
         The planner sizes its approach from the detector's raw extent, but the
-        lab stages the object at a corrected scale (see
-        _object_longest_dimension). When those disagree - which is most of the
-        time, since the detector's extent comes from non-metric depth - the hand
-        closes in the air above a smaller object.
+        lab stages the object at a corrected scale, and when those disagree the
+        hand closes in the air above a smaller object. Shifting the whole path
+        by a constant preserves the plan's relative motion and the object's lift.
 
-        Shifting the whole hand path by a constant offset preserves the plan
-        exactly: the hand's motion relative to the object, and the object's own
-        lift, are both unchanged. Only where the grasp sits is corrected.
+        Not applied to a recorded demonstration: there the hand's position
+        relative to the object is measured, and overriding it would edit the
+        very thing the replay exists to show.
         """
         grasp = self._contact_step()
         tips = self._hand_paths_lab[grasp][_FINGERTIPS]
         pinch = 0.5 * (tips[0] + tips[[1, 2]].mean(axis=0))
-        # Grip the upper third of the object, where a hand actually takes a cup.
         target = self._object_path_lab[grasp] + np.array(
             [0.0, float(self.object_size[1]) * 0.18, 0.0], dtype=np.float32)
         self._hand_paths_lab += (target - pinch)[None, None, :]
@@ -439,28 +503,63 @@ class LabSimulator:
         return self._ready and self.camera is not None
 
     def _fit_camera(self) -> Camera:
-        """The locked lab camera - the same pose for every reenactment.
+        """Look at the staged object from the direction the real camera saw it.
 
-        Deliberately ignores the trajectory. An earlier version fitted the shot
-        to each plan's extent, which kept everything perfectly in frame but made
-        no two demos look alike: the camera crept in and out between runs and a
-        large manipuland pushed it back far enough to shrink the hand past
-        legibility. Consistency is worth more here than optimal fill.
+        The lab camera is aimed along the vector from the object to the origin
+        of the PERCEPTION frame - which is where the webcam is - so the sim view
+        lines up with what the user is actually looking at. An object seen from
+        above and to the left is staged as seen from above and to the left.
 
-        The consequence to be aware of: a plan whose approach begins far from the
-        bench (the user's real hand across the room, say) now starts off-screen
-        and flies in. That reads fine - it is an entrance, not a glitch - but it
-        does mean the viewport no longer guarantees the whole path is visible.
+        This deliberately replaces the fixed pose used earlier. The trade is the
+        one that came with it: framing now changes as the user moves, where
+        before every demo was filmed identically. Distance is still governed
+        here rather than copied, since a webcam at arm's length crops the bench
+        out entirely, and the elevation is floored so the camera cannot end up
+        underneath the worktop looking up through it.
         """
-        target = LS.OBJECT_ANCHOR + np.array([0.0, _CAM_TARGET_HEIGHT_M, 0.0],
-                                             dtype=np.float32)
-        position = target + _view_direction() * _CAM_DISTANCE_M
+        anchor = self.transform.anchor_lab
+
+        # Object -> camera, in the perception frame, mapped into the lab.
+        to_camera_cam = -np.asarray(self.transform.origin_cam, dtype=np.float32)
+        direction = (_AXIS_FLIP @ to_camera_cam).astype(np.float32)
+        norm = float(np.linalg.norm(direction))
+        direction = (direction / norm) if norm > 1e-6 else _view_direction()
+
+        # Floor the elevation: a real camera is often level with the object, but
+        # a lab camera at bench height sees the worktop edge-on and little else.
+        min_el = math.radians(_MIN_CAMERA_ELEVATION_DEG)
+        horiz = float(np.hypot(direction[0], direction[2]))
+        if horiz < 1e-6:
+            direction = _view_direction()
+        elif math.atan2(float(direction[1]), horiz) < min_el:
+            scale_h = math.cos(min_el) / horiz
+            direction = np.array([direction[0] * scale_h, math.sin(min_el),
+                                  direction[2] * scale_h], dtype=np.float32)
+        # Never end up behind the backdrop.
+        if direction[2] <= 0.05:
+            direction[2] = 0.05
+            direction /= max(float(np.linalg.norm(direction)), 1e-6)
+
+        span = max(float(self.object_size.max()), 0.05)
+        dist = float(np.clip(span * _FRAMING_SPAN_MULTIPLE, 0.45, 1.60))
+
+        target = anchor + np.array([0.0, _CAM_TARGET_LIFT_M, 0.0], dtype=np.float32)
+        position = target + direction * dist
+        position[1] = float(max(position[1], LS.BENCH_TOP_Y + 0.18))
+        position[2] = float(max(position[2], LS.BENCH_FRONT_Z + 0.08))
+
         return Camera(position=position, target=target, up=(0.0, 1.0, 0.0),
                       fov_y_deg=_CAM_FOV_Y_DEG, width=self.width, height=self.height,
                       near=0.04, far=40.0)
 
     def _contact_step(self) -> int:
-        """The trajectory step where the grasp actually closes - the hero beat."""
+        """The step where the grasp closes - the hero beat.
+
+        For a recorded demonstration this was measured from the fingertips'
+        closest approach; a plan declares it in its own contact_state.
+        """
+        if self._contact_override is not None:
+            return int(self._contact_override)
         contacts = np.array([float(np.mean(wp.contact_state))
                              for wp in self.trajectory.waypoints], dtype=np.float32)
         closed = np.flatnonzero(contacts >= 0.98)

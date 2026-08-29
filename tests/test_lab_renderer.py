@@ -254,23 +254,50 @@ def test_hand_is_large_enough_to_read(staged_sim):
     assert visible > 0.012, f"only {visible:.2%} of the viewport shows hand"
 
 
-def test_camera_is_locked_across_different_objects_and_plans():
-    """The whole point of the locked shot: two different manipulands with two
-    different plans must be filmed from exactly the same pose."""
-    poses = []
-    for size in [(0.05, 0.05, 0.05), (0.39, 0.39, 0.20)]:
-        bbox = BoundingBox3D(label="x", center=np.array([0.03, 0.02, 0.55], np.float32),
-                             size=np.array(size, dtype=np.float32))
+def test_camera_follows_the_real_viewpoint():
+    """The lab camera looks at the object from the direction the webcam did.
+
+    This replaces an earlier locked-camera contract deliberately: consistency
+    between runs was traded for correspondence with what the user is actually
+    looking at. An object seen from the left must be staged as seen from the
+    left.
+    """
+    def camera_for(centre):
+        bbox = BoundingBox3D(label="coffee cup", center=np.array(centre, np.float32),
+                             size=np.array([0.09, 0.09, 0.09], dtype=np.float32))
         traj = MockTrajectoryDiffusion().generate_foreseen_rollout(
             start_hand_pose=None, target_object=bbox,
             affordance_map=MockAffordanceExtractor().extract_affordance(bbox, "pick"),
             intent="pick", num_steps=60)
         sim = LabSimulator(width=192, height=144)
         assert sim.prepare(traj, bbox, sprite=None)
-        poses.append((tuple(np.round(sim.camera.position, 5)),
-                      tuple(np.round(sim.camera.target, 5)),
-                      round(sim.camera.fov_y_deg, 5)))
-    assert poses[0] == poses[1], f"camera moved between plans: {poses}"
+        return sim.camera.position - sim.camera.target
+
+    # Perception frame is +X right, +Y down. An object to the LEFT of the optical
+    # axis is being viewed from its right, and vice versa.
+    left = camera_for([-0.18, 0.02, 0.55])
+    right = camera_for([0.18, 0.02, 0.55])
+    assert left[0] > right[0], "camera azimuth does not follow the object's position"
+
+    # Same viewpoint, same shot.
+    again = camera_for([-0.18, 0.02, 0.55])
+    assert np.allclose(left, again, atol=1e-5)
+
+
+def test_camera_never_ends_up_under_the_bench():
+    """A webcam level with the object would otherwise put the lab camera at
+    bench height, looking at the worktop edge-on or from beneath it."""
+    for centre in ([0.0, -0.30, 0.55], [0.0, 0.30, 0.55], [0.0, 0.0, 0.55]):
+        bbox = BoundingBox3D(label="coffee cup", center=np.array(centre, np.float32),
+                             size=np.array([0.09, 0.09, 0.09], dtype=np.float32))
+        traj = MockTrajectoryDiffusion().generate_foreseen_rollout(
+            start_hand_pose=None, target_object=bbox,
+            affordance_map=MockAffordanceExtractor().extract_affordance(bbox, "pick"),
+            intent="pick", num_steps=60)
+        sim = LabSimulator(width=192, height=144)
+        assert sim.prepare(traj, bbox, sprite=None)
+        assert sim.camera.position[1] > LS.BENCH_TOP_Y + 0.1, f"camera under the bench for {centre}"
+        assert sim.camera.position[2] > LS.BENCH_FRONT_Z, f"camera behind the backdrop for {centre}"
 
 
 def test_the_object_visibly_rises_when_it_is_picked_up(staged_sim):
@@ -802,3 +829,103 @@ def test_generic_box_gets_a_box_not_a_blob():
     absurd = BoundingBox3D(label="cardboard box", center=np.zeros(3, np.float32),
                            size=np.array([0.67, 0.67, 0.40], dtype=np.float32))
     assert _object_longest_dimension(absurd, _REFERENCE_PALM_M) == pytest.approx(0.20, abs=1e-6)
+
+
+# ------------------------------------------- replaying the real demonstration
+
+def _synthetic_recording(centre, n=48):
+    """A plausible tracked recording: reach in, then carry the object away."""
+    from src.perception.hand_tracker import HandPose, HandSide
+    gen = MockTrajectoryDiffusion()
+    poses = []
+    for i in range(n):
+        t = i / (n - 1.0)
+        if t < 0.5:
+            wrist = centre + np.array([0.22, -0.16, -0.10], np.float32) * (1 - t / 0.5)
+        else:
+            wrist = centre + np.array([-0.10, -0.20, 0.02], np.float32) * ((t - 0.5) / 0.5)
+        k = gen._generate_hand_keypoints_3d(wrist.astype(np.float32), gen._rot_grasp,
+                                            0.15 if t < 0.5 else 0.55)
+        poses.append(HandPose(hand_id=0, side=HandSide.RIGHT, keypoints_3d=k,
+                              keypoints_2d=np.zeros((21, 2), np.float32),
+                              confidence=1.0, timestamp=i / 30.0))
+    return poses
+
+
+def test_object_is_carried_by_the_recorded_hand():
+    """The object must sit still until the hand reaches it, then travel with it.
+
+    That is the only object motion a hand recording can honestly support - a
+    tracked hand carries no object physics of its own - and it is what makes the
+    replay a record of what the user did rather than a scripted lift.
+    """
+    centre = np.array([0.02, 0.03, 0.50], np.float32)
+    bbox = BoundingBox3D(label="coffee cup", center=centre,
+                         size=np.array([0.09, 0.09, 0.09], dtype=np.float32))
+    sim = LabSimulator(width=192, height=144)
+    assert sim.prepare_from_demonstration(_synthetic_recording(centre), bbox, None)
+
+    contact = sim._contact_step()
+    assert 0 < contact < len(sim._object_path_lab) - 4, "contact at a degenerate frame"
+
+    obj, wrist = sim._object_path_lab, sim._hand_paths_lab[:, 0]
+    assert np.abs(obj[:contact] - obj[0]).max() < 1e-4, "object moved before contact"
+
+    carried = float(np.linalg.norm(obj[-1] - obj[contact]))
+    hand_moved = float(np.linalg.norm(wrist[-1] - wrist[contact]))
+    assert carried > 0.05, "object never travelled with the hand"
+    assert abs(carried - hand_moved) < 2e-3, "object did not track the hand rigidly"
+
+
+def test_a_demonstration_is_replayed_unedited():
+    """A recording must not be re-posed for the camera or slid onto the object.
+
+    Both of those exist to make a CANNED plan legible. Applied to a measured
+    demonstration they would edit the one thing the replay exists to show.
+    """
+    centre = np.array([0.02, 0.03, 0.50], np.float32)
+    bbox = BoundingBox3D(label="coffee cup", center=centre,
+                         size=np.array([0.09, 0.09, 0.09], dtype=np.float32))
+    sim = LabSimulator(width=192, height=144)
+    assert sim.prepare_from_demonstration(_synthetic_recording(centre), bbox, None)
+    assert sim._is_demonstration is True
+
+    # The hand's position relative to the object is whatever was recorded,
+    # mapped through the frame conversion - not snapped to the staged geometry.
+    raw = np.stack([p.keypoints_3d for p in _synthetic_recording(centre)])
+    expected = sim.transform(raw.reshape(-1, 3)).reshape(raw.shape)
+    assert np.allclose(sim._hand_paths_lab, expected, atol=1e-5), "recording was re-posed"
+
+
+def test_demonstration_rejects_input_it_cannot_use():
+    sim = LabSimulator(width=96, height=72)
+    bbox = BoundingBox3D(label="cup", center=np.zeros(3, np.float32),
+                         size=np.array([0.09, 0.09, 0.09], dtype=np.float32))
+    assert sim.prepare_from_demonstration(None, bbox, None) is False
+    assert sim.prepare_from_demonstration([], bbox, None) is False
+    assert sim.prepare_from_demonstration(_synthetic_recording(np.zeros(3, np.float32)),
+                                          None, None) is False
+    assert sim.is_ready is False
+
+
+def test_authored_profile_overrides_the_canonical_class_shape():
+    """A profile authored for the actual object must be preferred to the generic
+    class shape - that is the entire point of asking for one."""
+    from src.simulation.render.object_library import (
+        build_class_mesh, remember_authored_profile, forget_authored_profiles,
+        authored_profile)
+    try:
+        canonical = build_class_mesh("water bottle", 0.25)
+        # A deliberately distinctive silhouette: a wide foot and a long stem.
+        remember_authored_profile("water bottle",
+                                  [[6.0, 0.0], [6.2, 1.0], [1.2, 6.0], [1.2, 22.0], [1.6, 25.0]])
+        assert authored_profile("Water Bottle") is not None, "lookup must be case-insensitive"
+        authored = build_class_mesh("water bottle", 0.25,
+                                    profile_cm=authored_profile("water bottle"))
+        assert authored is not None
+        assert authored.num_faces != canonical.num_faces or not np.allclose(
+            np.sort(authored.vertices, axis=0), np.sort(canonical.vertices, axis=0))
+        w, h, _ = (authored.vertices.max(axis=0) - authored.vertices.min(axis=0))
+        assert h == pytest.approx(0.25, abs=0.01), "authored profile not scaled to the staged size"
+    finally:
+        forget_authored_profiles()

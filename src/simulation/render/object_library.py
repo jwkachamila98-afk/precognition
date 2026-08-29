@@ -124,9 +124,29 @@ def _apply_ramp(mesh: Mesh, ramp: Optional[np.ndarray]) -> Mesh:
     return mesh
 
 
+# Profiles authored for a specific object by GeminiMeshAuthor, keyed by label.
+# Populated asynchronously; absent until an answer arrives, so the first staging
+# of an object uses its canonical class shape and later ones use its own.
+_AUTHORED: dict = {}
+
+
+def remember_authored_profile(label: str, profile_cm) -> None:
+    if label and profile_cm:
+        _AUTHORED[label.strip().lower()] = [[float(r), float(h)] for r, h in profile_cm]
+
+
+def authored_profile(label: Optional[str]):
+    return _AUTHORED.get(label.strip().lower()) if label else None
+
+
+def forget_authored_profiles() -> None:
+    _AUTHORED.clear()
+
+
 def build_class_mesh(label: Optional[str], longest_dim_m: float,
                      sprite: Optional[np.ndarray] = None,
-                     segments: int = 20) -> Optional[Mesh]:
+                     segments: int = 20,
+                     profile_cm=None) -> Optional[Mesh]:
     """Canonical mesh for a recognised class, centred on its own bounding box.
 
     Returns None when the class is unknown, so the caller falls back to
@@ -135,6 +155,19 @@ def build_class_mesh(label: Optional[str], longest_dim_m: float,
     longest = max(float(longest_dim_m), 0.01)
     ramp = colour_ramp(sprite)
     base_colour = (0.62, 0.60, 0.58) if ramp is None else tuple(float(c) for c in ramp[len(ramp) // 2])
+
+    if profile_cm:
+        prof = np.asarray(profile_cm, dtype=np.float32).reshape(-1, 2)
+        natural = max(float(prof[:, 1].max()), 2.0 * float(prof[:, 0].max()))
+        prof *= longest / max(natural, 1e-6)
+        mesh = P.lathe(prof, base_colour, segments=segments, material=_MATERIAL)
+        mesh = _apply_ramp(mesh, ramp)
+        v = mesh.vertices
+        for axis in range(3):
+            v[:, axis] -= 0.5 * (float(v[:, axis].min()) + float(v[:, axis].max()))
+        logger.info(f"Object mesh: '{label}' built from a profile authored for this "
+                    f"object ({len(prof)} points) at {longest*100:.0f} cm.")
+        return mesh
 
     key = _match(label, _PROFILES)
     if key is not None:
