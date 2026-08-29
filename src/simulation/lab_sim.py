@@ -336,7 +336,13 @@ class LabSimulator:
         # Squeezing the whole thing in plays it at five times real speed, which
         # misrepresents the very thing the replay exists to show. Keep the part
         # that carries the grasp, at its own pace, and drop the rest.
-        stamps = np.array([p.timestamp for p in recorded_poses], dtype=np.float32)
+        # float64 THEN rebase. These are absolute Unix timestamps around 1.79e9,
+        # where float32 has a 128-second ULP: casting them directly collapsed a
+        # 2050-frame recording to two distinct values, so the duration read as
+        # zero, the trim below never fired, and real-speed playback interpolated
+        # against a constant array. Relative seconds are small and fit fine.
+        stamps = np.asarray([p.timestamp for p in recorded_poses], dtype=np.float64)
+        stamps = (stamps - stamps[0]).astype(np.float32)
         if len(stamps) > 1 and float(stamps[-1] - stamps[0]) > 0.0:
             budget = max(self.demo_duration_sec - _END_HOLD_SEC, 1.0)
             duration = float(stamps[-1] - stamps[0])

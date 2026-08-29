@@ -99,6 +99,8 @@ PALETTE = {
     "glass_border": (70, 85, 110),       # High-tech Border
     "text_white": (245, 248, 252),       # Clean Crisp White
     "text_dim": (140, 155, 175),         # Muted Blue-Grey
+    "text_mute": (105, 120, 140),        # Label column - recedes behind values
+    "hairline": (62, 74, 94),            # Section rules, barely there
 }
 
 # Anatomical finger bone colors (BGR)
@@ -220,6 +222,50 @@ class LocalVisualizer:
         blended = cv2.addWeighted(glass, alpha, roi, 1 - alpha, 0)
         roi[:] = (blended * mask_f + roi * (1 - mask_f)).astype(np.uint8)
         cv2.drawContours(roi, contours, -1, border_color or PALETTE["glass_border"], 1, lineType=cv2.LINE_AA)
+
+    def _tracked_text(
+        self, frame: np.ndarray, text: str, org: tuple, scale: float,
+        color: tuple, spacing: float = 1.6, thickness: int = 1,
+    ) -> None:
+        """Draw text with extra letter spacing. OpenCV has no tracking control,
+        so section labels are stamped a glyph at a time - the wide spacing is
+        what separates a heading from body text at these small sizes."""
+        x, y = float(org[0]), int(org[1])
+        for ch in text:
+            cv2.putText(frame, ch, (int(round(x)), y), cv2.FONT_HERSHEY_SIMPLEX,
+                        scale, color, thickness, cv2.LINE_AA)
+            (cw, _), _ = cv2.getTextSize(ch, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)
+            x += cw + spacing
+
+    def _right_text(
+        self, frame: np.ndarray, text: str, right_x: int, baseline_y: int,
+        scale: float, color: tuple,
+    ) -> int:
+        """Right-align text to `right_x`. Returns the left edge it occupied."""
+        (tw, _), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)
+        x = right_x - tw
+        cv2.putText(frame, text, (x, baseline_y), cv2.FONT_HERSHEY_SIMPLEX,
+                    scale, color, 1, cv2.LINE_AA)
+        return x
+
+    def _chip(
+        self, frame: np.ndarray, right_x: int, centre_y: int, text: str,
+        color: tuple, scale: float = 0.30,
+    ) -> None:
+        """A small tinted pill, right-aligned. Used for the one value that is a
+        state rather than a number, so the eye finds it without reading."""
+        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)
+        pad_x, pad_y = 8, 5
+        x2, x1 = right_x, right_x - tw - 2 * pad_x
+        y1, y2 = centre_y - th // 2 - pad_y, centre_y + th // 2 + pad_y
+        h, w = frame.shape[:2]
+        sx1, sy1, sx2, sy2 = max(0, x1), max(0, y1), min(w, x2), min(h, y2)
+        if sx2 > sx1 and sy2 > sy1:
+            sub = frame[sy1:sy2, sx1:sx2]
+            sub[:] = cv2.addWeighted(np.full_like(sub, color), 0.16, sub, 0.84, 0)
+        cv2.rectangle(frame, (x1, y1), (x2 - 1, y2 - 1), color, 1, cv2.LINE_AA)
+        cv2.putText(frame, text, (x1 + pad_x, centre_y + th // 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, scale, color, 1, cv2.LINE_AA)
 
     def update_fps(self) -> float:
         now = time.perf_counter()
@@ -870,9 +916,11 @@ class LocalVisualizer:
         by1 = h - bar_h - 16
         bx2, by2 = bx1 + bar_w, by1 + bar_h
 
-        self._glass_panel(frame, bx1, by1, bx2, by2, alpha=0.85, radius=16, border_color=color)
-        cv2.putText(frame, title, (bx1 + 18, by1 + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.46, color, 1, cv2.LINE_AA)
-        cv2.putText(frame, body, (bx1 + 18, by1 + 44), cv2.FONT_HERSHEY_SIMPLEX, 0.38, PALETTE["text_white"], 1, cv2.LINE_AA)
+        self._glass_panel(frame, bx1, by1, bx2, by2, alpha=0.88, radius=16, border_color=color)
+        cv2.rectangle(frame, (bx1 + 18, by1 + 14), (bx1 + 20, by1 + 42), color, -1)
+        self._tracked_text(frame, title, (bx1 + 30, by1 + 25), 0.33, color, spacing=1.5)
+        cv2.putText(frame, body, (bx1 + 30, by1 + 43), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.37, PALETTE["text_white"], 1, cv2.LINE_AA)
 
     def draw_coadaptation_panel(
         self,
@@ -1011,11 +1059,16 @@ class LocalVisualizer:
         y2 = y1 + pip_h
 
         frame[y1:y2, x1:x2] = pip_resized
-        cv2.rectangle(frame, (x1, y1), (x2, y2), PALETTE["glass_border"], 1)
-        
-        # Header tag
-        cv2.rectangle(frame, (x1, y1), (x1 + 90, y1 + 16), (15, 20, 30), -1)
-        cv2.putText(frame, "DEPTH [m]", (x1 + 4, y1 + 12), cv2.FONT_HERSHEY_SIMPLEX, 0.32, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), PALETTE["hairline"], 1)
+
+        # A translucent caption strip rather than an opaque black tag - the
+        # heatmap stays readable underneath it.
+        strip = frame[y1 + 1:y1 + 17, x1 + 1:x2]
+        strip[:] = cv2.addWeighted(np.full_like(strip, PALETTE["dark_glass_bg"]),
+                                   0.72, strip, 0.28, 0)
+        self._tracked_text(frame, "DEPTH", (x1 + 7, y1 + 13), 0.28,
+                           PALETTE["text_white"], spacing=1.4)
+        self._right_text(frame, "m", x2 - 7, y1 + 13, 0.28, PALETTE["text_dim"])
 
     def draw_telemetry_hud(
         self,
@@ -1090,6 +1143,13 @@ class LocalVisualizer:
             ExecutionPhase.AUTONOMOUS_DEMO: PALETTE["cyan_electric"],
         }
         p_col = phase_colors.get(workflow_phase, PALETTE["text_dim"])
+        # The raw enum values are snake_case and too long for the chip - a
+        # 'AUTONOMOUS_DEMO' pill runs the full width of the card.
+        phase_short = {
+            ExecutionPhase.WAIT_USER: "READY",
+            ExecutionPhase.USER_EXECUTING: "EXECUTING",
+            ExecutionPhase.AUTONOMOUS_DEMO: "AUTO DEMO",
+        }.get(workflow_phase, workflow_phase.value.replace("_", " ").upper())
 
         cv2.circle(frame, (x1 + 16, y1 + 22), 4, p_col, -1, cv2.LINE_AA)
         stage_label = workflow_phase.value.replace("_", " ").title()
@@ -1113,6 +1173,11 @@ class LocalVisualizer:
             cv2.putText(frame, "'h' details  -  'i' intent", (x1 + 16, y1 + 66),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.28, PALETTE["text_dim"], 1, cv2.LINE_AA)
 
+    # Row metrics for the telemetry dock. Every element declares its own height
+    # so the card can be measured before it is drawn - adding or removing a row
+    # never leaves a hardcoded y-offset pointing at the wrong place.
+    _DOCK_H = {"sec": 22, "row": 19, "chip": 21, "bar": 23, "rule": 14, "hint": 17}
+
     def _draw_telemetry_expanded(
         self,
         frame: np.ndarray,
@@ -1132,102 +1197,130 @@ class LocalVisualizer:
         robot_connected: bool,
         policy_loss: float = 0.0,
     ) -> None:
-        """Full telemetry dock, sized to its content - opt-in detail view (press 'h')."""
+        """Full telemetry dock: a two-column data card, measured then drawn.
+
+        Labels sit in a muted left column and values are right-aligned against
+        the card edge, so the numbers line up into a scannable rail instead of
+        drifting with the length of each label."""
         h, w = frame.shape[:2]
 
-        dock_w = 225
-        dock_h = 372
-        x1 = w - dock_w - 10
-        y1 = 10
-        x2 = w - 10
-        y2 = y1 + dock_h
-
-        self._glass_panel(frame, x1, y1, x2, y2, alpha=0.84, radius=16)
-
-        # 1. Title & Status
-        cv2.putText(frame, "PRECOGNITION", (x1 + 12, y1 + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.42, PALETTE["cyan_electric"], 1, cv2.LINE_AA)
-
-        # Status Pill: FPS & Latency
-        fps_col = PALETTE["neon_green"] if fps >= 20 else PALETTE["amber_gold"]
-        cv2.circle(frame, (x1 + 16, y1 + 42), 4, fps_col, -1)
-        cv2.putText(frame, f"{fps:4.1f} fps  -  {latency_ms:3.0f} ms", (x1 + 26, y1 + 46), cv2.FONT_HERSHEY_SIMPLEX, 0.34, PALETTE["text_white"], 1, cv2.LINE_AA)
-
-        # Divider 1
-        cv2.line(frame, (x1 + 12, y1 + 58), (x2 - 12, y1 + 58), (40, 50, 65), 1)
-
-        # 2. Stage & Intent
         phase_colors = {
             ExecutionPhase.IDLE: PALETTE["text_dim"],
             ExecutionPhase.FORESEEING: PALETTE["amber_gold"],
             ExecutionPhase.WAIT_USER: PALETTE["text_white"],
             ExecutionPhase.USER_EXECUTING: PALETTE["neon_green"],
-            ExecutionPhase.ADAPTING: PALETTE["neon_violet"]
+            ExecutionPhase.RESTARTING: PALETTE["neon_violet"],
+            ExecutionPhase.ADAPTING: PALETTE["neon_violet"],
+            ExecutionPhase.AUTONOMOUS_DEMO: PALETTE["cyan_electric"],
         }
         p_col = phase_colors.get(workflow_phase, PALETTE["text_dim"])
-        cv2.putText(frame, f"stage - {workflow_phase.value}", (x1 + 12, y1 + 76), cv2.FONT_HERSHEY_SIMPLEX, 0.35, p_col, 1, cv2.LINE_AA)
+        # The raw enum values are snake_case and too long for the chip - a
+        # 'AUTONOMOUS_DEMO' pill runs the full width of the card.
+        phase_short = {
+            ExecutionPhase.WAIT_USER: "READY",
+            ExecutionPhase.USER_EXECUTING: "EXECUTING",
+            ExecutionPhase.AUTONOMOUS_DEMO: "AUTO DEMO",
+        }.get(workflow_phase, workflow_phase.value.replace("_", " ").upper())
 
-        target_obj = parsed_intent.target_object if parsed_intent and parsed_intent.is_active else "standby"
-        cv2.putText(frame, f"target - {target_obj[:16]}", (x1 + 12, y1 + 94), cv2.FONT_HERSHEY_SIMPLEX, 0.35, PALETTE["amber_gold"], 1, cv2.LINE_AA)
+        target_obj = (parsed_intent.target_object if parsed_intent and parsed_intent.is_active
+                      else "standby")
+        listening = voice_status == "LISTENING"
+        r_col = (PALETTE["neon_green"] if reward_score > 0.5
+                 else PALETTE["amber_gold"] if reward_score > 0.0 else PALETTE["laser_red"])
 
-        v_color = PALETTE["cyan_electric"] if voice_status == "LISTENING" else PALETTE["text_dim"]
-        v_label = "voice - listening..." if voice_status == "LISTENING" else "voice - talk ['v']"
-        cv2.putText(frame, v_label, (x1 + 12, y1 + 112), cv2.FONT_HERSHEY_SIMPLEX, 0.33, v_color, 1, cv2.LINE_AA)
-
-        # Divider 2
-        cv2.line(frame, (x1 + 12, y1 + 124), (x2 - 12, y1 + 124), (40, 50, 65), 1)
-
-        # 3. Telemetry & Policy Residuals
-        cv2.putText(frame, "Residual Adaptation", (x1 + 12, y1 + 142), cv2.FONT_HERSHEY_SIMPLEX, 0.35, PALETTE["text_dim"], 1, cv2.LINE_AA)
-
-        adapt_str = "online ['p']" if adaptation_active else "paused ['p']"
-        adapt_col = PALETTE["neon_green"] if adaptation_active else PALETTE["laser_red"]
-        cv2.putText(frame, f"learning - {adapt_str}", (x1 + 12, y1 + 160), cv2.FONT_HERSHEY_SIMPLEX, 0.32, adapt_col, 1, cv2.LINE_AA)
-
-        r_col = PALETTE["neon_green"] if reward_score > 0.5 else (PALETTE["amber_gold"] if reward_score > 0.0 else PALETTE["laser_red"])
-        cv2.putText(frame, f"reward - {reward_score:+0.2f}", (x1 + 12, y1 + 180), cv2.FONT_HERSHEY_SIMPLEX, 0.34, r_col, 1, cv2.LINE_AA)
-
-        cv2.putText(frame, f"error - {discrepancy_norm:.4f}  net loss - {policy_loss:.3f}", (x1 + 12, y1 + 200), cv2.FONT_HERSHEY_SIMPLEX, 0.30, PALETTE["text_white"], 1, cv2.LINE_AA)
-
-        # Gripper Actuator Progress Bar
-        cv2.putText(frame, "gripper", (x1 + 12, y1 + 222), cv2.FONT_HERSHEY_SIMPLEX, 0.34, PALETTE["text_white"], 1, cv2.LINE_AA)
-        bar_x = x1 + 70
-        bar_y = y1 + 213
-        bar_w = dock_w - 92
-        bar_h = 10
-        cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (35, 45, 55), -1)
-        fill_w = int(bar_w * np.clip(gripper_cmd, 0.0, 1.0))
-        if fill_w > 0:
-            cv2.rectangle(frame, (bar_x, bar_y), (bar_x + fill_w, bar_y + bar_h), PALETTE["cyan_electric"], -1)
-        cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), PALETTE["glass_border"], 1)
-
-        # Divider 3
-        cv2.line(frame, (x1 + 12, y1 + 234), (x2 - 12, y1 + 234), (40, 50, 65), 1)
-
-        # 4. Hardware & Vision Sensor Status
-        cv2.putText(frame, "Hardware & Sensors", (x1 + 12, y1 + 252), cv2.FONT_HERSHEY_SIMPLEX, 0.35, PALETTE["text_dim"], 1, cv2.LINE_AA)
-
-        rob_str = "robot - 7-DOF ok" if robot_connected else "robot - offline"
-        cv2.putText(frame, rob_str, (x1 + 12, y1 + 270), cv2.FONT_HERSHEY_SIMPLEX, 0.33, PALETTE["neon_green"] if robot_connected else PALETTE["laser_red"], 1, cv2.LINE_AA)
-
-        track_disp = "mediapipe (live)" if "MEDIAPIPE" in tracker_name else "mock synthetic"
-        cv2.putText(frame, f"track - {track_disp}", (x1 + 12, y1 + 288), cv2.FONT_HERSHEY_SIMPLEX, 0.32, PALETTE["cyan_electric"], 1, cv2.LINE_AA)
-
-        if poses and len(poses) > 0:
-            p = poses[0]
-            cv2.putText(frame, f"hand - tracked ({p.confidence*100:.0f}%)", (x1 + 12, y1 + 308), cv2.FONT_HERSHEY_SIMPLEX, 0.33, PALETTE["neon_green"], 1, cv2.LINE_AA)
-            cv2.putText(frame, f"xyz - [{p.keypoints_3d[0,0]:+.2f},{p.keypoints_3d[0,1]:+.2f},{p.keypoints_3d[0,2]:+.2f}]",
-                        (x1 + 12, y1 + 326), cv2.FONT_HERSHEY_SIMPLEX, 0.31, PALETTE["text_white"], 1, cv2.LINE_AA)
+        items: List[tuple] = [
+            ("sec", "SESSION"),
+            ("chip", "stage", phase_short, p_col),
+            ("row", "target", target_obj[:15], PALETTE["amber_gold"]),
+            ("row", "voice", "listening" if listening else "push 'v'",
+             PALETTE["cyan_electric"] if listening else PALETTE["text_dim"]),
+            ("rule",),
+            ("sec", "ADAPTATION"),
+            ("row", "learning", "online" if adaptation_active else "paused",
+             PALETTE["neon_green"] if adaptation_active else PALETTE["laser_red"]),
+            ("row", "reward", f"{reward_score:+.2f}", r_col),
+            ("row", "error", f"{discrepancy_norm:.3f}", PALETTE["text_white"]),
+            ("row", "net loss", f"{policy_loss:.3f}", PALETTE["text_white"]),
+            ("bar", "gripper", float(np.clip(gripper_cmd, 0.0, 1.0))),
+            ("rule",),
+            ("sec", "SYSTEM"),
+            ("row", "robot", "7-DOF ok" if robot_connected else "offline",
+             PALETTE["neon_green"] if robot_connected else PALETTE["laser_red"]),
+        ]
+        if poses:
+            pose = poses[0]
+            items.append(("row", "hand", f"tracked {pose.confidence * 100:.0f}%",
+                          PALETTE["neon_green"]))
+            items.append(("row", "wrist",
+                          f"{pose.keypoints_3d[0, 0]:+.2f} {pose.keypoints_3d[0, 1]:+.2f} "
+                          f"{pose.keypoints_3d[0, 2]:+.2f}", PALETTE["text_dim"]))
         else:
-            cv2.putText(frame, "hand - searching...", (x1 + 12, y1 + 308), cv2.FONT_HERSHEY_SIMPLEX, 0.33, PALETTE["amber_gold"], 1, cv2.LINE_AA)
-            cv2.putText(frame, "raise hand to camera", (x1 + 12, y1 + 326), cv2.FONT_HERSHEY_SIMPLEX, 0.30, PALETTE["text_dim"], 1, cv2.LINE_AA)
-
+            items.append(("row", "hand", "searching", PALETTE["amber_gold"]))
         if is_recording:
-            cv2.circle(frame, (x1 + 15, y1 + 342), 3, PALETTE["laser_red"], -1, cv2.LINE_AA)
-            cv2.putText(frame, f"rec [{recorded_frames}f]", (x1 + 24, y1 + 346), cv2.FONT_HERSHEY_SIMPLEX, 0.34, PALETTE["laser_red"], 1, cv2.LINE_AA)
+            items.append(("row", "recording", f"{recorded_frames} f", PALETTE["laser_red"]))
+        items += [("rule",), ("hint", "h  collapse     c  step     m  stats")]
 
-        # Bottom Shortcut Hints
-        cv2.line(frame, (x1 + 12, y1 + 350), (x2 - 12, y1 + 350), (40, 50, 65), 1)
-        cv2.putText(frame, "'h':Collapse | 'c':Step | 'm':Stats", (x1 + 10, y1 + 366), cv2.FONT_HERSHEY_SIMPLEX, 0.29, PALETTE["text_dim"], 1, cv2.LINE_AA)
+        pad = 14
+        header_h = 56
+        dock_w = 252
+        dock_h = header_h + sum(self._DOCK_H[it[0]] for it in items) + 10
+        x1, y1 = w - dock_w - 12, 12
+        x2, y2 = w - 12, y1 + dock_h
+        label_x, value_x = x1 + pad, x2 - pad
+
+        self._glass_panel(frame, x1, y1, x2, y2, alpha=0.90, radius=18)
+
+        # Masthead: an accent rule reads as a logotype mark at a glance.
+        cv2.rectangle(frame, (label_x, y1 + 15), (label_x + 2, y1 + 28),
+                      PALETTE["cyan_electric"], -1)
+        self._tracked_text(frame, "PRECOGNITION", (label_x + 10, y1 + 28),
+                           0.38, PALETTE["text_white"], spacing=1.4)
+
+        fps_col = (PALETTE["neon_green"] if fps >= 20
+                   else PALETTE["amber_gold"] if fps >= 10 else PALETTE["laser_red"])
+        cv2.circle(frame, (label_x + 3, y1 + 43), 3, fps_col, -1, cv2.LINE_AA)
+        cv2.putText(frame, f"{fps:.1f} fps", (label_x + 12, y1 + 47),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.31, PALETTE["text_dim"], 1, cv2.LINE_AA)
+        self._right_text(frame, f"{latency_ms:.0f} ms", value_x, y1 + 47, 0.31,
+                         PALETTE["text_dim"])
+        cv2.line(frame, (label_x, y1 + header_h - 6), (value_x, y1 + header_h - 6),
+                 PALETTE["hairline"], 1)
+
+        y = y1 + header_h
+        for item in items:
+            kind = item[0]
+            step = self._DOCK_H[kind]
+            if kind == "sec":
+                self._tracked_text(frame, item[1], (label_x, y + 12), 0.28,
+                                   PALETTE["text_mute"], spacing=1.5)
+            elif kind == "row":
+                _, label, value, colour = item
+                cv2.putText(frame, label, (label_x, y + 13), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.32, PALETTE["text_mute"], 1, cv2.LINE_AA)
+                self._right_text(frame, value, value_x, y + 13, 0.33, colour)
+            elif kind == "chip":
+                _, label, value, colour = item
+                cv2.putText(frame, label, (label_x, y + 14), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.32, PALETTE["text_mute"], 1, cv2.LINE_AA)
+                self._chip(frame, value_x, y + 10, value, colour)
+            elif kind == "bar":
+                _, label, frac = item
+                cv2.putText(frame, label, (label_x, y + 14), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.32, PALETTE["text_mute"], 1, cv2.LINE_AA)
+                bx1, bx2_ = label_x + 62, value_x
+                by, bh = y + 5, 8
+                cv2.rectangle(frame, (bx1, by), (bx2_, by + bh), (26, 32, 42), -1)
+                fill = int((bx2_ - bx1) * frac)
+                if fill > 0:
+                    cv2.rectangle(frame, (bx1, by), (bx1 + fill, by + bh),
+                                  PALETTE["cyan_electric"], -1)
+                cv2.rectangle(frame, (bx1, by), (bx2_, by + bh), PALETTE["hairline"], 1)
+            elif kind == "rule":
+                cv2.line(frame, (label_x, y + 7), (value_x, y + 7), PALETTE["hairline"], 1)
+            elif kind == "hint":
+                self._tracked_text(frame, item[1], (label_x, y + 12), 0.27,
+                                   PALETTE["text_mute"], spacing=0.6)
+            y += step
 
     # Ordered to match the README hotkey cheat sheet.
     HOTKEY_LEGEND = [
@@ -1570,7 +1663,10 @@ class LocalClientRunner:
         """Kick off Gemini profile authoring for `label`, at most once per object."""
         if (self._mesh_author is None or sprite is None or not label
                 or label in self._mesh_author_busy
-                or OL.authored_profile(label) is not None):
+                or OL.authored_profile(label) is not None
+                or not OL.is_turned(label)):
+            # Flat classes are boxes, not turned shapes - authoring a lathe
+            # profile for one buys a rod and an API call.
             return
         self._mesh_author_busy.add(label)
         crop = sprite.copy()

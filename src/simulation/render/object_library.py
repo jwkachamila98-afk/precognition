@@ -156,6 +156,15 @@ def build_class_mesh(label: Optional[str], longest_dim_m: float,
     ramp = colour_ramp(sprite)
     base_colour = (0.62, 0.60, 0.58) if ramp is None else tuple(float(c) for c in ramp[len(ramp) // 2])
 
+    # An authored profile describes a surface of REVOLUTION. Applying one to a
+    # class that is not turned produces a rod: asked to model a remote control
+    # this way, the authoring returned a 4.6 x 18 cm profile, which lathes into
+    # a cylinder rather than the flat slab a remote actually is.
+    if profile_cm and _match(label, _BOXES) is not None:
+        logger.info(f"Object mesh: ignoring an authored profile for '{label}' - "
+                    f"it is a flat class, not a turned one.")
+        profile_cm = None
+
     if profile_cm:
         prof = np.asarray(profile_cm, dtype=np.float32).reshape(-1, 2)
         natural = max(float(prof[:, 1].max()), 2.0 * float(prof[:, 0].max()))
@@ -197,6 +206,12 @@ def build_class_mesh(label: Optional[str], longest_dim_m: float,
     for axis in range(3):
         v[:, axis] -= 0.5 * (float(v[:, axis].min()) + float(v[:, axis].max()))
     return mesh
+
+
+def is_turned(label: Optional[str]) -> bool:
+    """Whether this class is a surface of revolution, and so worth authoring a
+    lathe profile for. Flat classes are modelled as boxes instead."""
+    return _match(label, _BOXES) is None
 
 
 def known_classes() -> List[str]:
