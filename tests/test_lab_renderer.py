@@ -987,3 +987,57 @@ def test_derived_grip_closes_over_a_recording():
     sim = LabSimulator(width=96, height=72)
     assert sim.prepare_from_demonstration(_synthetic_recording(centre), bbox, None)
     assert sim.telemetry(sim._num_steps - 1)["gripper"] > sim.telemetry(0)["gripper"]
+
+
+def test_truncated_authoring_response_is_reported_as_truncation():
+    """A thinking model charges its reasoning to the same output budget as the
+    answer. At too small a budget it replies with valid-looking JSON that simply
+    stops mid-key, which surfaced as 'Expecting value: line 1 column 46' - a
+    parse error that says nothing about the actual cause.
+    """
+    import json as _json
+    from unittest.mock import patch
+    from src.perception.gemini_mesh_author import GeminiMeshAuthor
+
+    truncated = {
+        "candidates": [{"finishReason": "MAX_TOKENS",
+                        "content": {"parts": [{"text": '{"shape":"cup","profile":'}]}}],
+        "usageMetadata": {"thoughtsTokenCount": 490, "candidatesTokenCount": 18},
+    }
+
+    class _Resp:
+        def read(self): return _json.dumps(truncated).encode()
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    author = GeminiMeshAuthor(api_key="x")
+    sprite = np.full((64, 32, 3), 120, dtype=np.uint8)
+    with patch("urllib.request.urlopen", return_value=_Resp()):
+        with pytest.raises(ValueError, match="truncated"):
+            author._request(sprite, "cup")
+        assert author.author(sprite, "cup") is None, "must fall back, not raise"
+
+
+def test_authored_profile_survives_the_round_trip_into_geometry():
+    """A real response shape must validate and build without special-casing."""
+    from src.perception.gemini_mesh_author import GeminiMeshAuthor
+    from src.simulation.render.object_library import build_class_mesh
+
+    # Captured verbatim from a live response for a wine glass.
+    payload = {"profile": [[3.8, 0.0], [3.8, 0.3], [0.5, 1.0], [0.4, 9.0],
+                           [0.6, 9.5], [4.5, 12.0], [4.0, 16.0], [3.2, 22.0]]}
+    prof = GeminiMeshAuthor._validate(payload, "wine glass")
+    assert prof is not None, "a valid live response was rejected"
+
+    mesh = build_class_mesh("wine glass", 0.20, profile_cm=prof)
+    assert mesh is not None and mesh.num_faces > 100
+    extent = mesh.vertices.max(axis=0) - mesh.vertices.min(axis=0)
+    assert extent[1] == pytest.approx(0.20, abs=0.01)
+
+    # The stem must actually be narrower than the foot - the distinguishing
+    # feature the canonical class profile cannot capture per object.
+    v = mesh.vertices
+    radius = np.hypot(v[:, 0], v[:, 2])
+    foot = radius[v[:, 1] < v[:, 1].min() + 0.005].max()
+    stem = radius[(v[:, 1] > v[:, 1].min() + 0.04) & (v[:, 1] < v[:, 1].min() + 0.07)].max()
+    assert stem < 0.4 * foot, "authored stem is not narrower than the foot"

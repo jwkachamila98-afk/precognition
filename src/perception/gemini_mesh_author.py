@@ -86,7 +86,13 @@ class GeminiMeshAuthor:
                 {"inline_data": {"mime_type": "image/jpeg",
                                  "data": base64.b64encode(buf.tobytes()).decode()}},
             ]}],
-            "generationConfig": {"temperature": 0.0, "maxOutputTokens": 512},
+            # This is a thinking model and its reasoning is charged to the SAME
+            # output budget as the answer. At 512 it spent 490 tokens thinking
+            # and 18 replying, truncating the JSON mid-key - which surfaced as a
+            # parse error rather than as the budget exhaustion it actually was.
+            # thinkingConfig is rejected with HTTP 400 on this endpoint, so the
+            # budget simply has to be large enough for both.
+            "generationConfig": {"temperature": 0.0, "maxOutputTokens": 2048},
         }).encode()
 
         req = urllib.request.Request(
@@ -97,7 +103,14 @@ class GeminiMeshAuthor:
         with urllib.request.urlopen(req, context=self._ssl_ctx, timeout=self.timeout) as resp:
             data = json.loads(resp.read().decode())
 
-        text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        candidate = data["candidates"][0]
+        if candidate.get("finishReason") == "MAX_TOKENS":
+            usage = data.get("usageMetadata", {})
+            raise ValueError(
+                f"response truncated: {usage.get('thoughtsTokenCount', '?')} tokens of "
+                f"reasoning left only {usage.get('candidatesTokenCount', '?')} for the answer"
+            )
+        text = candidate["content"]["parts"][0]["text"].strip()
         if text.startswith("```"):
             text = text.split("```")[1].lstrip("json").strip()
         return json.loads(text)
