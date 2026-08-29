@@ -13,7 +13,7 @@ from src.simulation.trajectory_generator import ForeseenTrajectory, ForeseenWayp
 @dataclass
 class DiscrepancyState:
     """112-dimensional state vector and scalar reward metrics."""
-    state_vector: np.ndarray # Shape (112,)
+    state_vector: np.ndarray # Shape (144,): 112 geometric + 32 intent
     reward: float
     discrepancy_norm: float # || theta_real - theta_sim ||
     pose_error: float # Mean 3D keypoint distance error (meters)
@@ -86,7 +86,8 @@ class DiscrepancyEngineABC(ABC):
         real_hand: Optional[HandPose],
         foreseen_step: Optional[ForeseenWaypoint],
         target_object: Optional[BoundingBox3D] = None,
-        last_action: Optional[np.ndarray] = None
+        last_action: Optional[np.ndarray] = None,
+        intent_embedding: Optional[np.ndarray] = None
     ) -> DiscrepancyState:
         """
         Evaluate tracking divergence and construct 112D state vector s_t and reward R_t.
@@ -114,7 +115,7 @@ class DiscrepancyEngine(DiscrepancyEngineABC):
     and compile cumulative trajectory episode discrepancies D_traj.
     """
 
-    STATE_DIM = 112
+    STATE_DIM = 144
 
     def __init__(
         self,
@@ -134,10 +135,13 @@ class DiscrepancyEngine(DiscrepancyEngineABC):
         real_hand: Optional[HandPose],
         foreseen_step: Optional[ForeseenWaypoint],
         target_object: Optional[BoundingBox3D] = None,
-        last_action: Optional[np.ndarray] = None
+        last_action: Optional[np.ndarray] = None,
+        intent_embedding: Optional[np.ndarray] = None
     ) -> DiscrepancyState:
         """
-        Construct 112D state vector s_t.
+        Construct the 144D state vector s_t: 112 geometric dims plus 32 encoding
+        the spoken intent, so the policy can condition on WHAT WAS ASKED FOR and
+        not only on the geometry it is looking at.
         """
         s = np.zeros(self.STATE_DIM, dtype=np.float32)
 
@@ -209,6 +213,15 @@ class DiscrepancyEngine(DiscrepancyEngineABC):
         # [100..106] Previous residual action (7 dims)
         if last_action is not None and len(last_action) >= 7:
             s[100:107] = last_action[:7]
+
+        # [112..143] Spoken intent (32 dims)
+        # Everything above this line is geometry, so two differently-worded
+        # instructions about the same object produced identical states and,
+        # necessarily, identical corrections - the policy could not condition on
+        # what was said even in principle. Absent or failed embedding leaves
+        # these zero, which reproduces exactly the previous behaviour.
+        if intent_embedding is not None and len(intent_embedding) == 32:
+            s[112:144] = np.asarray(intent_embedding, dtype=np.float32)
 
         # [107..111] Reward history features (5 dims)
         s[107:112] = np.array(self._reward_history[-5:], dtype=np.float32)

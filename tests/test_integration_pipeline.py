@@ -217,7 +217,7 @@ def test_stress_tracking_loss_mid_workflow():
         target_object=None,
         last_action=np.zeros(7, dtype=np.float32)
     )
-    assert disc_state.state_vector.shape == (112,)
+    assert disc_state.state_vector.shape == (144,)
     assert -1.0 <= disc_state.reward <= 1.0
 
     action = policy.evaluate(disc_state.state_vector)

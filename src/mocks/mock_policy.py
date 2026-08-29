@@ -19,7 +19,8 @@ from src.policy.policy import PolicyABC, PolicyAction, PolicyObservation
 class MockResidualPolicy(PolicyABC):
     """
     Lightweight CPU-friendly residual policy with a fixed linear proportional
-    feedback term. Accepts a 112D state vector s_t, outputs residual joint
+    feedback term. Accepts a 144D state vector s_t (112 geometric dimensions
+    plus 32 encoding the spoken intent), outputs residual joint
     correction deltas a_t = Delta theta_t in [-0.08, 0.08] radians. `update()`
     is a placeholder gradient step for interface parity with a real policy - it
     does not minimize any actual loss (see module docstring).
@@ -27,7 +28,7 @@ class MockResidualPolicy(PolicyABC):
 
     def __init__(
         self,
-        state_dim: int = 112,
+        state_dim: int = 144,
         action_dim: int = 7,
         learning_rate: float = 3e-4,
         max_residual: float = 0.08
@@ -73,7 +74,7 @@ class MockResidualPolicy(PolicyABC):
 
     def evaluate(self, state: np.ndarray) -> PolicyAction:
         """
-        Infer residual action vector a_t given 112D state vector s_t.
+        Infer residual action vector a_t given the 144D state vector s_t.
         """
         if len(state) < self.state_dim:
             s_padded = np.zeros(self.state_dim, dtype=np.float32)

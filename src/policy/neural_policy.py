@@ -49,7 +49,7 @@ if TORCH_AVAILABLE:
     class _ResidualPolicyNet(nn.Module):
         """112D discrepancy/perception state -> 7 joint residuals + 1 gripper action."""
 
-        def __init__(self, state_dim: int = 112, action_dim: int = 7, hidden: int = 128) -> None:
+        def __init__(self, state_dim: int = 144, action_dim: int = 7, hidden: int = 128) -> None:
             super().__init__()
             self.trunk = nn.Sequential(
                 nn.Linear(state_dim, hidden),
@@ -79,7 +79,7 @@ class NeuralResidualPolicy(PolicyABC):
 
     def __init__(
         self,
-        state_dim: int = 112,
+        state_dim: int = 144,
         action_dim: int = 7,
         hidden: int = 128,
         learning_rate: float = 1e-3,
@@ -253,4 +253,38 @@ class NeuralResidualPolicy(PolicyABC):
         return self.net.state_dict()
 
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
-        self.net.load_state_dict(state_dict)
+        """Load weights, zero-padding a checkpoint trained on a narrower state.
+
+        The state vector grew from 112 to 144 dimensions when the spoken intent
+        was added to it. Rather than discard everything already learned, an old
+        checkpoint's first-layer weights are copied into the wider matrix and
+        the new intent columns start at zero - so the policy resumes exactly as
+        it behaved before and learns the intent dimensions from there.
+        """
+        try:
+            own = self.net.state_dict()
+            adapted = dict(state_dict)
+            for name, saved in state_dict.items():
+                target = own.get(name)
+                if target is None or saved.shape == target.shape:
+                    continue
+                if (saved.dim() == 2 and target.dim() == 2
+                        and saved.shape[0] == target.shape[0]
+                        and saved.shape[1] < target.shape[1]):
+                    grown = target.clone().zero_()
+                    grown[:, :saved.shape[1]] = saved
+                    adapted[name] = grown
+                    logger.info(
+                        f"NeuralResidualPolicy: widened '{name}' from "
+                        f"{tuple(saved.shape)} to {tuple(target.shape)}; the "
+                        f"{target.shape[1] - saved.shape[1]} intent inputs start at zero."
+                    )
+                else:
+                    raise ValueError(
+                        f"checkpoint tensor '{name}' has shape {tuple(saved.shape)}, "
+                        f"incompatible with {tuple(target.shape)}"
+                    )
+            self.net.load_state_dict(adapted)
+        except Exception as exc:
+            logger.warning(f"NeuralResidualPolicy: could not load checkpoint ({exc}); "
+                           f"keeping the freshly initialised network.")

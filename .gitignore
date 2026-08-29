@@ -51,3 +51,7 @@ snapshot_*.png
 
 # Downloaded/cached ML model weights
 config/models/
+
+# Model weights fetched at runtime by ultralytics/torch.hub - not source.
+yolov8*.pt
+*.pt

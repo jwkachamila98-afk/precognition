@@ -2,6 +2,8 @@
 
 import asyncio
 import logging
+import threading
+import os
 import time
 from typing import Any, Optional
 import numpy as np
@@ -92,6 +94,21 @@ class WSInferenceServer:
         # completed episodes, EMA-blended so the suggested grasp trajectory visibly
         # shifts toward how this user actually moves over repeated attempts.
         self._learned_wrist_bias = np.zeros(3, dtype=np.float32)
+        # Spoken intent, embedded so the policy can condition on it. Requested
+        # off the frame loop: the call takes ~200-600 ms and the loop must not
+        # block on it. Until an answer lands the intent dimensions are zero,
+        # which is exactly how the policy behaved before they existed.
+        self._intent_embedder = None
+        self._intent_vec: Optional[np.ndarray] = None
+        self._intent_pending: set = set()
+        key = os.environ.get("GEMINI_API_KEY")
+        if key:
+            from src.perception.gemini_intent_embedder import GeminiIntentEmbedder
+            self._intent_embedder = GeminiIntentEmbedder(api_key=key)
+            logger.info("Intent embedding enabled: what the user says conditions the policy.")
+        else:
+            logger.info("GEMINI_API_KEY not set: the policy stays intent-blind "
+                        "(intent dimensions remain zero).")
         self._BIAS_EMA_ALPHA = 0.4
         self._BIAS_MAX_METERS = 0.05
 
@@ -112,6 +129,30 @@ class WSInferenceServer:
         # When the current demo started waiting for a detectable target.
         self._autonomous_demo_wait_start = 0.0
         self._AUTONOMOUS_DEMO_TARGET_TIMEOUT_SEC = 12.0
+
+    def _refresh_intent_embedding(self, intent: Optional[str]) -> None:
+        """Keep self._intent_vec in step with what was last said.
+
+        Never blocks. A cached utterance is applied immediately; anything new is
+        embedded on a worker thread and picked up on a later frame.
+        """
+        if self._intent_embedder is None or not intent:
+            return
+        cached = self._intent_embedder.cached(intent)
+        if cached is not None:
+            self._intent_vec = cached
+            return
+        if intent in self._intent_pending:
+            return
+        self._intent_pending.add(intent)
+
+        def _work() -> None:
+            try:
+                self._intent_embedder.embed(intent)
+            finally:
+                self._intent_pending.discard(intent)
+
+        threading.Thread(target=_work, name="intent-embed", daemon=True).start()
 
     def _apply_learned_correction(self, traj, target_box, image_shape: tuple) -> None:
         """Run each waypoint of a freshly generated demo trajectory through the
@@ -355,13 +396,18 @@ class WSInferenceServer:
                     if continue_demo:
                         self.workflow.step_autonomous_demo()
 
+                # 6b. Spoken intent -> policy state. Cached lookups are free; a
+                # miss is embedded on a worker so the frame loop never waits.
+                self._refresh_intent_embedding(frame_msg.intent)
+
                 # 7. Discrepancy Engine & Policy Evaluation
                 real_h = hand_poses[0] if hand_poses else None
                 discrepancy_state = self.discrepancy_engine.evaluate(
                     real_hand=real_h,
                     foreseen_step=current_foreseen_step,
                     target_object=target_box,
-                    last_action=self._last_action
+                    last_action=self._last_action,
+                    intent_embedding=self._intent_vec
                 )
 
                 action = self.policy.evaluate(discrepancy_state.state_vector)
