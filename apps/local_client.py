@@ -61,6 +61,9 @@ from src.analytics.benchmark import CoAdaptationBenchmark
 from src.hardware.robot_interface import MockRobotHardware, RobotHardwareABC, RobotState
 from src.safety.safety_monitor import SafetyMonitor, SafetyStatus
 from src.mocks.mock_hand_tracker import MockHandTracker
+from src.ui import glass as UIG
+from src.ui import hud as UIH
+from src.ui.stage import Stage
 from src.mocks.mock_depth_estimator import MockDepthEstimator
 from src.mocks.mock_scene_parser import MockSceneParser
 from src.mocks.mock_affordance_extractor import MockAffordanceExtractor
@@ -201,71 +204,6 @@ class LocalVisualizer:
         result = (mask_f, contours)
         self._panel_cache[key] = result
         return result
-
-    def _glass_panel(
-        self,
-        frame: np.ndarray,
-        x1: int, y1: int, x2: int, y2: int,
-        alpha: float = 0.80,
-        radius: int = 14,
-        border_color: Optional[tuple] = None,
-    ) -> None:
-        """Blend a soft rounded-corner frosted glass card onto the frame in place."""
-        h, w = frame.shape[:2]
-        x1, y1, x2, y2 = max(0, x1), max(0, y1), min(w, x2), min(h, y2)
-        pw, ph = x2 - x1, y2 - y1
-        if pw <= 0 or ph <= 0:
-            return
-        roi = frame[y1:y2, x1:x2]
-        mask_f, contours = self._rounded_panel_mask(pw, ph, radius)
-        glass = np.full_like(roi, PALETTE["dark_glass_bg"])
-        blended = cv2.addWeighted(glass, alpha, roi, 1 - alpha, 0)
-        roi[:] = (blended * mask_f + roi * (1 - mask_f)).astype(np.uint8)
-        cv2.drawContours(roi, contours, -1, border_color or PALETTE["glass_border"], 1, lineType=cv2.LINE_AA)
-
-    def _tracked_text(
-        self, frame: np.ndarray, text: str, org: tuple, scale: float,
-        color: tuple, spacing: float = 1.6, thickness: int = 1,
-    ) -> None:
-        """Draw text with extra letter spacing. OpenCV has no tracking control,
-        so section labels are stamped a glyph at a time - the wide spacing is
-        what separates a heading from body text at these small sizes."""
-        x, y = float(org[0]), int(org[1])
-        for ch in text:
-            cv2.putText(frame, ch, (int(round(x)), y), cv2.FONT_HERSHEY_SIMPLEX,
-                        scale, color, thickness, cv2.LINE_AA)
-            (cw, _), _ = cv2.getTextSize(ch, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)
-            x += cw + spacing
-
-    def _right_text(
-        self, frame: np.ndarray, text: str, right_x: int, baseline_y: int,
-        scale: float, color: tuple,
-    ) -> int:
-        """Right-align text to `right_x`. Returns the left edge it occupied."""
-        (tw, _), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)
-        x = right_x - tw
-        cv2.putText(frame, text, (x, baseline_y), cv2.FONT_HERSHEY_SIMPLEX,
-                    scale, color, 1, cv2.LINE_AA)
-        return x
-
-    def _chip(
-        self, frame: np.ndarray, right_x: int, centre_y: int, text: str,
-        color: tuple, scale: float = 0.30,
-    ) -> None:
-        """A small tinted pill, right-aligned. Used for the one value that is a
-        state rather than a number, so the eye finds it without reading."""
-        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)
-        pad_x, pad_y = 8, 5
-        x2, x1 = right_x, right_x - tw - 2 * pad_x
-        y1, y2 = centre_y - th // 2 - pad_y, centre_y + th // 2 + pad_y
-        h, w = frame.shape[:2]
-        sx1, sy1, sx2, sy2 = max(0, x1), max(0, y1), min(w, x2), min(h, y2)
-        if sx2 > sx1 and sy2 > sy1:
-            sub = frame[sy1:sy2, sx1:sx2]
-            sub[:] = cv2.addWeighted(np.full_like(sub, color), 0.16, sub, 0.84, 0)
-        cv2.rectangle(frame, (x1, y1), (x2 - 1, y2 - 1), color, 1, cv2.LINE_AA)
-        cv2.putText(frame, text, (x1 + pad_x, centre_y + th // 2),
-                    cv2.FONT_HERSHEY_SIMPLEX, scale, color, 1, cv2.LINE_AA)
 
     def update_fps(self) -> float:
         now = time.perf_counter()
@@ -819,157 +757,6 @@ class LocalVisualizer:
             cv2.circle(frame, (cx0 + 60 + i * 11, gy + 3), 3,
                        PALETTE["neon_green"] if on else (55, 62, 72), -1, cv2.LINE_AA)
 
-    def draw_workflow_banner(
-        self,
-        frame: np.ndarray,
-        phase: ExecutionPhase,
-        progress: float,
-        step_idx: int,
-        discrepancy_norm: float = 0.0,
-        episode_report: Optional[EpisodeDiscrepancyReport] = None
-    ) -> None:
-        """Render modern, compact Floating Dynamic Island banner at top center."""
-        h, w = frame.shape[:2]
-        banner_w = 360
-        banner_h = 32
-        bx1 = (w - banner_w - 240) // 2  # Center relative to demonstrator view area
-        if bx1 < 10:
-            bx1 = 15
-        by1 = 10
-        bx2 = bx1 + banner_w
-        by2 = by1 + banner_h
-
-        self._glass_panel(frame, bx1, by1, bx2, by2, alpha=0.82, radius=16)
-
-        t = time.time()
-        pulse = 0.5 + 0.5 * np.sin(t * 8.0)
-
-        if phase == ExecutionPhase.FORESEEING:
-            cv2.circle(frame, (bx1 + 18, by1 + 16), int(4 + 2 * pulse), PALETTE["amber_gold"], -1, cv2.LINE_AA)
-            msg = f"Foreseeing rollout  -  {int(progress*100)}%"
-            cv2.putText(frame, msg, (bx1 + 30, by1 + 21), cv2.FONT_HERSHEY_SIMPLEX, 0.38, PALETTE["amber_gold"], 1, cv2.LINE_AA)
-
-        elif phase == ExecutionPhase.WAIT_USER:
-            cv2.circle(frame, (bx1 + 18, by1 + 16), 5, PALETTE["cyan_electric"], -1, cv2.LINE_AA)
-            msg = "Ready - press 'c' to execute"
-            cv2.putText(frame, msg, (bx1 + 30, by1 + 21), cv2.FONT_HERSHEY_SIMPLEX, 0.36, PALETTE["text_white"], 1, cv2.LINE_AA)
-
-        elif phase == ExecutionPhase.USER_EXECUTING:
-            cv2.circle(frame, (bx1 + 18, by1 + 16), int(4 + 2 * pulse), PALETTE["neon_green"], -1, cv2.LINE_AA)
-            msg = f"Tracking execution  -  {int(progress*100)}%"
-            cv2.putText(frame, msg, (bx1 + 30, by1 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.36, PALETTE["neon_green"], 1, cv2.LINE_AA)
-
-            # High precision alignment bar
-            bar_x = bx1 + 30
-            bar_y = by1 + 24
-            bar_w = banner_w - 46
-            bar_h = 3
-            cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (40, 50, 60), -1)
-            fill_w = int(bar_w * np.clip(1.0 - (discrepancy_norm / 0.10), 0.0, 1.0))
-            if fill_w > 0:
-                cv2.rectangle(frame, (bar_x, bar_y), (bar_x + fill_w, bar_y + bar_h), PALETTE["neon_green"], -1)
-
-        elif phase == ExecutionPhase.RESTARTING:
-            cv2.circle(frame, (bx1 + 18, by1 + 16), int(4 + 2 * pulse), PALETTE["neon_violet"], -1, cv2.LINE_AA)
-            msg = f"Restarting with improved plan  -  {int(progress*100)}%"
-            cv2.putText(frame, msg, (bx1 + 30, by1 + 21), cv2.FONT_HERSHEY_SIMPLEX, 0.36, PALETTE["neon_violet"], 1, cv2.LINE_AA)
-        elif phase == ExecutionPhase.ADAPTING or episode_report is not None:
-            cv2.circle(frame, (bx1 + 18, by1 + 16), 5, PALETTE["neon_violet"], -1, cv2.LINE_AA)
-            rew = episode_report.episode_reward if episode_report else 0.0
-            msg = f"Adapted  -  {rew:+.2f} reward"
-            cv2.putText(frame, msg, (bx1 + 30, by1 + 21), cv2.FONT_HERSHEY_SIMPLEX, 0.36, PALETTE["neon_violet"], 1, cv2.LINE_AA)
-        elif phase == ExecutionPhase.AUTONOMOUS_DEMO:
-            cv2.circle(frame, (bx1 + 18, by1 + 16), int(4 + 2 * pulse), PALETTE["cyan_electric"], -1, cv2.LINE_AA)
-            msg = f"Autonomous Demo  -  {int(progress*100)}%"
-            cv2.putText(frame, msg, (bx1 + 30, by1 + 21), cv2.FONT_HERSHEY_SIMPLEX, 0.38, PALETTE["cyan_electric"], 1, cv2.LINE_AA)
-        else:
-            cv2.circle(frame, (bx1 + 18, by1 + 16), 3, PALETTE["text_dim"], -1, cv2.LINE_AA)
-            msg = "Standby - press 'i' or talk ('v')"
-            cv2.putText(frame, msg, (bx1 + 30, by1 + 21), cv2.FONT_HERSHEY_SIMPLEX, 0.36, PALETTE["text_dim"], 1, cv2.LINE_AA)
-
-    def draw_instruction_bar(
-        self, frame: np.ndarray, phase: ExecutionPhase, target_label: str = "", has_replay: bool = False
-    ) -> None:
-        """Large, unmissable bottom-center bar stating exactly what to do right now,
-        in plain language - separate from the compact top-of-frame status banner."""
-        h, w = frame.shape[:2]
-        target = target_label.replace("_", " ") if target_label and target_label.lower() not in ("none", "") else "an object"
-
-        foreseeing_body = (
-            f"Watch a replay of your last attempt at the {target}, or press 'a' for the autonomous demo..." if has_replay
-            else f"First try - go with your best guess for the {target}. Get ready..."
-        )
-        messages = {
-            ExecutionPhase.IDLE: ("STANDBY", "Hold 'v' or SPACE and say what to pick up, e.g. \"wine glass\"", PALETTE["text_dim"]),
-            ExecutionPhase.FORESEEING: ("PREVIEWING", foreseeing_body, PALETTE["amber_gold"]),
-            ExecutionPhase.WAIT_USER: ("YOUR TURN", "Get in position and press 'c' - or press 'a' for the autonomous demo", PALETTE["cyan_electric"]),
-            ExecutionPhase.USER_EXECUTING: ("GO", f"Reach for the {target} now - do it your way", PALETTE["neon_green"]),
-            ExecutionPhase.ADAPTING: ("REVIEW", "Here's a replay of what you just did...", PALETTE["neon_violet"]),
-            ExecutionPhase.RESTARTING: ("TRY AGAIN", f"Restarting with an improved plan for the {target}...", PALETTE["neon_violet"]),
-            ExecutionPhase.AUTONOMOUS_DEMO: ("AUTONOMOUS DEMO", f"Simulating the grasp on the {target}, using everything learned so far...", PALETTE["cyan_electric"]),
-        }
-        title, body, color = messages.get(phase, messages[ExecutionPhase.IDLE])
-
-        bar_w = min(600, w - 32)
-        bar_h = 56
-        bx1 = (w - bar_w) // 2
-        by1 = h - bar_h - 16
-        bx2, by2 = bx1 + bar_w, by1 + bar_h
-
-        self._glass_panel(frame, bx1, by1, bx2, by2, alpha=0.88, radius=16, border_color=color)
-        cv2.rectangle(frame, (bx1 + 18, by1 + 14), (bx1 + 20, by1 + 42), color, -1)
-        self._tracked_text(frame, title, (bx1 + 30, by1 + 25), 0.33, color, spacing=1.5)
-        cv2.putText(frame, body, (bx1 + 30, by1 + 43), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.37, PALETTE["text_white"], 1, cv2.LINE_AA)
-
-    def draw_coadaptation_panel(
-        self,
-        frame: np.ndarray,
-        benchmark_summary: Optional[dict] = None
-    ) -> None:
-        """Render modern Co-Adaptation Performance Analytics Glass Panel."""
-        if not self.show_analytics_panel:
-            return
-
-        h, w = frame.shape[:2]
-        panel_w = 260
-        panel_h = 220
-        px1 = w - panel_w - 250  # Dock neatly to the left of the right sidebar
-        if px1 < 10:
-            px1 = 10
-        py1 = 10
-        px2 = px1 + panel_w
-        py2 = py1 + panel_h
-
-        self._glass_panel(frame, px1, py1, px2, py2, alpha=0.86, radius=16, border_color=PALETTE["cyan_electric"])
-
-        cv2.putText(frame, "Co-Adaptation", (px1 + 14, py1 + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.42, PALETTE["cyan_electric"], 1, cv2.LINE_AA)
-
-        if not benchmark_summary or benchmark_summary.get("total_trials", 0) == 0:
-            cv2.putText(frame, "No trials recorded yet.", (px1 + 12, py1 + 55), cv2.FONT_HERSHEY_SIMPLEX, 0.36, PALETTE["text_dim"], 1, cv2.LINE_AA)
-            cv2.putText(frame, "Complete Foresee-Execute cycles", (px1 + 12, py1 + 78), cv2.FONT_HERSHEY_SIMPLEX, 0.34, PALETTE["text_dim"], 1, cv2.LINE_AA)
-            cv2.putText(frame, "to track multi-trial learning.", (px1 + 12, py1 + 96), cv2.FONT_HERSHEY_SIMPLEX, 0.34, PALETTE["text_dim"], 1, cv2.LINE_AA)
-        else:
-            trials_cnt = benchmark_summary.get("total_trials", 0)
-            reduction_pct = benchmark_summary.get("error_reduction_pct", 0.0)
-            mean_r = benchmark_summary.get("mean_reward", 0.0)
-            init_err = benchmark_summary.get("initial_error_mm", 0.0)
-            cur_err = benchmark_summary.get("latest_error_mm", 0.0)
-
-            cv2.putText(frame, f"TOTAL TRIALS: {trials_cnt}", (px1 + 12, py1 + 50), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (255, 255, 255), 1, cv2.LINE_AA)
-            cv2.putText(frame, f"INIT D_traj: {init_err:.1f} mm", (px1 + 12, py1 + 70), cv2.FONT_HERSHEY_SIMPLEX, 0.36, PALETTE["amber_gold"], 1, cv2.LINE_AA)
-            cv2.putText(frame, f"CURR D_traj: {cur_err:.1f} mm", (px1 + 12, py1 + 90), cv2.FONT_HERSHEY_SIMPLEX, 0.36, PALETTE["neon_green"], 1, cv2.LINE_AA)
-            
-            # Error Reduction Badge
-            red_color = PALETTE["neon_green"] if reduction_pct >= 0 else PALETTE["laser_red"]
-            cv2.putText(frame, f"ERROR REDUCTION: {reduction_pct:+5.1f}%", (px1 + 12, py1 + 115), cv2.FONT_HERSHEY_SIMPLEX, 0.40, red_color, 1, cv2.LINE_AA)
-            cv2.putText(frame, f"MEAN REWARD: {mean_r:+0.3f}", (px1 + 12, py1 + 135), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (220, 240, 255), 1, cv2.LINE_AA)
-
-        # Checkpoint hotkey instructions
-        cv2.line(frame, (px1 + 12, py1 + 155), (px2 - 12, py1 + 155), (50, 65, 80), 1)
-        cv2.putText(frame, "HOTKEYS: 'k':Save | 'l':Load | 'x':Reset", (px1 + 12, py1 + 175), cv2.FONT_HERSHEY_SIMPLEX, 0.32, PALETTE["text_white"], 1, cv2.LINE_AA)
-        cv2.putText(frame, "SAVED IN: config/profiles/default_user", (px1 + 12, py1 + 195), cv2.FONT_HERSHEY_SIMPLEX, 0.28, PALETTE["text_dim"], 1, cv2.LINE_AA)
-
     def draw_3d_bounding_boxes(self, frame: np.ndarray, bboxes: List[BoundingBox3D],
                                simplified: bool = False) -> None:
         """Render 3D bounding wireframes with corner brackets and a target badge.
@@ -1041,332 +828,6 @@ class LocalVisualizer:
                 cv2.circle(frame, (u, v), r, PALETTE["neon_green"], 1, cv2.LINE_AA)
                 cv2.drawMarker(frame, (u, v), PALETTE["neon_green"], cv2.MARKER_CROSS, 8, 1)
                 cv2.putText(frame, f"HOTSPOT #{h_idx+1}", (u + 12, v + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.34, PALETTE["neon_green"], 1, cv2.LINE_AA)
-
-    def draw_depth_pip(self, frame: np.ndarray, depth_heatmap: Optional[np.ndarray]) -> None:
-        """Draw Picture-in-Picture metric depth inset tucked on bottom-left."""
-        if not self.show_depth_inset or depth_heatmap is None:
-            return
-
-        h, w = frame.shape[:2]
-        pip_w = 120
-        pip_h = 90
-
-        pip_resized = cv2.resize(depth_heatmap, (pip_w, pip_h), interpolation=cv2.INTER_LINEAR)
-        
-        x1 = 12
-        y1 = h - pip_h - 12
-        x2 = x1 + pip_w
-        y2 = y1 + pip_h
-
-        frame[y1:y2, x1:x2] = pip_resized
-        cv2.rectangle(frame, (x1, y1), (x2, y2), PALETTE["hairline"], 1)
-
-        # A translucent caption strip rather than an opaque black tag - the
-        # heatmap stays readable underneath it.
-        strip = frame[y1 + 1:y1 + 17, x1 + 1:x2]
-        strip[:] = cv2.addWeighted(np.full_like(strip, PALETTE["dark_glass_bg"]),
-                                   0.72, strip, 0.28, 0)
-        self._tracked_text(frame, "DEPTH", (x1 + 7, y1 + 13), 0.28,
-                           PALETTE["text_white"], spacing=1.4)
-        self._right_text(frame, "m", x2 - 7, y1 + 13, 0.28, PALETTE["text_dim"])
-
-    def draw_telemetry_hud(
-        self,
-        frame: np.ndarray,
-        fps: float,
-        mode_str: str,
-        tracker_name: str,
-        intent: str,
-        workflow_phase: ExecutionPhase,
-        phase_progress: float = 0.0,
-        parsed_intent: Optional[ParsedIntent] = None,
-        voice_status: str = "IDLE",
-        foreseen_step: int = 0,
-        latency_ms: float = 0.0,
-        poses: Optional[List[HandPose]] = None,
-        bboxes: Optional[List[BoundingBox3D]] = None,
-        gripper_cmd: float = 0.0,
-        residuals: Optional[List[float]] = None,
-        reward_score: float = 0.0,
-        discrepancy_norm: float = 0.0,
-        adaptation_active: bool = True,
-        buffer_steps: int = 0,
-        is_recording: bool = False,
-        recorded_frames: int = 0,
-        robot_connected: bool = True,
-        policy_loss: float = 0.0
-    ) -> None:
-        """Render the status HUD: a minimal glance card by default, or the full
-        telemetry dock when expanded via 'h'."""
-        if self.show_telemetry_detail:
-            self._draw_telemetry_expanded(
-                frame=frame, fps=fps, tracker_name=tracker_name, workflow_phase=workflow_phase,
-                parsed_intent=parsed_intent, voice_status=voice_status, latency_ms=latency_ms,
-                poses=poses, gripper_cmd=gripper_cmd, reward_score=reward_score,
-                discrepancy_norm=discrepancy_norm, adaptation_active=adaptation_active,
-                is_recording=is_recording, recorded_frames=recorded_frames, robot_connected=robot_connected,
-                policy_loss=policy_loss,
-            )
-        else:
-            self._draw_telemetry_compact(
-                frame=frame, fps=fps, latency_ms=latency_ms, workflow_phase=workflow_phase,
-                parsed_intent=parsed_intent, poses=poses, is_recording=is_recording,
-                recorded_frames=recorded_frames,
-            )
-
-    def _draw_telemetry_compact(
-        self,
-        frame: np.ndarray,
-        fps: float,
-        latency_ms: float,
-        workflow_phase: ExecutionPhase,
-        parsed_intent: Optional[ParsedIntent],
-        poses: Optional[List[HandPose]],
-        is_recording: bool,
-        recorded_frames: int,
-    ) -> None:
-        """Minimal glance card - just health, stage, and target. No walls of text."""
-        h, w = frame.shape[:2]
-        card_w, card_h = 208, 80
-        x1 = w - card_w - 10
-        y1 = 10
-        x2, y2 = x1 + card_w, y1 + card_h
-
-        self._glass_panel(frame, x1, y1, x2, y2, alpha=0.80, radius=14)
-
-        phase_colors = {
-            ExecutionPhase.IDLE: PALETTE["text_dim"],
-            ExecutionPhase.FORESEEING: PALETTE["amber_gold"],
-            ExecutionPhase.WAIT_USER: PALETTE["text_white"],
-            ExecutionPhase.USER_EXECUTING: PALETTE["neon_green"],
-            ExecutionPhase.ADAPTING: PALETTE["neon_violet"],
-            ExecutionPhase.AUTONOMOUS_DEMO: PALETTE["cyan_electric"],
-        }
-        p_col = phase_colors.get(workflow_phase, PALETTE["text_dim"])
-        # The raw enum values are snake_case and too long for the chip - a
-        # 'AUTONOMOUS_DEMO' pill runs the full width of the card.
-        phase_short = {
-            ExecutionPhase.WAIT_USER: "READY",
-            ExecutionPhase.USER_EXECUTING: "EXECUTING",
-            ExecutionPhase.AUTONOMOUS_DEMO: "AUTO DEMO",
-        }.get(workflow_phase, workflow_phase.value.replace("_", " ").upper())
-
-        cv2.circle(frame, (x1 + 16, y1 + 22), 4, p_col, -1, cv2.LINE_AA)
-        stage_label = workflow_phase.value.replace("_", " ").title()
-        cv2.putText(frame, stage_label, (x1 + 28, y1 + 26), cv2.FONT_HERSHEY_SIMPLEX, 0.40, PALETTE["text_white"], 1, cv2.LINE_AA)
-
-        fps_col = PALETTE["neon_green"] if fps >= 20 else PALETTE["amber_gold"]
-        hand_pct = f"{poses[0].confidence*100:.0f}%" if poses else "-"
-        cv2.circle(frame, (x1 + 16, y1 + 44), 3, fps_col, -1, cv2.LINE_AA)
-        cv2.putText(frame, f"{fps:4.1f} fps  -  {latency_ms:3.0f} ms  -  hand {hand_pct}",
-                    (x1 + 26, y1 + 48), cv2.FONT_HERSHEY_SIMPLEX, 0.31, PALETTE["text_dim"], 1, cv2.LINE_AA)
-
-        target_obj = parsed_intent.target_object if parsed_intent and parsed_intent.is_active else None
-        if target_obj:
-            cv2.putText(frame, f"target - {target_obj[:18]}", (x1 + 16, y1 + 66),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.32, PALETTE["amber_gold"], 1, cv2.LINE_AA)
-        elif is_recording:
-            cv2.circle(frame, (x1 + 18, y1 + 62), 3, PALETTE["laser_red"], -1, cv2.LINE_AA)
-            cv2.putText(frame, f"rec - {recorded_frames} frames", (x1 + 26, y1 + 66),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.31, PALETTE["laser_red"], 1, cv2.LINE_AA)
-        else:
-            cv2.putText(frame, "'h' details  -  'i' intent", (x1 + 16, y1 + 66),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.28, PALETTE["text_dim"], 1, cv2.LINE_AA)
-
-    # Row metrics for the telemetry dock. Every element declares its own height
-    # so the card can be measured before it is drawn - adding or removing a row
-    # never leaves a hardcoded y-offset pointing at the wrong place.
-    _DOCK_H = {"sec": 22, "row": 19, "chip": 21, "bar": 23, "rule": 14, "hint": 17}
-
-    def _draw_telemetry_expanded(
-        self,
-        frame: np.ndarray,
-        fps: float,
-        tracker_name: str,
-        workflow_phase: ExecutionPhase,
-        parsed_intent: Optional[ParsedIntent],
-        voice_status: str,
-        latency_ms: float,
-        poses: Optional[List[HandPose]],
-        gripper_cmd: float,
-        reward_score: float,
-        discrepancy_norm: float,
-        adaptation_active: bool,
-        is_recording: bool,
-        recorded_frames: int,
-        robot_connected: bool,
-        policy_loss: float = 0.0,
-    ) -> None:
-        """Full telemetry dock: a two-column data card, measured then drawn.
-
-        Labels sit in a muted left column and values are right-aligned against
-        the card edge, so the numbers line up into a scannable rail instead of
-        drifting with the length of each label."""
-        h, w = frame.shape[:2]
-
-        phase_colors = {
-            ExecutionPhase.IDLE: PALETTE["text_dim"],
-            ExecutionPhase.FORESEEING: PALETTE["amber_gold"],
-            ExecutionPhase.WAIT_USER: PALETTE["text_white"],
-            ExecutionPhase.USER_EXECUTING: PALETTE["neon_green"],
-            ExecutionPhase.RESTARTING: PALETTE["neon_violet"],
-            ExecutionPhase.ADAPTING: PALETTE["neon_violet"],
-            ExecutionPhase.AUTONOMOUS_DEMO: PALETTE["cyan_electric"],
-        }
-        p_col = phase_colors.get(workflow_phase, PALETTE["text_dim"])
-        # The raw enum values are snake_case and too long for the chip - a
-        # 'AUTONOMOUS_DEMO' pill runs the full width of the card.
-        phase_short = {
-            ExecutionPhase.WAIT_USER: "READY",
-            ExecutionPhase.USER_EXECUTING: "EXECUTING",
-            ExecutionPhase.AUTONOMOUS_DEMO: "AUTO DEMO",
-        }.get(workflow_phase, workflow_phase.value.replace("_", " ").upper())
-
-        target_obj = (parsed_intent.target_object if parsed_intent and parsed_intent.is_active
-                      else "standby")
-        r_col = (PALETTE["neon_green"] if reward_score > 0.5
-                 else PALETTE["amber_gold"] if reward_score > 0.0 else PALETTE["laser_red"])
-
-        items: List[tuple] = [
-            ("sec", "SESSION"),
-            ("chip", "stage", phase_short, p_col),
-            ("row", "target", target_obj[:15], PALETTE["amber_gold"]),
-            ("row", "voice", *{
-                "LISTENING": ("listening", PALETTE["cyan_electric"]),
-                "TRANSCRIBING": ("transcribing", PALETTE["amber_gold"]),
-                "FAILED": ("not heard - retry", PALETTE["laser_red"]),
-            }.get(voice_status, ("push 'v'", PALETTE["text_dim"]))),
-            ("rule",),
-            ("sec", "ADAPTATION"),
-            ("row", "learning", "online" if adaptation_active else "paused",
-             PALETTE["neon_green"] if adaptation_active else PALETTE["laser_red"]),
-            ("row", "reward", f"{reward_score:+.2f}", r_col),
-            ("row", "error", f"{discrepancy_norm:.3f}", PALETTE["text_white"]),
-            ("row", "net loss", f"{policy_loss:.3f}", PALETTE["text_white"]),
-            ("bar", "gripper", float(np.clip(gripper_cmd, 0.0, 1.0))),
-            ("rule",),
-            ("sec", "SYSTEM"),
-            ("row", "robot", "7-DOF ok" if robot_connected else "offline",
-             PALETTE["neon_green"] if robot_connected else PALETTE["laser_red"]),
-        ]
-        if poses:
-            pose = poses[0]
-            items.append(("row", "hand", f"tracked {pose.confidence * 100:.0f}%",
-                          PALETTE["neon_green"]))
-            items.append(("row", "wrist",
-                          f"{pose.keypoints_3d[0, 0]:+.2f} {pose.keypoints_3d[0, 1]:+.2f} "
-                          f"{pose.keypoints_3d[0, 2]:+.2f}", PALETTE["text_dim"]))
-        else:
-            items.append(("row", "hand", "searching", PALETTE["amber_gold"]))
-        if is_recording:
-            items.append(("row", "recording", f"{recorded_frames} f", PALETTE["laser_red"]))
-        items += [("rule",), ("hint", "h  collapse     c  step     m  stats")]
-
-        pad = 14
-        header_h = 56
-        dock_w = 252
-        dock_h = header_h + sum(self._DOCK_H[it[0]] for it in items) + 10
-        x1, y1 = w - dock_w - 12, 12
-        x2, y2 = w - 12, y1 + dock_h
-        label_x, value_x = x1 + pad, x2 - pad
-
-        self._glass_panel(frame, x1, y1, x2, y2, alpha=0.90, radius=18)
-
-        # Masthead: an accent rule reads as a logotype mark at a glance.
-        cv2.rectangle(frame, (label_x, y1 + 15), (label_x + 2, y1 + 28),
-                      PALETTE["cyan_electric"], -1)
-        self._tracked_text(frame, "PRECOGNITION", (label_x + 10, y1 + 28),
-                           0.38, PALETTE["text_white"], spacing=1.4)
-
-        fps_col = (PALETTE["neon_green"] if fps >= 20
-                   else PALETTE["amber_gold"] if fps >= 10 else PALETTE["laser_red"])
-        cv2.circle(frame, (label_x + 3, y1 + 43), 3, fps_col, -1, cv2.LINE_AA)
-        cv2.putText(frame, f"{fps:.1f} fps", (label_x + 12, y1 + 47),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.31, PALETTE["text_dim"], 1, cv2.LINE_AA)
-        self._right_text(frame, f"{latency_ms:.0f} ms", value_x, y1 + 47, 0.31,
-                         PALETTE["text_dim"])
-        cv2.line(frame, (label_x, y1 + header_h - 6), (value_x, y1 + header_h - 6),
-                 PALETTE["hairline"], 1)
-
-        y = y1 + header_h
-        for item in items:
-            kind = item[0]
-            step = self._DOCK_H[kind]
-            if kind == "sec":
-                self._tracked_text(frame, item[1], (label_x, y + 12), 0.28,
-                                   PALETTE["text_mute"], spacing=1.5)
-            elif kind == "row":
-                _, label, value, colour = item
-                cv2.putText(frame, label, (label_x, y + 13), cv2.FONT_HERSHEY_SIMPLEX,
-                            0.32, PALETTE["text_mute"], 1, cv2.LINE_AA)
-                self._right_text(frame, value, value_x, y + 13, 0.33, colour)
-            elif kind == "chip":
-                _, label, value, colour = item
-                cv2.putText(frame, label, (label_x, y + 14), cv2.FONT_HERSHEY_SIMPLEX,
-                            0.32, PALETTE["text_mute"], 1, cv2.LINE_AA)
-                self._chip(frame, value_x, y + 10, value, colour)
-            elif kind == "bar":
-                _, label, frac = item
-                cv2.putText(frame, label, (label_x, y + 14), cv2.FONT_HERSHEY_SIMPLEX,
-                            0.32, PALETTE["text_mute"], 1, cv2.LINE_AA)
-                bx1, bx2_ = label_x + 62, value_x
-                by, bh = y + 5, 8
-                cv2.rectangle(frame, (bx1, by), (bx2_, by + bh), (26, 32, 42), -1)
-                fill = int((bx2_ - bx1) * frac)
-                if fill > 0:
-                    cv2.rectangle(frame, (bx1, by), (bx1 + fill, by + bh),
-                                  PALETTE["cyan_electric"], -1)
-                cv2.rectangle(frame, (bx1, by), (bx2_, by + bh), PALETTE["hairline"], 1)
-            elif kind == "rule":
-                cv2.line(frame, (label_x, y + 7), (value_x, y + 7), PALETTE["hairline"], 1)
-            elif kind == "hint":
-                self._tracked_text(frame, item[1], (label_x, y + 12), 0.27,
-                                   PALETTE["text_mute"], spacing=0.6)
-            y += step
-
-    # Ordered to match the README hotkey cheat sheet.
-    HOTKEY_LEGEND = [
-        ("ENTER/c", "Step Phase"),
-        ("h", "Telemetry"),
-        ("m", "Co-Adapt"),
-        ("k / ^S", "Save Ckpt"),
-        ("l / ^L", "Load Ckpt"),
-        ("x / ^R", "Reset"),
-        ("v/SPACE", "Voice PTT"),
-        ("g", "Voice Guide"),
-        ("i", "Cycle Intent"),
-        ("p", "Toggle Adapt"),
-        ("r", "Record"),
-        ("f", "Ghost Hand"),
-        ("t", "Toggle Tracker"),
-        ("b", "3D Box"),
-        ("d", "Depth PIP"),
-        ("s", "Screenshot"),
-        ("z", "Fullscreen"),
-        ("a", "Autonomous Demo"),
-        ("q/ESC", "Quit"),
-    ]
-
-    def draw_hotkey_panel(self, frame: np.ndarray, top_y: int) -> None:
-        """Render the always-on hotkey cheat sheet docked below the glance card on the right side."""
-        h, w = frame.shape[:2]
-        panel_w = 218
-        line_h = 14
-        panel_h = 26 + line_h * len(self.HOTKEY_LEGEND) + 8
-        x1 = w - panel_w - 10
-        y1 = top_y
-        x2 = w - 10
-        y2 = y1 + panel_h
-
-        self._glass_panel(frame, x1, y1, x2, y2, alpha=0.80, radius=14)
-        cv2.putText(frame, "HOTKEYS", (x1 + 12, y1 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.36, PALETTE["cyan_electric"], 1, cv2.LINE_AA)
-        cv2.line(frame, (x1 + 12, y1 + 28), (x2 - 12, y1 + 28), (40, 50, 65), 1)
-
-        for idx, (key, action) in enumerate(self.HOTKEY_LEGEND):
-            row_y = y1 + 44 + idx * line_h
-            cv2.putText(frame, key, (x1 + 12, row_y), cv2.FONT_HERSHEY_SIMPLEX, 0.32, PALETTE["amber_gold"], 1, cv2.LINE_AA)
-            cv2.putText(frame, action, (x1 + 84, row_y), cv2.FONT_HERSHEY_SIMPLEX, 0.32, PALETTE["text_white"], 1, cv2.LINE_AA)
-
 
 class SyntheticCamera:
     """Generates synthetic animated RGB video frames when webcam is inaccessible."""
@@ -1498,6 +959,14 @@ class LocalClientRunner:
         self._audio_stream: Optional["sd.InputStream"] = None
         self._is_fullscreen = False
         self._screen_w, self._screen_h = self._detect_screen_size()
+        # The composition surface. Chrome is drawn on it at its own resolution
+        # rather than on the 640x480 feed, so type is rasterised at the size it
+        # is shown instead of being scaled up threefold on the way to the window.
+        self.motion = UIG.Motion()
+        self.stage = self._build_stage()
+        # Episode rewards for the learning card's trend line. The benchmark
+        # summary reports aggregates only, so the series is kept here.
+        self._reward_history: collections.deque = collections.deque(maxlen=48)
 
         selected_tracker = tracker_type or config.perception.hand_tracker.tracker_type
         self.use_mediapipe = (selected_tracker == "mediapipe") and MEDIAPIPE_AVAILABLE
@@ -1863,32 +1332,102 @@ class LocalClientRunner:
         back into focus. Resizing/moving a WINDOW_NORMAL window to the screen's
         dimensions gets the same "fills the screen" effect while keeping
         keyboard capture reliable; letterboxing is instead done ourselves (see
-        _prepare_display_frame) with a themed pad color."""
+        the stage composition) with the backdrop rather than a flat fill."""
         window_name = self.config.visualization.window_name
         self._is_fullscreen = not self._is_fullscreen
         if self._is_fullscreen:
             cv2.resizeWindow(window_name, self._screen_w, self._screen_h)
             cv2.moveWindow(window_name, 0, 0)
         else:
-            cv2.resizeWindow(window_name, self.config.camera.width, self.config.camera.height)
+            cv2.resizeWindow(window_name, self.stage.width, self.stage.height)
             cv2.moveWindow(window_name, 60, 60)
         logger.info(f"Visualizer window: {'FULLSCREEN' if self._is_fullscreen else 'windowed'}")
 
-    def _prepare_display_frame(self, frame: np.ndarray) -> np.ndarray:
-        """When in fake-fullscreen mode, scale the frame to fill the display
-        while preserving its aspect ratio, letterboxing any leftover space with
-        a themed dark color instead of leaving it to HighGUI's default fill."""
-        if not self._is_fullscreen:
-            return frame
-        h, w = frame.shape[:2]
-        scale = min(self._screen_w / w, self._screen_h / h)
-        new_w, new_h = max(1, int(w * scale)), max(1, int(h * scale))
-        resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-        canvas = np.full((self._screen_h, self._screen_w, 3), PALETTE["dark_glass_bg"], dtype=np.uint8)
-        x_off = (self._screen_w - new_w) // 2
-        y_off = (self._screen_h - new_h) // 2
-        canvas[y_off:y_off + new_h, x_off:x_off + new_w] = resized
-        return canvas
+    STAGE_HOTKEYS = [
+        ("v", "talk"), ("a", "auto demo"), ("c", "step"), ("r", "record"),
+        ("p", "adapt"), ("f", "ghost"), ("m", "stats"), ("k", "save"),
+        ("l", "load"), ("x", "reset"), ("i", "intent"), ("q", "quit"),
+    ]
+
+    # Composing at the full width of a 3440-pixel display costs more than the
+    # visible gain: the stage is built at most this wide and the window scales
+    # it, which still rasterises text far larger than the old 640-wide path did.
+    _MAX_STAGE_W = 1920
+
+    def _build_stage(self) -> Stage:
+        """Size the stage to the display's aspect, capped for cost."""
+        sw, sh = max(640, self._screen_w), max(480, self._screen_h)
+        width = min(sw, self._MAX_STAGE_W)
+        height = max(360, int(round(width * sh / sw)))
+        probe = Stage(width, height)
+        return Stage(width, height,
+                     telemetry_h=UIH.telemetry_height(probe.layout.scale),
+                     learning_h=UIH.learning_height(probe.layout.scale))
+
+    def _compose_stage(self, frame, *, fps, latency_ms, workflow_phase, phase_progress,
+                       parsed_intent, depth_heatmap, poses, gripper_cmd, reward_score,
+                       discrepancy_norm, policy_loss, benchmark_summary,
+                       target_label, has_replay) -> np.ndarray:
+        """Lay the annotated feed on the stage and draw the chrome around it."""
+        stage, L = self.stage, self.stage.layout
+        s = L.scale
+        self.motion.tick()
+
+        stage.compose_backdrop(frame)
+        stage.place_video(frame)
+
+        phase_value = workflow_phase.value
+        colour = UIH.phase_colour(phase_value)
+        title, body = self._status_message(workflow_phase, target_label, has_replay)
+        progress = None if workflow_phase == ExecutionPhase.IDLE else phase_progress
+
+        UIH.draw_telemetry_card(
+            stage, L.telemetry, self.motion, fps=fps, latency_ms=latency_ms,
+            phase_value=phase_value,
+            target=(parsed_intent.target_object if parsed_intent and parsed_intent.is_active
+                    else None),
+            voice_status=self._current_voice_status(),
+            adaptation_active=self.adaptation_active, reward=reward_score,
+            error=discrepancy_norm, loss=policy_loss, gripper=gripper_cmd,
+            robot_connected=self.robot.is_connected,
+            hand_conf=(poses[0].confidence if poses else None),
+            is_recording=self.recorder.is_recording,
+            recorded_frames=self.recorder.frame_count, scale=s)
+
+        UIH.draw_depth_card(stage, L.depth, depth_heatmap, s)
+        UIH.draw_hotkey_card(stage, L.hotkeys, self.STAGE_HOTKEYS, s)
+        if L.learning:
+            summary = benchmark_summary or {}
+            UIH.draw_learning_card(
+                stage, L.learning, trials=int(summary.get("total_trials", 0)),
+                init_err_mm=float(summary.get("initial_error_mm", 0.0)),
+                cur_err_mm=float(summary.get("latest_error_mm", 0.0)),
+                rewards=list(self._reward_history), scale=s)
+
+        UIH.draw_status_bar(stage, L.status, self.motion, title=title, body=body,
+                            colour=colour, progress=progress, scale=s)
+        UIH.draw_banner(stage.canvas, L.video, self.motion,
+                        title=UIH.phase_label(phase_value).title(),
+                        colour=colour, progress=progress, scale=s)
+        return stage.canvas
+
+    @staticmethod
+    def _status_message(phase: ExecutionPhase, target_label: str, has_replay: bool):
+        """Plain language for what to do right now."""
+        target = (target_label.replace("_", " ")
+                  if target_label and target_label.lower() not in ("none", "") else "an object")
+        foreseeing = (f"Watch a replay of your last attempt at the {target}, or press 'a'"
+                      if has_replay else f"First try - go with your best guess for the {target}")
+        return {
+            ExecutionPhase.IDLE: ("STANDBY", "Hold 'v' and say what to pick up, e.g. \"wine glass\""),
+            ExecutionPhase.FORESEEING: ("PREVIEWING", foreseeing),
+            ExecutionPhase.WAIT_USER: ("YOUR TURN", "Get in position and press 'c' - or 'a' for the demo"),
+            ExecutionPhase.USER_EXECUTING: ("GO", f"Reach for the {target} now - do it your way"),
+            ExecutionPhase.ADAPTING: ("REVIEW", "Here's a replay of what you just did"),
+            ExecutionPhase.RESTARTING: ("TRY AGAIN", f"Restarting with an improved plan for the {target}"),
+            ExecutionPhase.AUTONOMOUS_DEMO: ("AUTONOMOUS DEMO",
+                                             f"Simulating the grasp on the {target}"),
+        }.get(phase, ("STANDBY", "Hold 'v' and say what to pick up"))
 
     def toggle_tracker(self) -> None:
         """Toggle between MediaPipe live tracker and synthetic mock."""
@@ -1941,6 +1480,7 @@ class LocalClientRunner:
         rep = response.get_episode_report()
         if rep:
             self.last_episode_report = rep
+            self._reward_history.append(float(rep.episode_reward))
 
         self._remote_snapshot.update({
             "poses": response.get_hand_poses(),
@@ -2106,6 +1646,11 @@ class LocalClientRunner:
         self.setup_camera()
         self.setup_microphone()
         cv2.namedWindow(self.config.visualization.window_name, cv2.WINDOW_NORMAL)
+        # Open at the stage's own size. Sizing the window to the CAMERA's
+        # resolution left the composed widescreen stage squeezed into a 640x480
+        # box the moment the app started.
+        cv2.resizeWindow(self.config.visualization.window_name,
+                         self.stage.width, self.stage.height)
         self.robot.connect()
         if self.server_url:
             mode_str = f"REMOTE CLOUD GPU ({self.server_url})"
@@ -2246,6 +1791,7 @@ class LocalClientRunner:
                                 policy=self.local_policy
                             )
                             self.last_episode_report = rep
+                            self._reward_history.append(float(rep.episode_reward))
                             self.benchmark.record_trial(rep, intent=self.intent)
                             episode_offset = np.clip(
                                 np.array(rep.mean_wrist_offset, dtype=np.float32), -0.05, 0.05
@@ -2481,67 +2027,27 @@ class LocalClientRunner:
                     frame, replay_poses, real_poses=poses, reanchor=replay_reanchor, label=ghost_label,
                     target_bbox=bboxes[0] if bboxes else None, object_sprite=self._object_sprite
                 )
-                self.visualizer.draw_depth_pip(frame, depth_heatmap)
-                
-                # Render Stage Banner
-                self.visualizer.draw_workflow_banner(
-                    frame=frame,
-                    phase=workflow_phase,
-                    progress=phase_progress,
-                    step_idx=self.workflow.step_index,
-                    discrepancy_norm=discrepancy_norm,
-                    episode_report=self.last_episode_report
-                )
-                self.visualizer.draw_instruction_bar(
-                    frame=frame,
-                    phase=workflow_phase,
-                    target_label=(parsed_intent_resp.target_object if parsed_intent_resp else self.intent),
-                    has_replay=bool(self._last_completed_recording)
-                )
-
-                # Render Co-Adaptation Benchmark Panel
-                self.visualizer.draw_coadaptation_panel(frame, benchmark_summary)
-
-                label = "MOCK LOCAL" if self.mode == "mock_local" else f"MOCK REMOTE ({self.config.network.server_host}:{self.config.network.server_port})"
-                self.visualizer.draw_telemetry_hud(
-                    frame=frame,
-                    fps=fps,
-                    mode_str=label,
-                    tracker_name=self.tracker_name,
-                    intent=self.intent,
-                    workflow_phase=workflow_phase,
-                    phase_progress=phase_progress,
-                    parsed_intent=parsed_intent_resp,
-                    voice_status=self._current_voice_status(),
-                    foreseen_step=foreseen_step,
-                    latency_ms=latency_ms,
-                    poses=poses,
-                    bboxes=bboxes,
-                    gripper_cmd=gripper_cmd,
-                    residuals=residuals,
-                    reward_score=reward_score,
-                    discrepancy_norm=discrepancy_norm,
-                    adaptation_active=self.adaptation_active,
-                    buffer_steps=buffer_steps,
-                    is_recording=self.recorder.is_recording,
-                    recorded_frames=self.recorder.frame_count,
-                    robot_connected=self.robot.is_connected,
-                    policy_loss=policy_loss
-                )
-
-                # Always-on hotkey cheat sheet, docked below the glance card (skipped when the
-                # full telemetry dock is expanded, since it already fills the right column).
-                if not self.visualizer.show_telemetry_detail:
-                    self.visualizer.draw_hotkey_panel(frame, top_y=100)
-
-                # Simulated-lab reenactment, composited last so it sits above the
-                # HUD it temporarily replaces. Its own header and footer carry the
-                # phase progress and plan telemetry while it is open.
+                # The simulated-lab reenactment irises open over the camera
+                # image itself, so it is composited before the frame is placed
+                # on the stage and appears inside the video card.
                 self._update_lab_panel(frame, workflow_phase, phase_progress,
                                        foreseen_traj, bboxes)
 
-                # Display frame window
-                cv2.imshow(self.config.visualization.window_name, self._prepare_display_frame(frame))
+                # Chrome is drawn on the stage, not on the feed. The feed keeps
+                # only what is anchored to image content - the skeleton, the
+                # boxes, the ghost hand and the lab viewport.
+                display = self._compose_stage(
+                    frame,
+                    fps=fps, latency_ms=latency_ms, workflow_phase=workflow_phase,
+                    phase_progress=phase_progress, parsed_intent=parsed_intent_resp,
+                    depth_heatmap=depth_heatmap, poses=poses, gripper_cmd=gripper_cmd,
+                    reward_score=reward_score, discrepancy_norm=discrepancy_norm,
+                    policy_loss=policy_loss, benchmark_summary=benchmark_summary,
+                    target_label=(parsed_intent_resp.target_object
+                                  if parsed_intent_resp else self.intent),
+                    has_replay=bool(self._last_completed_recording),
+                )
+                cv2.imshow(self.config.visualization.window_name, display)
 
                 # Handle keyboard inputs
                 key = cv2.waitKey(1) & 0xFF
