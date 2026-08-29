@@ -208,7 +208,7 @@ class GeminiTranscriber(AudioTranscriberABC):
         api_key: str,
         model: str = "gemini-3.6-flash",
         sample_rate: int = 16000,
-        timeout: float = 8.0,
+        timeout: float = 20.0,
     ) -> None:
         self.api_key = api_key
         self.model = model
@@ -243,6 +243,10 @@ class GeminiTranscriber(AudioTranscriberABC):
             self._audio_buffer.clear()
 
         if not buffered:
+            # No audio captured at all - no microphone, or the device is muted.
+            # This is the dev-without-a-mic path the presets exist for, and is
+            # distinct from a request that failed on real recorded speech.
+            logger.warning("GeminiTranscriber: no audio captured; using a preset utterance.")
             return self._fallback.stop_listening()
 
         try:
@@ -252,8 +256,18 @@ class GeminiTranscriber(AudioTranscriberABC):
             logger.info(f"GeminiTranscriber: [TRANSCRIBED] -> '{transcript}'")
             return transcript if transcript else "idle"
         except Exception as e:
-            logger.error(f"GeminiTranscriber: transcription failed ({e}); falling back.")
-            return self._fallback.stop_listening()
+            # Do NOT fall back to the mock here. Its presets are plausible
+            # sentences ("foresee me picking this remote control"), so a failed
+            # request used to hand back a fabricated utterance that was
+            # indistinguishable from a real one in the logs and on screen - the
+            # system would confidently chase an object the user never named, and
+            # the intent embedding would encode a sentence they never said.
+            # An empty transcript leaves the current target untouched instead.
+            logger.error(
+                f"GeminiTranscriber: transcription failed ({e}). Reporting no "
+                f"transcript rather than guessing - say it again."
+            )
+            return ""
 
     def transcribe_stream(self, audio_chunk: bytes) -> Optional[str]:
         if not self._listening:

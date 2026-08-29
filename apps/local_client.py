@@ -1224,7 +1224,6 @@ class LocalVisualizer:
 
         target_obj = (parsed_intent.target_object if parsed_intent and parsed_intent.is_active
                       else "standby")
-        listening = voice_status == "LISTENING"
         r_col = (PALETTE["neon_green"] if reward_score > 0.5
                  else PALETTE["amber_gold"] if reward_score > 0.0 else PALETTE["laser_red"])
 
@@ -1232,8 +1231,11 @@ class LocalVisualizer:
             ("sec", "SESSION"),
             ("chip", "stage", phase_short, p_col),
             ("row", "target", target_obj[:15], PALETTE["amber_gold"]),
-            ("row", "voice", "listening" if listening else "push 'v'",
-             PALETTE["cyan_electric"] if listening else PALETTE["text_dim"]),
+            ("row", "voice", *{
+                "LISTENING": ("listening", PALETTE["cyan_electric"]),
+                "TRANSCRIBING": ("transcribing", PALETTE["amber_gold"]),
+                "FAILED": ("not heard - retry", PALETTE["laser_red"]),
+            }.get(voice_status, ("push 'v'", PALETTE["text_dim"]))),
             ("rule",),
             ("sec", "ADAPTATION"),
             ("row", "learning", "online" if adaptation_active else "paused",
@@ -1486,6 +1488,7 @@ class LocalClientRunner:
         self.safety_monitor = SafetyMonitor(dof=7)
         
         self.voice_status = "IDLE"
+        self._voice_status_until = 0.0
         self.current_parsed_intent = self.intent_parser.parse_intent(self.intent)
         self.last_episode_report: Optional[EpisodeDiscrepancyReport] = None
         self._control_cmd_to_send: Optional[str] = None
@@ -1607,12 +1610,26 @@ class LocalClientRunner:
         else:
             self.voice_status = "TRANSCRIBING"
             transcript = self.transcriber.stop_listening()
+            if not transcript:
+                # The transcriber declined to guess. Say so on the HUD rather
+                # than silently leaving the old target in place.
+                logger.warning("Voice Mode: nothing transcribed - target unchanged.")
+                self.voice_status = "FAILED"
+                self._voice_status_until = time.time() + 4.0
+                return
             if transcript:
                 self.intent = transcript
                 self.current_parsed_intent = self.intent_parser.parse_intent(transcript)
                 self.workflow.trigger_intent(self.current_parsed_intent.target_object if self.current_parsed_intent.is_active else "none")
                 logger.info(f"Voice Mode Transcribed: '{transcript}' -> Target: {self.current_parsed_intent.target_object}")
             self.voice_status = "IDLE"
+
+    def _current_voice_status(self) -> str:
+        """Voice status for display, expiring any transient notice."""
+        if self._voice_status_until and time.time() > self._voice_status_until:
+            self.voice_status = "IDLE"
+            self._voice_status_until = 0.0
+        return self.voice_status
 
     def toggle_voice_guidance(self) -> None:
         """Toggle spoken workflow guidance (announcements on each phase transition)."""
@@ -2495,7 +2512,7 @@ class LocalClientRunner:
                     workflow_phase=workflow_phase,
                     phase_progress=phase_progress,
                     parsed_intent=parsed_intent_resp,
-                    voice_status=self.voice_status,
+                    voice_status=self._current_voice_status(),
                     foreseen_step=foreseen_step,
                     latency_ms=latency_ms,
                     poses=poses,
