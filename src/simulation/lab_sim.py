@@ -246,6 +246,10 @@ class LabSimulator:
         self._contact_override: Optional[int] = None
         self._is_demonstration = False
         self._timestamps: Optional[np.ndarray] = None
+        # Step count of whatever is staged. NOT len(trajectory.waypoints): a
+        # recorded demonstration has no trajectory, and reading through one
+        # crashed the render loop the first time a demonstration was played.
+        self._num_steps = 0
         self._hand_paths_lab: Optional[np.ndarray] = None      # (T, 21, 3)
         self._object_path_lab: Optional[np.ndarray] = None     # (T, 3)
         self._ready = False
@@ -412,6 +416,7 @@ class LabSimulator:
         self.transform = LabTransform(origin_cam=origin_cam, anchor_lab=anchor_lab,
                                       scale=scale)
 
+        self._num_steps = int(len(raw_kpts))
         self._hand_paths_lab = self.transform(raw_kpts.reshape(-1, 3)).reshape(raw_kpts.shape)
         self._object_path_lab = self.transform(object_path_cam)
         # Keep the staged object from sinking through or floating above the bench:
@@ -560,6 +565,8 @@ class LabSimulator:
         """
         if self._contact_override is not None:
             return int(self._contact_override)
+        if self.trajectory is None:
+            return max(self._num_steps // 2, 0)
         contacts = np.array([float(np.mean(wp.contact_state))
                              for wp in self.trajectory.waypoints], dtype=np.float32)
         closed = np.flatnonzero(contacts >= 0.98)
@@ -642,7 +649,7 @@ class LabSimulator:
         however smoothly the progress itself advances; callers interpolate
         between the neighbouring waypoints instead.
         """
-        n = len(self.trajectory.waypoints) if self.trajectory else 1
+        n = max(self._num_steps, 1)
         # Hold the finished grasp for a FIXED beat rather than a fixed fraction:
         # a proportion that reads as a pause at six seconds reads as dead air at
         # twelve.
@@ -692,28 +699,51 @@ class LabSimulator:
         return visible / float(self.width * self.height)
 
     def telemetry(self, step: float) -> Dict[str, float]:
-        """Per-step numbers for the caller's HUD - all from the real plan.
+        """Per-step numbers for the caller's HUD.
 
-        Accepts the same fractional index the renderer uses; the discrete fields
-        (step number, contact) come from the nearest waypoint, while the
-        continuous ones are interpolated so they do not visibly tick.
+        A generated plan states its own gripper aperture and per-fingertip
+        contact. A recorded demonstration states neither - a hand tracker
+        reports joints, not grip force - so those are DERIVED from the geometry:
+        aperture from how far the fingertips have closed relative to their
+        widest spread in the recording, contact from proximity to the object.
+        Derived, and labelled as such here, rather than presented as measured.
         """
-        if not self.trajectory or not self.trajectory.waypoints:
+        if self._num_steps == 0:
             return {}
-        n = len(self.trajectory.waypoints)
+        n = self._num_steps
         idx = int(np.clip(round(step), 0, n - 1))
-        wp = self.trajectory.waypoints[idx]
-        grip = float(np.interp(step, np.arange(n),
-                               [w.gripper_aperture for w in self.trajectory.waypoints]))
+
         lifted = float(self._lerp_along(self._object_path_lab, step)[1])
-        return {
+        common = {
             "step": idx + 1,
             "num_steps": n,
-            "sim_time": float(wp.time_offset),
-            "gripper": grip,
-            "contact": float(np.mean(wp.contact_state)),
             "lift_cm": float(max(0.0, lifted - self._object_path_lab[0, 1]) * 100.0),
         }
+
+        if self.trajectory is not None:
+            wp = self.trajectory.waypoints[idx]
+            grip = float(np.interp(step, np.arange(n),
+                                   [w.gripper_aperture for w in self.trajectory.waypoints]))
+            common.update(sim_time=float(wp.time_offset), gripper=grip,
+                          contact=float(np.mean(wp.contact_state)))
+            return common
+
+        tips = self._hand_paths_lab[:, _FINGERTIPS]
+        spread = np.linalg.norm(tips.max(axis=1) - tips.min(axis=1), axis=1)
+        widest = float(spread.max())
+        here = float(self._lerp_along(spread[:, None], step)[0])
+        grip = float(np.clip(1.0 - here / max(widest, 1e-6), 0.0, 1.0))
+
+        reach = float(np.linalg.norm(
+            self._lerp_along(tips.mean(axis=1), step)
+            - self._lerp_along(self._object_path_lab, step)))
+        contact = float(np.clip(1.0 - reach / max(float(self.object_size.max()), 1e-3),
+                                0.0, 1.0))
+        when = (float(self._lerp_along(self._timestamps[:, None], step)[0]
+                      - self._timestamps[0])
+                if self._timestamps is not None and len(self._timestamps) == n else 0.0)
+        common.update(sim_time=when, gripper=grip, contact=contact)
+        return common
 
     def _hand_mesh_for(self, step: float) -> Mesh:
         return HM.build_hand_mesh(
@@ -798,7 +828,7 @@ class LabSimulator:
             return None
         t0 = time.perf_counter()
 
-        step = float(np.clip(step, 0.0, len(self.trajectory.waypoints) - 1))
+        step = float(np.clip(step, 0.0, max(self._num_steps - 1, 0)))
         key = (round(step, 3), round(push_in, 3))
         if self._last_image is not None:
             if key == self._last_key:

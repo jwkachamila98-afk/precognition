@@ -929,3 +929,61 @@ def test_authored_profile_overrides_the_canonical_class_shape():
         assert h == pytest.approx(0.25, abs=0.01), "authored profile not scaled to the staged size"
     finally:
         forget_authored_profiles()
+
+
+def test_a_demonstration_renders_end_to_end():
+    """Staging a recording is not enough - it has to survive the render loop.
+
+    This is the gap that crashed live: render(), step_for_progress() and
+    telemetry() all still read len(self.trajectory.waypoints) for the step
+    count, and a demonstration has no trajectory. Staging was tested; playing
+    was not.
+    """
+    centre = np.array([0.02, 0.03, 0.50], np.float32)
+    bbox = BoundingBox3D(label="remote control", center=centre,
+                         size=np.array([0.05, 0.02, 0.17], dtype=np.float32))
+    poses = _synthetic_recording(centre, n=90)
+    sim = LabSimulator(width=192, height=144)
+    assert sim.prepare_from_demonstration(poses, bbox, None)
+    assert sim.trajectory is None, "a demonstration must not fabricate a trajectory"
+    assert sim._num_steps == len(poses)
+
+    seen = set()
+    for p in np.linspace(0.0, 1.0, 15):
+        pos = sim.step_for_progress(p)
+        assert 0.0 <= pos <= sim._num_steps - 1
+        seen.add(round(pos))
+        sim._last_render_t = 0.0
+        img = sim.render(pos, elapsed=p * 12.0, push_in=p)
+        assert img is not None and img.shape == (sim.height, sim.width, 3)
+
+        tel = sim.telemetry(pos)
+        assert 1 <= tel["step"] <= sim._num_steps
+        assert 0.0 <= tel["gripper"] <= 1.0
+        assert 0.0 <= tel["contact"] <= 1.0
+
+    assert len(seen) > 8, "playback barely advanced through the recording"
+
+
+def test_demonstration_playback_spans_the_whole_recording():
+    """A 363-step recording must play across all of it, not the first frame or
+    two - step_for_progress previously fell back to a single step without a
+    trajectory to measure against."""
+    centre = np.array([0.02, 0.03, 0.50], np.float32)
+    bbox = BoundingBox3D(label="coffee cup", center=centre,
+                         size=np.array([0.09, 0.09, 0.09], dtype=np.float32))
+    poses = _synthetic_recording(centre, n=363)
+    sim = LabSimulator(width=96, height=72)
+    assert sim.prepare_from_demonstration(poses, bbox, None)
+    assert sim.step_for_progress(1.0) == pytest.approx(362.0, abs=1.0)
+
+
+def test_derived_grip_closes_over_a_recording():
+    """A hand tracker reports joints, not grip force, so aperture is derived
+    from the fingertips closing. It must still behave like a grip."""
+    centre = np.array([0.02, 0.03, 0.50], np.float32)
+    bbox = BoundingBox3D(label="coffee cup", center=centre,
+                         size=np.array([0.09, 0.09, 0.09], dtype=np.float32))
+    sim = LabSimulator(width=96, height=72)
+    assert sim.prepare_from_demonstration(_synthetic_recording(centre), bbox, None)
+    assert sim.telemetry(sim._num_steps - 1)["gripper"] > sim.telemetry(0)["gripper"]
