@@ -948,8 +948,12 @@ def test_a_demonstration_renders_end_to_end():
     assert sim.trajectory is None, "a demonstration must not fabricate a trajectory"
     assert sim._num_steps == len(poses)
 
+    # Sample within the window the recording actually occupies: at real speed a
+    # 3-second recording in a 12-second demo plays out in the first quarter and
+    # then holds, which is correct, not a stall.
     seen = set()
-    for p in np.linspace(0.0, 1.0, 15):
+    span = max(float(poses[-1].timestamp - poses[0].timestamp), 0.1)
+    for p in np.linspace(0.0, span / sim.demo_duration_sec, 15):
         pos = sim.step_for_progress(p)
         assert 0.0 <= pos <= sim._num_steps - 1
         seen.add(round(pos))
@@ -965,17 +969,46 @@ def test_a_demonstration_renders_end_to_end():
     assert len(seen) > 8, "playback barely advanced through the recording"
 
 
-def test_demonstration_playback_spans_the_whole_recording():
-    """A 363-step recording must play across all of it, not the first frame or
-    two - step_for_progress previously fell back to a single step without a
-    trajectory to measure against."""
+def test_demonstration_plays_at_the_speed_it_was_performed():
+    """Wall-clock elapsed maps 1:1 onto recorded time, so a slow reach looks slow.
+
+    Compressing a whole recording into the demo window played a 552-step, ~55 s
+    attempt at roughly five times real speed - which misrepresents the very
+    thing a replay of the user's own motion exists to show.
+    """
     centre = np.array([0.02, 0.03, 0.50], np.float32)
     bbox = BoundingBox3D(label="coffee cup", center=centre,
                          size=np.array([0.09, 0.09, 0.09], dtype=np.float32))
-    poses = _synthetic_recording(centre, n=363)
+    poses = _synthetic_recording(centre, n=120)          # 30 fps -> ~4 s
     sim = LabSimulator(width=96, height=72)
+    sim.demo_duration_sec = 12.0
     assert sim.prepare_from_demonstration(poses, bbox, None)
-    assert sim.step_for_progress(1.0) == pytest.approx(362.0, abs=1.0)
+
+    for seconds in (1.0, 2.0, 3.0):
+        pos = sim.step_for_progress(seconds / sim.demo_duration_sec)
+        assert pos == pytest.approx(seconds * 30.0, abs=2.0), \
+            f"{seconds}s in should be ~{seconds*30:.0f} frames in, got {pos:.0f}"
+
+    # Past the end of the recording it holds on the last frame rather than
+    # running off or looping.
+    assert sim.step_for_progress(1.0) == pytest.approx(sim._num_steps - 1, abs=1.0)
+
+
+def test_a_long_recording_is_trimmed_around_the_grasp():
+    """A recording longer than the demo window keeps the part carrying the
+    grasp, at its own pace, rather than being squeezed in whole."""
+    centre = np.array([0.02, 0.03, 0.50], np.float32)
+    bbox = BoundingBox3D(label="coffee cup", center=centre,
+                         size=np.array([0.09, 0.09, 0.09], dtype=np.float32))
+    poses = _synthetic_recording(centre, n=1500)         # 30 fps -> 50 s
+    sim = LabSimulator(width=96, height=72)
+    sim.demo_duration_sec = 12.0
+    assert sim.prepare_from_demonstration(poses, bbox, None)
+
+    kept = sim._timestamps[-1] - sim._timestamps[0]
+    assert kept <= sim.demo_duration_sec + 0.5, f"kept {kept:.1f}s, window is 12s"
+    assert kept > 6.0, "trimmed far more than necessary"
+    assert 0 < sim._contact_step() < sim._num_steps - 1, "the grasp fell outside the window"
 
 
 def test_derived_grip_closes_over_a_recording():

@@ -73,6 +73,10 @@ _HAND_APPROACH_OFFSET_DEG = 330.0
 # How long the completed grasp is held on screen once the plan has played out.
 _END_HOLD_SEC = 1.4
 
+# When a recording must be trimmed, how much of the window sits before contact.
+# Weighted after it: the reach is context, the carry is the point.
+_PRE_CONTACT_SHARE = 0.40
+
 # The lab camera is LOCKED: one pose, identical for every demo, regardless of
 # object or plan. Framing the shot adaptively made each reenactment look like a
 # different scene - the viewer had to re-read the geometry every time before
@@ -328,6 +332,31 @@ class LabSimulator:
         object_path_cam = np.tile(centre, (len(kpts), 1)).astype(np.float32)
         object_path_cam[contact:] += hand_ref[contact:] - hand_ref[contact]
 
+        # A recording can run a minute or more; the demo window is twelve seconds.
+        # Squeezing the whole thing in plays it at five times real speed, which
+        # misrepresents the very thing the replay exists to show. Keep the part
+        # that carries the grasp, at its own pace, and drop the rest.
+        stamps = np.array([p.timestamp for p in recorded_poses], dtype=np.float32)
+        if len(stamps) > 1 and float(stamps[-1] - stamps[0]) > 0.0:
+            budget = max(self.demo_duration_sec - _END_HOLD_SEC, 1.0)
+            duration = float(stamps[-1] - stamps[0])
+            if duration > budget:
+                t_contact = float(stamps[contact])
+                lo_t = t_contact - budget * _PRE_CONTACT_SHARE
+                lo = int(np.searchsorted(stamps, lo_t, side="left"))
+                lo = int(np.clip(lo, 0, max(len(stamps) - 8, 0)))
+                hi = int(np.searchsorted(stamps, stamps[lo] + budget, side="right"))
+                hi = int(np.clip(hi, lo + 8, len(stamps)))
+                logger.info(
+                    f"LabSimulator: recording runs {duration:.1f}s; replaying "
+                    f"{float(stamps[min(hi, len(stamps)-1)] - stamps[lo]):.1f}s around the "
+                    f"grasp at real speed rather than compressing all of it."
+                )
+                kpts = kpts[lo:hi]
+                object_path_cam = object_path_cam[lo:hi]
+                stamps = stamps[lo:hi]
+                contact = int(np.clip(contact - lo, 0, len(kpts) - 1))
+
         self._contact_override = contact
         return self._stage(
             raw_kpts=kpts,
@@ -336,7 +365,7 @@ class LabSimulator:
             target_bbox=target_bbox,
             sprite=sprite,
             source="your recorded demonstration",
-            timestamps=np.array([p.timestamp for p in recorded_poses], dtype=np.float32),
+            timestamps=stamps,
         )
 
     def prepare(self, trajectory: Optional[ForeseenTrajectory],
@@ -650,6 +679,16 @@ class LabSimulator:
         between the neighbouring waypoints instead.
         """
         n = max(self._num_steps, 1)
+
+        if self._is_demonstration and self._timestamps is not None and n > 1:
+            # Real speed: wall-clock elapsed maps straight onto recorded time, so
+            # a slow reach looks slow. No easing - the recording already carries
+            # its own acceleration, and smoothing it again would be editing it.
+            elapsed = float(np.clip(progress, 0.0, 1.0)) * max(self.demo_duration_sec, 0.1)
+            return float(np.clip(
+                np.interp(self._timestamps[0] + elapsed, self._timestamps, np.arange(n)),
+                0.0, n - 1))
+
         # Hold the finished grasp for a FIXED beat rather than a fixed fraction:
         # a proportion that reads as a pause at six seconds reads as dead air at
         # twelve.
