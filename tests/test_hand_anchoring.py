@@ -126,3 +126,50 @@ def test_reward_still_separates_a_good_attempt_from_a_bad_one():
     bad = _reward_for(centre, (0.25, 0.0, 0.0)).episode_reward
     assert perfect > sloppy > bad, f"not ordered: {perfect:.3f} {sloppy:.3f} {bad:.3f}"
     assert perfect - bad > 0.8, "reward has too little range to learn from"
+
+
+def test_the_lab_replay_finds_the_real_moment_of_grasp():
+    """A consequence of anchoring, and the reason the reenactment used to grasp
+    at the wrong moment.
+
+    The lab picks its contact frame as the one where the fingertips come closest
+    to the object in 3-D. With every hand pinned to the optical axis that
+    comparison was meaningless - on this recording it chose frame 3 of 90, before
+    the reach had begun - so the ghost hand closed on nothing and the object
+    began moving far too early.
+    """
+    from src.mocks.mock_trajectory_diffusion import MockTrajectoryDiffusion
+    from src.simulation.lab_sim import LabSimulator
+
+    gen = MockTrajectoryDiffusion()
+    centre = np.array([0.30, 0.0, 0.55], np.float32)
+    frames, grasp_at = 90, 60
+
+    # A reach that settles into a real grasp pose - the wrist stops short of the
+    # object, as a hand actually does - holds, then lifts away.
+    grasp_wrist = gen._solve_grasp_wrist(centre, np.array([-0.28, -0.18, 0.0], np.float32))
+    world = []
+    for i in range(frames):
+        if i <= grasp_at:
+            approach = 1.0 - i / float(grasp_at)
+            wrist = grasp_wrist + np.array([-0.28, -0.20, -0.10], np.float32) * approach
+        else:
+            lift = (i - grasp_at) / float(frames - grasp_at)
+            wrist = grasp_wrist + np.array([0.0, -0.14, 0.02], np.float32) * lift
+        world.append(gen._generate_hand_keypoints_3d(
+            wrist.astype(np.float32), gen._rot_grasp, 0.15 if i < grasp_at else 0.55))
+
+    t = _tracker()
+    poses = [HandPose(hand_id=0, side=HandSide.RIGHT,
+                      keypoints_3d=t._anchor_in_camera_frame(*_as_mediapipe_gives_it(k),
+                                                             width=WIDTH, height=HEIGHT),
+                      keypoints_2d=np.zeros((21, 2), np.float32), confidence=1.0,
+                      timestamp=1788038400.0 + i / 30.0)
+             for i, k in enumerate(world)]
+
+    sim = LabSimulator(width=96, height=72)
+    bbox = BoundingBox3D(label="cup", center=centre,
+                         size=np.array([0.09, 0.09, 0.09], np.float32))
+    assert sim.prepare_from_demonstration(poses, bbox, None)
+    assert abs(sim._contact_step() - grasp_at) <= 6, \
+        f"grasp detected at frame {sim._contact_step()}, actually at {grasp_at}"
