@@ -1794,10 +1794,15 @@ class LocalClientRunner:
                             self._reward_history.append(float(rep.episode_reward))
                             self.benchmark.record_trial(rep, intent=self.intent)
                             episode_offset = np.clip(
-                                np.array(rep.mean_wrist_offset, dtype=np.float32), -0.05, 0.05
+                                np.array(rep.grasp_wrist_offset, dtype=np.float32), -0.05, 0.05
                             )
                             self._local_learned_wrist_bias = np.clip(
-                                0.6 * self._local_learned_wrist_bias + 0.4 * episode_offset, -0.05, 0.05
+                                # Accumulate: episode_offset is the residual left
+                                # after the current bias, not the total. See the
+                                # note in ws_server on why averaging toward it
+                                # stalls at half the user's real offset.
+                                self._local_learned_wrist_bias + 0.4 * episode_offset,
+                                -0.05, 0.05
                             )
                             self._cached_foreseen_traj = None
                             self._local_adaptation_computed_this_episode = True

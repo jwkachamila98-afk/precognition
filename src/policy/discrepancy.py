@@ -32,6 +32,12 @@ class DiscrepancyState:
         }
 
 
+# Share of the rollout treated as the closing approach for the co-adaptation
+# signal. The planner biases the grasp waypoint, so the feedback is measured
+# over the final stretch that actually converges on it.
+_GRASP_WINDOW_SHARE = 0.30
+
+
 @dataclass
 class EpisodeDiscrepancyReport:
     """Comprehensive compilation of an executed manipulation episode against foreseen rollout."""
@@ -48,6 +54,13 @@ class EpisodeDiscrepancyReport:
     # episode. This is the actual co-adaptation signal: the direction the next foreseen
     # plan should shift to better match how this user really moves, not just a scalar
     # error magnitude.
+    grasp_wrist_offset: List[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
+    # The same offset measured over the closing approach only. The planner applies its
+    # learned bias to the GRASP waypoint alone - the start of the reach comes from the
+    # user's own live hand and needs no correction - so feeding back an average over
+    # the whole trajectory corrects with a signal diluted by the unbiased first half.
+    # The loop then converges to a fixed point that leaves roughly half the offset
+    # standing. Measuring where the correction is actually applied closes that gap.
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -59,7 +72,8 @@ class EpisodeDiscrepancyReport:
             "num_steps_sim": int(self.num_steps_sim),
             "num_steps_real": int(self.num_steps_real),
             "policy_loss_delta": float(self.policy_loss_delta),
-            "mean_wrist_offset": [float(v) for v in self.mean_wrist_offset]
+            "mean_wrist_offset": [float(v) for v in self.mean_wrist_offset],
+            "grasp_wrist_offset": [float(v) for v in self.grasp_wrist_offset]
         }
 
     @classmethod
@@ -73,7 +87,11 @@ class EpisodeDiscrepancyReport:
             num_steps_sim=int(data.get("num_steps_sim", 60)),
             num_steps_real=int(data.get("num_steps_real", 0)),
             policy_loss_delta=float(data.get("policy_loss_delta", 0.0)),
-            mean_wrist_offset=list(data.get("mean_wrist_offset", [0.0, 0.0, 0.0]))
+            mean_wrist_offset=list(data.get("mean_wrist_offset", [0.0, 0.0, 0.0])),
+            # Older reports carry no grasp-region offset; fall back to the episode
+            # mean so a checkpoint written before this existed still adapts.
+            grasp_wrist_offset=list(data.get("grasp_wrist_offset",
+                                             data.get("mean_wrist_offset", [0.0, 0.0, 0.0])))
         )
 
 
@@ -333,6 +351,13 @@ class DiscrepancyEngine(DiscrepancyEngineABC):
         # to shift the NEXT foreseen plan toward how this user really moves their hand.
         wrist_offset = np.mean(aligned_real_kpts[:, 0, :] - sim_kpts_seq[:, 0, :], axis=0)
 
+        # Measured over the closing approach, where the planner actually applies
+        # its learned bias. See grasp_wrist_offset on the report for why the
+        # episode-wide mean under-corrects.
+        grasp_from = max(0, int(N_sim * (1.0 - _GRASP_WINDOW_SHARE)))
+        grasp_offset = np.mean(
+            aligned_real_kpts[grasp_from:, 0, :] - sim_kpts_seq[grasp_from:, 0, :], axis=0)
+
         # 5. Cumulative Episode Reward Formulation
         # R_episode in [-1.0, +1.0]
         alignment_term = np.exp(-4.0 * mean_pose_err)
@@ -364,5 +389,6 @@ class DiscrepancyEngine(DiscrepancyEngineABC):
             num_steps_sim=N_sim,
             num_steps_real=K_real,
             policy_loss_delta=loss_delta,
-            mean_wrist_offset=wrist_offset.tolist()
+            mean_wrist_offset=wrist_offset.tolist(),
+            grasp_wrist_offset=grasp_offset.tolist()
         )

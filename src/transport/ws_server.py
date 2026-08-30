@@ -334,12 +334,25 @@ class WSInferenceServer:
                         # Fold this episode's directional error into the accumulated
                         # co-adaptation bias (EMA across iterations, clamped so one noisy
                         # attempt can't send the plan drifting).
+                        # Measured over the closing approach, which is where the
+                        # planner applies this bias. The episode-wide mean is
+                        # diluted by the unbiased first half of the reach, and
+                        # feeding it back leaves about half the offset standing.
                         episode_offset = np.clip(
-                            np.array(rep.mean_wrist_offset, dtype=np.float32),
+                            np.array(rep.grasp_wrist_offset, dtype=np.float32),
                             -self._BIAS_MAX_METERS, self._BIAS_MAX_METERS
                         )
+                        # ACCUMULATE the correction; do not average toward it.
+                        # episode_offset is what remains AFTER the current bias
+                        # was applied, so blending the bias toward it treats a
+                        # residual as if it were the total. That is a
+                        # proportional controller: with the planner cancelling
+                        # the offset one-for-one, its fixed point sits at half
+                        # the user's actual offset and the rest never goes away.
+                        # Adding the residual makes it integral, and the fixed
+                        # point is where the residual reaches zero.
                         self._learned_wrist_bias = np.clip(
-                            (1.0 - self._BIAS_EMA_ALPHA) * self._learned_wrist_bias + self._BIAS_EMA_ALPHA * episode_offset,
+                            self._learned_wrist_bias + self._BIAS_EMA_ALPHA * episode_offset,
                             -self._BIAS_MAX_METERS, self._BIAS_MAX_METERS
                         )
 
