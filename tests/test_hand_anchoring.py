@@ -173,3 +173,24 @@ def test_the_lab_replay_finds_the_real_moment_of_grasp():
     assert sim.prepare_from_demonstration(poses, bbox, None)
     assert abs(sim._contact_step() - grasp_at) <= 6, \
         f"grasp detected at frame {sim._contact_step()}, actually at {grasp_at}"
+
+
+def test_both_tracker_backends_share_one_anchoring_implementation():
+    """There are two MediaPipe backends. The anchoring was written twice, the
+    server used the copy that was NOT fixed, and the whole repair silently did
+    nothing in production - the logs showed MediaPipeTasksHandTracker while the
+    fix sat in MediaPipeHandTracker. One implementation, imported by both.
+    """
+    import inspect
+    from src.perception import hand_anchoring, mediapipe_tasks_hand_tracker
+    from src.perception import mediapipe_tracker as mp_tracker
+
+    for module in (mp_tracker, mediapipe_tasks_hand_tracker):
+        source = inspect.getsource(module)
+        assert "anchor_hand" in source, f"{module.__name__} does not anchor its hands"
+        # The exact shape of the original bug: a constant pasted into depth.
+        assert "0.50 + wlm.z" not in source, \
+            f"{module.__name__} still pins world landmarks to a fixed depth"
+
+    assert mp_tracker.anchor_hand is hand_anchoring.anchor_hand
+    assert mediapipe_tasks_hand_tracker.anchor_hand is hand_anchoring.anchor_hand

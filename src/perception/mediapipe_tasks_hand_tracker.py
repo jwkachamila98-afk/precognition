@@ -16,6 +16,8 @@ import certifi
 import cv2
 import numpy as np
 
+from src.perception.hand_anchoring import DEFAULT_HFOV_DEG, anchor_hand
+
 from src.perception.hand_tracker import (
     HandPose,
     HandSide,
@@ -37,7 +39,9 @@ class MediaPipeTasksHandTracker(HandTrackerABC):
         max_num_hands: int = 2,
         min_detection_confidence: float = 0.45,
         min_tracking_confidence: float = 0.45,
+        horizontal_fov_deg: float = DEFAULT_HFOV_DEG,
     ) -> None:
+        self.horizontal_fov_deg = float(horizontal_fov_deg)
         from mediapipe.tasks import python as mp_tasks
         from mediapipe.tasks.python import vision
         import mediapipe as mp
@@ -89,10 +93,17 @@ class MediaPipeTasksHandTracker(HandTrackerABC):
             kpts_3d = np.zeros((21, 3), dtype=np.float32)
             if result.hand_world_landmarks and idx < len(result.hand_world_landmarks):
                 world_lms = result.hand_world_landmarks[idx]
+                local = np.empty((21, 3), dtype=np.float32)
                 for j_idx, wlm in enumerate(world_lms):
-                    kpts_3d[j_idx, 0] = wlm.x
-                    kpts_3d[j_idx, 1] = -wlm.y
-                    kpts_3d[j_idx, 2] = 0.50 + wlm.z
+                    # World landmarks are metric but relative to the HAND's own
+                    # centre. Convert to the camera convention (Y down).
+                    local[j_idx] = (wlm.x, -wlm.y, wlm.z)
+                local -= local.mean(axis=0)
+                # Recover where the hand actually is. Pasting a constant depth
+                # here - as this did - pins every hand to the optical axis and
+                # discards its position, which silently wrecks every comparison
+                # against a plan authored at the object. See hand_anchoring.
+                kpts_3d = anchor_hand(local, kpts_2d, w, h, self.horizontal_fov_deg)
             else:
                 for j_idx, lm in enumerate(hand_lms):
                     kpts_3d[j_idx, 0] = (lm.x - 0.5) * 0.4

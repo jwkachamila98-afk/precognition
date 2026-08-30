@@ -5,6 +5,8 @@ from typing import List, Optional
 import cv2
 import numpy as np
 
+from src.perception.hand_anchoring import DEFAULT_HFOV_DEG, anchor_hand
+
 from src.perception.hand_tracker import (
     HandPose,
     HandSide,
@@ -31,7 +33,7 @@ class MediaPipeHandTracker(HandTrackerABC):
         min_detection_confidence: float = 0.45,
         min_tracking_confidence: float = 0.45,
         model_complexity: int = 0,  # 0 = fastest / lightest CPU profile for Intel Mac
-        horizontal_fov_deg: float = 60.0,
+        horizontal_fov_deg: float = DEFAULT_HFOV_DEG,
     ) -> None:
         if not MEDIAPIPE_AVAILABLE:
             raise ImportError(
@@ -57,58 +59,11 @@ class MediaPipeHandTracker(HandTrackerABC):
         )
 
 
-    # A hand nearer than this is touching the lens; further and it is out of the
-    # workspace. Outside the band the size-based estimate is not believable.
-    _MIN_DEPTH_M = 0.15
-    _MAX_DEPTH_M = 1.60
-    _NOMINAL_DEPTH_M = 0.50
-
     def _anchor_in_camera_frame(
         self, local: np.ndarray, kpts_2d: np.ndarray, width: int, height: int
     ) -> np.ndarray:
-        """Place hand-centred metric landmarks at their true camera-frame position.
-
-        MediaPipe hands its metric landmarks back relative to the hand's own
-        geometric centre; where the hand IS in the scene has to be recovered
-        separately, and it is exactly what the reward and the co-adaptation
-        signal need.
-
-        This is a pose-from-correspondences problem: the metric shape is known,
-        its projection is observed, and the rigid transform between them is
-        wanted - so it is solved as one. A simpler apparent-size estimate
-        (Z = f x metres / pixels) was tried first and is biased, because it
-        assumes the measured span lies on the optical axis; off to one side it
-        over-estimated depth by up to 20 cm at 40 cm off-centre, which is the
-        very regime that matters here.
-        """
-        f_px = (0.5 * width) / np.tan(np.radians(self.horizontal_fov_deg) * 0.5)
-        K = np.array([[f_px, 0.0, width * 0.5],
-                      [0.0, f_px, height * 0.5],
-                      [0.0, 0.0, 1.0]], dtype=np.float64)
-
-        ok, rvec, tvec = False, None, None
-        try:
-            ok, rvec, tvec = cv2.solvePnP(
-                local.astype(np.float64), kpts_2d.astype(np.float64), K, None,
-                flags=cv2.SOLVEPNP_SQPNP)
-        except cv2.error:
-            ok = False
-
-        depth_ok = tvec is not None and self._MIN_DEPTH_M <= float(tvec.reshape(-1)[2]) <= self._MAX_DEPTH_M
-        if ok and depth_ok:
-            R, _ = cv2.Rodrigues(rvec)
-            return (local.astype(np.float64) @ R.T + tvec.reshape(1, 3)).astype(np.float32)
-
-        # No usable solution - the hand is too foreshortened, too small or too
-        # blurred to localise. Sit it at the nominal working distance on the ray
-        # through its own centre, which is still better than the optical axis.
-        centre_px = kpts_2d.mean(axis=0)
-        depth = self._NOMINAL_DEPTH_M
-        out = local.copy()
-        out[:, 0] += (float(centre_px[0]) - width * 0.5) * depth / f_px
-        out[:, 1] += (float(centre_px[1]) - height * 0.5) * depth / f_px
-        out[:, 2] += depth
-        return out.astype(np.float32)
+        """Place hand-centred metric landmarks at their true camera position."""
+        return anchor_hand(local, kpts_2d, width, height, self.horizontal_fov_deg)
 
     def estimate(
         self,
