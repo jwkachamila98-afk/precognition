@@ -30,7 +30,8 @@ class MediaPipeHandTracker(HandTrackerABC):
         max_num_hands: int = 2,
         min_detection_confidence: float = 0.45,
         min_tracking_confidence: float = 0.45,
-        model_complexity: int = 0  # 0 = fastest / lightest CPU profile for Intel Mac
+        model_complexity: int = 0,  # 0 = fastest / lightest CPU profile for Intel Mac
+        horizontal_fov_deg: float = 60.0,
     ) -> None:
         if not MEDIAPIPE_AVAILABLE:
             raise ImportError(
@@ -41,6 +42,10 @@ class MediaPipeHandTracker(HandTrackerABC):
         self.min_detection_confidence = min_detection_confidence
         self.min_tracking_confidence = min_tracking_confidence
         self.model_complexity = model_complexity
+        # Needed to turn an apparent hand size in pixels into a distance. Most
+        # laptop webcams sit near 60 degrees horizontally; an error here scales
+        # the recovered depth proportionally but does not distort the hand.
+        self.horizontal_fov_deg = float(horizontal_fov_deg)
 
         self._mp_hands = mp.solutions.hands
         self._tracker = self._mp_hands.Hands(
@@ -50,6 +55,60 @@ class MediaPipeHandTracker(HandTrackerABC):
             min_detection_confidence=min_detection_confidence,
             min_tracking_confidence=min_tracking_confidence
         )
+
+
+    # A hand nearer than this is touching the lens; further and it is out of the
+    # workspace. Outside the band the size-based estimate is not believable.
+    _MIN_DEPTH_M = 0.15
+    _MAX_DEPTH_M = 1.60
+    _NOMINAL_DEPTH_M = 0.50
+
+    def _anchor_in_camera_frame(
+        self, local: np.ndarray, kpts_2d: np.ndarray, width: int, height: int
+    ) -> np.ndarray:
+        """Place hand-centred metric landmarks at their true camera-frame position.
+
+        MediaPipe hands its metric landmarks back relative to the hand's own
+        geometric centre; where the hand IS in the scene has to be recovered
+        separately, and it is exactly what the reward and the co-adaptation
+        signal need.
+
+        This is a pose-from-correspondences problem: the metric shape is known,
+        its projection is observed, and the rigid transform between them is
+        wanted - so it is solved as one. A simpler apparent-size estimate
+        (Z = f x metres / pixels) was tried first and is biased, because it
+        assumes the measured span lies on the optical axis; off to one side it
+        over-estimated depth by up to 20 cm at 40 cm off-centre, which is the
+        very regime that matters here.
+        """
+        f_px = (0.5 * width) / np.tan(np.radians(self.horizontal_fov_deg) * 0.5)
+        K = np.array([[f_px, 0.0, width * 0.5],
+                      [0.0, f_px, height * 0.5],
+                      [0.0, 0.0, 1.0]], dtype=np.float64)
+
+        ok, rvec, tvec = False, None, None
+        try:
+            ok, rvec, tvec = cv2.solvePnP(
+                local.astype(np.float64), kpts_2d.astype(np.float64), K, None,
+                flags=cv2.SOLVEPNP_SQPNP)
+        except cv2.error:
+            ok = False
+
+        depth_ok = tvec is not None and self._MIN_DEPTH_M <= float(tvec.reshape(-1)[2]) <= self._MAX_DEPTH_M
+        if ok and depth_ok:
+            R, _ = cv2.Rodrigues(rvec)
+            return (local.astype(np.float64) @ R.T + tvec.reshape(1, 3)).astype(np.float32)
+
+        # No usable solution - the hand is too foreshortened, too small or too
+        # blurred to localise. Sit it at the nominal working distance on the ray
+        # through its own centre, which is still better than the optical axis.
+        centre_px = kpts_2d.mean(axis=0)
+        depth = self._NOMINAL_DEPTH_M
+        out = local.copy()
+        out[:, 0] += (float(centre_px[0]) - width * 0.5) * depth / f_px
+        out[:, 1] += (float(centre_px[1]) - height * 0.5) * depth / f_px
+        out[:, 2] += depth
+        return out.astype(np.float32)
 
     def estimate(
         self,
@@ -88,13 +147,24 @@ class MediaPipeHandTracker(HandTrackerABC):
             kpts_3d = np.zeros((21, 3), dtype=np.float32)
             if results.multi_hand_world_landmarks and idx < len(results.multi_hand_world_landmarks):
                 world_lms = results.multi_hand_world_landmarks[idx]
+                local = np.empty((21, 3), dtype=np.float32)
                 for j_idx, wlm in enumerate(world_lms.landmark):
-                    # MediaPipe world coordinates: X right, Y up, Z forward (relative to hand center)
-                    # Convert to camera convention: X right, Y down, Z forward
-                    kpts_3d[j_idx, 0] = wlm.x
-                    kpts_3d[j_idx, 1] = -wlm.y
-                    # Place wrist approx 0.5m in front of camera
-                    kpts_3d[j_idx, 2] = 0.50 + wlm.z
+                    # MediaPipe world coordinates: X right, Y up, Z forward, and
+                    # crucially they are relative to the HAND's own centre, not
+                    # the camera. Convert to the camera convention (Y down).
+                    local[j_idx] = (wlm.x, -wlm.y, wlm.z)
+                local -= local.mean(axis=0)
+
+                # Anchor the hand where it actually is. Copying the centred
+                # world landmarks through and pasting a constant 0.5 m into z -
+                # as this did - pins every hand to the optical axis and throws
+                # its position away, keeping only shape and orientation. Any
+                # comparison against a plan authored at the object then measures
+                # where the OBJECT is rather than what the user did: a perfectly
+                # executed reach still scored as a total failure whenever the
+                # object sat off-centre, which is why episode reward was stuck
+                # at -1.000 and the policy had no gradient to learn from.
+                kpts_3d = self._anchor_in_camera_frame(local, kpts_2d, w, h)
             else:
                 # Fallback depth estimation from normalized landmarks
                 for j_idx, lm in enumerate(hand_lms.landmark):
