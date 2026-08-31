@@ -1015,14 +1015,17 @@ class LocalClientRunner:
         self.local_trajectory_diffusion = MockTrajectoryDiffusion()
         self.local_discrepancy_engine = DiscrepancyEngine()
         self.local_physics_engine = MockPhysicsEngine()
-        # Deliberately NOT using NeuralResidualPolicy here even when torch happens
-        # to be installed: loading torch in the same process as faster-whisper
-        # (WhisperTranscriber, used by this same client) was observed to crash
-        # with a fatal native abort - almost certainly a conflicting bundled
-        # OpenMP/MKL runtime between the two libraries' native backends. The real
-        # neural policy runs server-side (apps/remote_server.py), in a process
-        # that never loads faster-whisper, where this conflict cannot occur.
-        self.local_policy = MockResidualPolicy()
+        # The real neural policy is used locally whenever it is SAFE to load
+        # torch in this process. The hazard is specific and narrow: faster-whisper
+        # (ctranslate2) and torch each bundle an OpenMP runtime, and having both
+        # in one interpreter aborts it outright. That only arises when
+        # WhisperTranscriber is the active backend - with Gemini transcription,
+        # or the mock, faster-whisper is never imported and torch is fine.
+        #
+        # This matters beyond tidiness: it is what makes the laptop-only path a
+        # real fallback that actually learns, rather than a demo of a stub, for
+        # the times the GPU pod is unavailable.
+        self.local_policy = self._build_local_policy()
         self._last_action = np.zeros(7, dtype=np.float32)
         self._cached_foreseen_traj = None
         self._local_learned_wrist_bias = np.zeros(3, dtype=np.float32)
@@ -1115,6 +1118,30 @@ class LocalClientRunner:
                 self.workflow.trigger_intent(self.current_parsed_intent.target_object if self.current_parsed_intent.is_active else "none")
                 logger.info(f"Voice Mode Transcribed: '{transcript}' -> Target: {self.current_parsed_intent.target_object}")
             self.voice_status = "IDLE"
+
+    def _build_local_policy(self):
+        """The real residual policy when torch can safely be loaded here."""
+        if isinstance(self.transcriber, WhisperTranscriber):
+            logger.info(
+                "LocalClient: WhisperTranscriber is active, so torch cannot be loaded "
+                "in this process (conflicting OpenMP runtimes). Using MockResidualPolicy, "
+                "which DOES NOT LEARN - set GEMINI_API_KEY to enable real local adaptation."
+            )
+            return MockResidualPolicy()
+        try:
+            from src.policy.neural_policy import NeuralResidualPolicy
+            policy = NeuralResidualPolicy()
+            logger.info(
+                f"LocalClient: Using real NeuralResidualPolicy (device={policy.device}), "
+                "trained online via Reward-Weighted Regression."
+            )
+            return policy
+        except Exception as e:
+            logger.warning(
+                f"LocalClient: NeuralResidualPolicy unavailable ({e}); using "
+                "MockResidualPolicy, which DOES NOT LEARN."
+            )
+            return MockResidualPolicy()
 
     def _current_voice_status(self) -> str:
         """Voice status for display, expiring any transient notice."""
@@ -2092,6 +2119,9 @@ class LocalClientRunner:
                 # pixel lab render still pays for its own resolution.
                 fps = self.visualizer.update_fps()
                 frame, display_poses = self._to_display_resolution(frame, poses)
+                self.visualizer.draw_hand_skeleton(
+                    frame, display_poses, residuals=residuals,
+                    adaptation_active=self.adaptation_active)
                 # While a ghost hand is grasping on the live view, drop the 3-D
                 # wireframe to a plain rectangle - its pillars cut through the
                 # fingers exactly where the grasp needs to be legible.

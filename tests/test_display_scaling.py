@@ -108,3 +108,26 @@ def test_the_execution_phase_explains_itself():
     for phase in ExecutionPhase:
         title, text = LocalClientRunner._status_message(phase, "cup", True)
         assert title and text, f"{phase} has no guidance"
+
+
+def test_the_render_loop_actually_invokes_every_annotation_renderer():
+    """A wiring guard, not a rendering one.
+
+    Inserting the display-resize step once REPLACED the draw_hand_skeleton call
+    rather than preceding it, and the skeleton silently stopped being drawn. The
+    entire suite still passed: every test covered the drawing functions in
+    isolation, and nothing asserted the loop still called them.
+    """
+    import inspect
+    from apps import local_client
+
+    source = inspect.getsource(local_client.LocalClientRunner.run)
+    for renderer in ("draw_hand_skeleton", "draw_3d_bounding_boxes",
+                     "draw_affordance_hotspots", "draw_hand_replay",
+                     "_update_lab_panel", "_compose_stage"):
+        assert f"{renderer}(" in source, f"the render loop no longer calls {renderer}"
+
+    # And the annotations must be fed the DISPLAY poses, not the sensor-space
+    # originals, or they land at a fraction of their correct position.
+    skeleton_call = source[source.index("draw_hand_skeleton("):][:200]
+    assert "display_poses" in skeleton_call, "skeleton is not using display-scaled poses"

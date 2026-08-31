@@ -177,6 +177,7 @@ class GeminiSpeaker(SpeechSynthesizerABC):
                 return
             import numpy as np
             audio = np.frombuffer(pcm, dtype=np.int16)
+            audio, sample_rate = self._match_device_rate(audio, sample_rate)
             clip_duration_sec = len(audio) / float(sample_rate)
             # Hard ceiling well above the clip's own duration, in case CoreAudio ever
             # leaves a stream reporting active=True indefinitely (observed once during
@@ -184,7 +185,12 @@ class GeminiSpeaker(SpeechSynthesizerABC):
             # voice guidance forever.
             deadline = time.time() + clip_duration_sec + 3.0
 
-            self._sd.play(audio, samplerate=sample_rate)
+            # A generous output buffer. The render loop saturates the CPU
+            # (~35 ms in the window blit alone), and with the default low-latency
+            # buffer the playback callback is starved often enough to crackle -
+            # which is what "static" in the voice guidance actually was. Latency
+            # is irrelevant here: this is a pre-rendered clip, not a live monitor.
+            self._sd.play(audio, samplerate=sample_rate, latency="high")
             while self._sd.get_stream().active and not stop_event.is_set():
                 if time.time() > deadline:
                     logger.warning("GeminiSpeaker: playback exceeded expected duration; forcing stop.")
@@ -199,6 +205,41 @@ class GeminiSpeaker(SpeechSynthesizerABC):
                 self._fallback.speak(text)
         finally:
             self._speaking = False
+
+    def _match_device_rate(self, audio, sample_rate: int):
+        """Resample to the output device's own rate before playing.
+
+        The built-in speakers run natively at 48 kHz while the model returns
+        24 kHz and the microphone stream holds the same physical device open at
+        16 kHz. Leaving CoreAudio to reconcile all three, on a machine whose CPU
+        is already saturated by the render loop, is what makes playback crackle.
+        Converting once, here, costs a few milliseconds on a background thread.
+        """
+        import numpy as np
+        try:
+            device_rate = int(self._sd.query_devices(
+                self._sd.default.device[1])["default_samplerate"])
+        except Exception:
+            return audio, sample_rate
+        if device_rate <= 0 or device_rate == sample_rate:
+            return audio, sample_rate
+        try:
+            from math import gcd
+            from scipy.signal import resample_poly
+            g = gcd(device_rate, sample_rate)
+            converted = resample_poly(audio.astype(np.float32),
+                                      device_rate // g, sample_rate // g)
+        except Exception:
+            # Linear interpolation is a fair fallback for speech.
+            n = int(round(len(audio) * device_rate / float(sample_rate)))
+            if n <= 1:
+                return audio, sample_rate
+            converted = np.interp(np.linspace(0, len(audio) - 1, n),
+                                  np.arange(len(audio)), audio.astype(np.float32))
+        peak = float(np.abs(converted).max()) if len(converted) else 0.0
+        if peak > 32767.0:                       # resampling can overshoot slightly
+            converted *= 32767.0 / peak
+        return converted.astype(np.int16), device_rate
 
     def _synthesize(self, text: str) -> tuple:
         payload = {
