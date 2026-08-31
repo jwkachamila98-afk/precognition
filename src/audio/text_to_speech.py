@@ -8,12 +8,15 @@ what the user should do next.
 import base64
 import json
 import logging
+import os
 import re
 import shutil
 import ssl
 import subprocess
+import tempfile
 import threading
 import time
+import wave
 import urllib.request
 from abc import ABC, abstractmethod
 from typing import Optional
@@ -148,6 +151,7 @@ class GeminiSpeaker(SpeechSynthesizerABC):
         self._fallback = SystemSpeaker()
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
+        self._player = None
         self._speaking = False
 
         try:
@@ -175,6 +179,21 @@ class GeminiSpeaker(SpeechSynthesizerABC):
             pcm, sample_rate = self._synthesize(text)
             if stop_event.is_set():
                 return
+
+            # Play OUT OF PROCESS where the platform allows it. Playing through
+            # sounddevice meant PortAudio opened and closed an output stream per
+            # utterance while the microphone's input stream stayed open on the
+            # same device, and a teardown eventually corrupted the heap:
+            #
+            #   abort <- malloc_zone_error <- PaUtil_TerminateBufferProcessor
+            #                              <- CloseStream
+            #
+            # That is a SIGABRT with no Python traceback, mid-session, and it
+            # killed a live run. A separate player process cannot corrupt this
+            # one's heap however badly it behaves.
+            if self._play_externally(pcm, sample_rate, stop_event):
+                return
+
             import numpy as np
             audio = np.frombuffer(pcm, dtype=np.int16)
             audio, sample_rate = self._match_device_rate(audio, sample_rate)
@@ -205,6 +224,45 @@ class GeminiSpeaker(SpeechSynthesizerABC):
                 self._fallback.speak(text)
         finally:
             self._speaking = False
+
+    def _play_externally(self, pcm: bytes, sample_rate: int,
+                         stop_event: threading.Event) -> bool:
+        """Play the clip with the OS player. Returns False if unavailable."""
+        player = shutil.which("afplay") or shutil.which("aplay")
+        if not player:
+            return False
+        path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as fh:
+                path = fh.name
+            with wave.open(path, "wb") as wav:
+                wav.setnchannels(1)
+                wav.setsampwidth(2)
+                wav.setframerate(int(sample_rate))
+                wav.writeframes(pcm)
+
+            proc = subprocess.Popen([player, path],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self._player = proc
+            # A ceiling well past the clip's own length, so a wedged player can
+            # never hold voice guidance open forever.
+            deadline = time.time() + (len(pcm) / 2.0 / max(sample_rate, 1)) + 5.0
+            while proc.poll() is None:
+                if stop_event.is_set() or time.time() > deadline:
+                    proc.terminate()
+                    break
+                time.sleep(0.05)
+            return True
+        except Exception as e:
+            logger.debug(f"GeminiSpeaker: external player failed ({e}); using sounddevice.")
+            return False
+        finally:
+            self._player = None
+            if path:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
 
     def _match_device_rate(self, audio, sample_rate: int):
         """Resample to the output device's own rate before playing.
@@ -267,6 +325,12 @@ class GeminiSpeaker(SpeechSynthesizerABC):
 
     def stop(self) -> None:
         self._stop_event.set()
+        player = getattr(self, "_player", None)
+        if player is not None and player.poll() is None:
+            try:
+                player.terminate()
+            except Exception:
+                pass
         if self._sd is not None:
             try:
                 self._sd.stop()
