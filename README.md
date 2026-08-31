@@ -223,6 +223,45 @@ is **synthetic** and must not be presented as real output.
 
 ---
 
+## Demo Runbook
+
+Before starting: the GPU pod must be RUNNING. A cold pod takes about five
+minutes to clone and install, so start it first, then run the launcher - it
+waits for the server rather than failing.
+
+```bash
+export GEMINI_API_KEY=...
+python tools/launch_demo.py            # waits for the pod, then opens the client
+```
+
+Preflight will refuse to start if the camera, a dependency or the server is
+missing, and will say which. That is the intended behaviour: it is the only
+thing standing between you and demonstrating synthetic data by accident.
+
+**The sequence.** Each step waits for you; nothing is on a timer except the
+reenactment itself.
+
+| Step | Key | What happens |
+|---|---|---|
+| 1 | hold `v`, speak | "I'm going to pick up the coffee cup" -> the target is grounded in the live scene |
+| 2 | `c` | **YOUR TURN** - the plan is ready |
+| 3 | `c` | **GO** - your reach is now being recorded |
+| 4 | *(reach for it)* | the bar counts captured frames, e.g. `24/60` |
+| 5 | *(automatic)* | **ADAPTING** - the episode is scored and the policy updated |
+| 6 | repeat 1-5 | the LEARNING card plots error reduction across trials |
+| any time | `a` | the simulated-lab reenactment, over the live view |
+
+**The one thing that can stall it.** Step 4 advances on frames in which a hand
+was actually *detected*, not on elapsed time. If your hand leaves the frame the
+count stops and the phase waits. The status bar says so directly - "Raise your
+hand into view" - so watch it rather than the camera image.
+
+**What to point at.** The reward tile responds to how closely the reach matched
+the plan; across repeated attempts the plan shifts toward how *you* reach, and
+the LEARNING card's error-reduction figure is the evidence.
+
+---
+
 ## Interactive Hotkey Cheat Sheet
 
 When running the visualizer HUD (`apps/local_client.py` or `apps/run_demo.py`), use the following hotkeys:
