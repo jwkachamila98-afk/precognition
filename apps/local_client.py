@@ -1556,9 +1556,11 @@ class LocalClientRunner:
         width = min(sw, self._MAX_STAGE_W)
         height = max(360, int(round(width * sh / sw)))
         probe = Stage(width, height)
+        rail_w = probe.layout.telemetry[2] - probe.layout.telemetry[0]
         return Stage(width, height,
                      telemetry_h=UIH.telemetry_height(probe.layout.scale),
-                     learning_h=UIH.learning_height(probe.layout.scale))
+                     learning_h=UIH.learning_height(probe.layout.scale),
+                     depth_h=UIH.depth_height(probe.layout.scale, rail_w))
 
     def _compose_stage(self, frame, *, fps, latency_ms, workflow_phase, phase_progress,
                        parsed_intent, depth_heatmap, poses, gripper_cmd, reward_score,

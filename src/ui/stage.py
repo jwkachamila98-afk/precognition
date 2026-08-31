@@ -63,7 +63,7 @@ class Layout:
 
 
 def compute_layout(width: int, height: int, telemetry_h: int = 0,
-                   learning_h: int = 0) -> Layout:
+                   learning_h: int = 0, depth_h: int = 0) -> Layout:
     """Place the camera card and its rails, centred as a group.
 
     On a wide display the video is flanked by TWO rails. A single rail left a
@@ -113,11 +113,17 @@ def compute_layout(width: int, height: int, telemetry_h: int = 0,
         # Right rail: telemetry, with the shortcut list filling the remainder.
         hot_top = telemetry[3] + gap
         hotkeys = (rx, hot_top, rx + rail_w, rail_bottom)
-        # Left rail: learning is sized to its content and the depth preview
-        # takes the rest, so neither card carries a band of empty glass.
-        learn_h = int(learning_h) if learning_h > 0 else int(rail_h * 0.46)
-        learn_h = int(np.clip(learn_h, 120, rail_h - gap - 140))
-        depth = (left_x, y0, left_x + rail_w, rail_bottom - learn_h - gap)
+        # Left rail: the depth preview is sized to its content (the heatmap's
+        # own aspect) and the learning card takes everything under it - its
+        # trend line grows into the extra height, so neither card carries a
+        # band of empty glass.
+        if depth_h > 0:
+            d_h = int(np.clip(depth_h, 100, rail_h - gap - 160))
+            depth = (left_x, y0, left_x + rail_w, y0 + d_h)
+        else:
+            learn_h = int(learning_h) if learning_h > 0 else int(rail_h * 0.46)
+            learn_h = int(np.clip(learn_h, 120, rail_h - gap - 140))
+            depth = (left_x, y0, left_x + rail_w, rail_bottom - learn_h - gap)
         learning = (left_x, depth[3] + gap, left_x + rail_w, rail_bottom)
     else:
         remaining = rail_h - tel_h - 2 * gap
@@ -135,12 +141,14 @@ class Stage:
     """The composition surface: backdrop, camera card, and chrome on top."""
 
     def __init__(self, width: int, height: int, telemetry_h: int = 0,
-                 learning_h: int = 0) -> None:
+                 learning_h: int = 0, depth_h: int = 0) -> None:
         self.width = int(width)
         self.height = int(height)
         self._telemetry_h = int(telemetry_h)
         self._learning_h = int(learning_h)
-        self.layout = compute_layout(self.width, self.height, telemetry_h, learning_h)
+        self._depth_h = int(depth_h)
+        self.layout = compute_layout(self.width, self.height, telemetry_h,
+                                     learning_h, depth_h)
         self._canvas = np.zeros((self.height, self.width, 3), dtype=np.uint8)
         self._backdrop = np.zeros((self.height, self.width, 3), dtype=np.uint8)
         self._vignette: Optional[np.ndarray] = None
@@ -166,11 +174,12 @@ class Stage:
         self._bd_h = max(2, int(self._bd_w * self.height / max(self.width, 1)))
 
     def resize(self, width: int, height: int, telemetry_h: int = 0,
-               learning_h: int = 0) -> None:
-        if ((int(width), int(height), int(telemetry_h), int(learning_h))
-                == (self.width, self.height, self._telemetry_h, self._learning_h)):
+               learning_h: int = 0, depth_h: int = 0) -> None:
+        if ((int(width), int(height), int(telemetry_h), int(learning_h), int(depth_h))
+                == (self.width, self.height, self._telemetry_h, self._learning_h,
+                    self._depth_h)):
             return
-        self.__init__(width, height, telemetry_h, learning_h)
+        self.__init__(width, height, telemetry_h, learning_h, depth_h)
 
     def _vignette_mask(self) -> np.ndarray:
         """A soft darkening toward the edges, baked at backdrop resolution."""

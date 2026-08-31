@@ -52,7 +52,7 @@ def fake_camera(w=640, h=480):
     return np.clip(img.astype(np.int16) + noise, 0, 255).astype(np.uint8)
 
 
-def depth_map(w=240, h=150):
+def depth_map(w=240, h=180):    # the sensor's depth maps are 4:3, like the feed
     g = np.linspace(0, 255, w * h).reshape(h, w).astype(np.uint8)
     g = cv2.GaussianBlur(np.roll(g, 40, axis=1), (0, 0), 6)
     return cv2.applyColorMap(g, cv2.COLORMAP_TURBO)
@@ -103,9 +103,11 @@ def main():
     motion = G.Motion()
     cam, depth = fake_camera(), depth_map()
     probe = Stage(a.width, height)
+    rail_w = probe.layout.telemetry[2] - probe.layout.telemetry[0]
     stage = Stage(a.width, height,
                   telemetry_h=hud.telemetry_height(probe.layout.scale),
-                  learning_h=hud.learning_height(probe.layout.scale))
+                  learning_h=hud.learning_height(probe.layout.scale),
+                  depth_h=hud.depth_height(probe.layout.scale, rail_w))
     for _ in range(4):
         motion.tick()
         render(a.width, height, a.phase, motion, stage, cam, depth)

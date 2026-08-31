@@ -53,6 +53,25 @@ def _p(base: float, s: float) -> int:
     return max(1, int(round(base * s)))
 
 
+def truncate(text: str, px: int, max_px: int, weight: str = "regular") -> str:
+    """Elide text to fit `max_px`, measured in the real face.
+
+    Character-count slicing cut values at whatever pixel width the characters
+    happened to add up to - "grasp from above, then lif" shipped that way.
+    """
+    if T.measure(text, px, weight) <= max_px:
+        return text
+    ell = "…"
+    lo, hi = 0, len(text)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if T.measure(text[:mid].rstrip() + ell, px, weight) <= max_px:
+            lo = mid
+        else:
+            hi = mid - 1
+    return text[:lo].rstrip() + ell
+
+
 def wrap(text: str, px: int, max_px: int, weight: str = "regular") -> List[str]:
     """Break text into lines that fit `max_px`, measured in the real face."""
     words, lines, line = text.split(), [], ""
@@ -153,8 +172,11 @@ def _rule(canvas, x1: int, x2: int, y: int) -> None:
 
 def _row(canvas, label: str, value: str, x1: int, x2: int, y: int, colour, s: float,
          value_weight: str = "medium") -> None:
-    T.draw(canvas, label, (x1, y), _p(13, s), C["tertiary"])
-    T.draw(canvas, value, (x2, y), _p(13, s), colour, weight=value_weight, align="right")
+    px = _p(13, s)
+    lw = T.draw(canvas, label, (x1, y), px, C["tertiary"])
+    room = (x2 - x1) - lw - _p(12, s)
+    T.draw(canvas, truncate(value, px, max(room, _p(40, s)), value_weight),
+           (x2, y), px, colour, weight=value_weight, align="right")
 
 
 def _eyebrow(canvas, label: str, x: int, y: int, s: float, colour=None) -> int:
@@ -192,8 +214,8 @@ def phase_label(phase_value: str) -> str:
 
 # Height of each element at scale 1.0, so the card can be measured before the
 # layout runs and its content can never overrun its own bottom edge.
-_H = {"head": 86, "tiles": 86, "sec": 26, "row": 26, "gauge": 50,
-      "rule": 20, "rec": 26, "quote": 50}
+_H = {"head": 80, "tiles": 78, "sec": 26, "row": 26, "gauge": 50,
+      "rule": 16, "rec": 26, "quote": 50}
 _QUOTE_LINES = 2
 
 
@@ -213,8 +235,8 @@ def _telemetry_items(*, phase_value, target, voice_status, adaptation_active,
         ("tiles",),
         ("sec", "Intent"),
         ("quote", utterance or "", intent_conditioned),
-        ("row", "Action", (action or "reach and grasp")[:26], C["purple"]),
-        ("row", "Target", (target or "standby")[:22], C["orange"]),
+        ("row", "Action", action or "reach and grasp", C["purple"]),
+        ("row", "Target", target or "standby", C["orange"]),
         ("row", "Voice", v_txt, v_col),
         ("rule",),
         ("sec", "Adaptation"),
@@ -375,6 +397,18 @@ def draw_status_bar(stage, rect: Rect, motion, *, title, body, colour,
                                 x2 - pad, y2 - _p(10, s)), eased, colour)
 
 
+def depth_height(scale: float, rail_w: int, aspect: float = 0.75) -> int:
+    """The card height that fits a heatmap of `aspect` (h/w) with no dead band.
+
+    The sensor's depth maps are 4:3; the card used to take whatever the rail had
+    left, which put a strip of empty glass under the heatmap.
+    """
+    s = scale
+    pad = _p(16, s)
+    inner_w = max(2, rail_w - 2 * pad)
+    return _p(36, s) + int(round(inner_w * aspect)) + pad
+
+
 def draw_depth_card(stage, rect: Rect, heatmap: Optional[np.ndarray], scale: float) -> None:
     canvas = stage.canvas
     x1, y1, x2, y2 = rect
@@ -415,9 +449,19 @@ def _draw_hotkeys(canvas, rect: Rect, entries: Sequence[Tuple[str, str]],
 
     top = y1 + _p(38, s)
     avail = max(0, (y2 - _p(10, s)) - top)
+    # The card is handed whatever the rail has left, so the grid adapts: the
+    # fewest columns that let EVERY entry fit vertically. Two columns clipped
+    # eight of twelve shortcuts when the telemetry card grew.
+    n = len(entries)
     step = _p(23, s)
-    rows = max(1, avail // max(step, 1))
     cols = 2
+    for c in (2, 3, 4):
+        cols = c
+        need_rows = (n + c - 1) // c
+        if need_rows * _p(20, s) <= avail:
+            step = min(_p(23, s), avail // max(need_rows, 1))
+            break
+    rows = max(1, avail // max(step, 1))
     shown = list(entries)[: rows * cols]
     per_col = max(1, (len(shown) + cols - 1) // cols)
     col_w = (x2 - x1 - 2 * pad) // cols
@@ -431,7 +475,9 @@ def _draw_hotkeys(canvas, rect: Rect, entries: Sequence[Tuple[str, str]],
              C["separator"], radius=_p(4, s), opacity=0.85)
         T.draw(canvas, key.upper(), (cx + kw // 2, cy), _p(10, s),
                C["secondary"], weight="medium", align="center")
-        T.draw(canvas, desc, (cx + kw + _p(8, s), cy), _p(11, s), C["tertiary"])
+        room = col_w - kw - _p(14, s)
+        T.draw(canvas, truncate(desc, _p(11, s), max(room, _p(24, s))),
+               (cx + kw + _p(8, s), cy), _p(11, s), C["tertiary"])
 
 
 def draw_banner(canvas, video_rect: Rect, motion, *, title, colour,
@@ -521,6 +567,9 @@ def draw_learning_card(stage, rect: Rect, *, trials: int, init_err_mm: float,
     if y + _p(46, s) <= y2 - pad:
         T.draw(canvas, "Episode reward", (lx, y + _p(12, s)), _p(11, s), C["quaternary"])
         band_top = y + _p(18, s)
-        band_bottom = min(y2 - pad, band_top + _p(92, s))
+        # The trend line takes every remaining pixel of the card: when the rail
+        # hands this card extra height, the chart grows instead of leaving a
+        # band of empty glass at the bottom.
+        band_bottom = y2 - pad
         sparkline(canvas, (lx, band_top, rx, band_bottom), list(rewards),
                   C["teal"], thickness=max(1, _p(2, s)))
