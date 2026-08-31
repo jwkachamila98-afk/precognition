@@ -47,6 +47,8 @@ from src.utils.preflight import client_checks, enforce
 
 ensure_ca_bundle()
 
+from src.perception.action_schema import ActionPlan, plan_from_text
+from src.perception.gemini_action_parser import GeminiActionParser
 from src.perception.hand_tracker import HAND_CONNECTIONS, HandPose, HandTrackerABC
 from src.perception.scene_parser import BoundingBox3D, ParsedScene
 from src.perception.mediapipe_tracker import MediaPipeHandTracker, MEDIAPIPE_AVAILABLE
@@ -1011,7 +1013,12 @@ class LocalClientRunner:
 
         # Local mock generators
         self.local_depth_estimator = MockDepthEstimator()
-        self.local_scene_parser = MockSceneParser()
+        # Real, open-vocabulary detection wherever a key allows it. The mock
+        # invents objects from the intent string and never looks at the camera,
+        # which is indistinguishable from working until you notice the box is
+        # attached to nothing. Gemini names whatever is actually in frame -
+        # "utensil holder", "houseplant" - which COCO-80 cannot.
+        self.local_scene_parser = self._build_local_scene_parser(gemini_api_key)
         self.local_affordance_extractor = MockAffordanceExtractor()
         self.local_trajectory_diffusion = MockTrajectoryDiffusion()
         self.local_discrepancy_engine = DiscrepancyEngine()
@@ -1026,7 +1033,14 @@ class LocalClientRunner:
         # This matters beyond tidiness: it is what makes the laptop-only path a
         # real fallback that actually learns, rather than a demo of a stub, for
         # the times the GPU pod is unavailable.
+        self.local_object_detector = getattr(self, "local_object_detector", None)
         self.local_policy = self._build_local_policy()
+        # How the spoken verb should be carried out. The rules answer instantly;
+        # the language model refines the reading a second or two later, off the
+        # render loop, and the refined plan is cached against the utterance.
+        self.action_parser = (GeminiActionParser(api_key=gemini_api_key)
+                              if gemini_api_key else None)
+        self._action_plan = ActionPlan()
         self._last_action = np.zeros(7, dtype=np.float32)
         self._cached_foreseen_traj = None
         self._local_learned_wrist_bias = np.zeros(3, dtype=np.float32)
@@ -1120,6 +1134,30 @@ class LocalClientRunner:
                 logger.info(f"Voice Mode Transcribed: '{transcript}' -> Target: {self.current_parsed_intent.target_object}")
             self.voice_status = "IDLE"
 
+    def _build_local_scene_parser(self, gemini_api_key: Optional[str]):
+        """Open-vocabulary detection locally, or the mock when there is no key."""
+        if not gemini_api_key:
+            logger.warning(
+                "LocalClient: no GEMINI_API_KEY, so objects are SYNTHETIC - "
+                "MockSceneParser invents them from the intent text and never "
+                "looks at the camera."
+            )
+            return MockSceneParser()
+        try:
+            from src.perception.gemini_scene_detector import GeminiObjectDetector
+            from src.perception.live_scene_parser import LiveSceneParser
+            self.local_object_detector = GeminiObjectDetector(
+                api_key=gemini_api_key, cadence_sec=1.5)
+            logger.info(
+                "LocalClient: Using Gemini open-vocabulary detection "
+                "(refreshed every ~1.5 s, tracked between calls)."
+            )
+            return LiveSceneParser(object_detector=self.local_object_detector)
+        except Exception as e:
+            logger.warning(f"LocalClient: Gemini detection unavailable ({e}); "
+                           "objects will be SYNTHETIC.")
+            return MockSceneParser()
+
     def _build_local_policy(self):
         """The real residual policy when torch can safely be loaded here."""
         if isinstance(self.transcriber, WhisperTranscriber):
@@ -1143,6 +1181,18 @@ class LocalClientRunner:
                 "MockResidualPolicy, which DOES NOT LEARN."
             )
             return MockResidualPolicy()
+
+    def _refresh_action_plan(self) -> ActionPlan:
+        """The current reading of what the user said they would do."""
+        said = self._spoken_intent()
+        if not said:
+            self._action_plan = ActionPlan()
+            return self._action_plan
+        if self.action_parser is not None:
+            self._action_plan = self.action_parser.plan_async(said)
+        else:
+            self._action_plan = plan_from_text(said)
+        return self._action_plan
 
     def _spoken_intent(self) -> Optional[str]:
         """The last utterance, or None if it is a placeholder rather than speech."""
@@ -1493,7 +1543,8 @@ class LocalClientRunner:
             # What the user actually said, and whether it is reaching the policy
             # as an embedding rather than merely having been heard.
             utterance=self._spoken_intent(),
-            intent_conditioned=bool(self.gemini_api_key))
+            intent_conditioned=bool(self.gemini_api_key),
+            action=self._action_plan.summary if self._spoken_intent() else None)
 
         UIH.draw_depth_card(stage, L.depth, depth_heatmap, s)
         UIH.draw_hotkey_card(stage, L.hotkeys, self.STAGE_HOTKEYS, s)
@@ -1868,6 +1919,9 @@ class LocalClientRunner:
                         depth_heatmap = depth_map.to_colored_heatmap()
                         
                         prompt_for_scene = self.current_parsed_intent.target_object if self.current_parsed_intent.is_active else self.intent
+                        detector = getattr(self, "local_object_detector", None)
+                        if detector is not None:
+                            detector.set_hint(prompt_for_scene)
                         parsed_scene = self.local_scene_parser.parse_scene(
                             image=frame,
                             depth=depth_map,
@@ -1897,7 +1951,8 @@ class LocalClientRunner:
                                     affordance_map=affordance_map,
                                     intent=self.intent,
                                     num_steps=60,
-                                    learned_bias=self._local_learned_wrist_bias
+                                    learned_bias=self._local_learned_wrist_bias,
+                                    action=self._refresh_action_plan()
                                 )
                                 self.workflow.stored_foreseen_trajectory = self._cached_foreseen_traj
 

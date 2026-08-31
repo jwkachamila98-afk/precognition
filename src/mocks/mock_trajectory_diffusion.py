@@ -4,6 +4,7 @@ import math
 from typing import List, Optional
 import numpy as np
 
+from src.perception.action_schema import ActionPlan
 from src.perception.hand_tracker import HandPose
 from src.perception.scene_parser import BoundingBox3D
 from src.simulation.simulator import SimState
@@ -182,7 +183,8 @@ class MockTrajectoryDiffusion(TrajectoryGeneratorABC):
         affordance_map: AffordanceMap,
         intent: str = "foresee me picking this remote control",
         num_steps: int = 60,
-        learned_bias: Optional[np.ndarray] = None
+        learned_bias: Optional[np.ndarray] = None,
+        action: Optional[ActionPlan] = None
     ) -> ForeseenTrajectory:
         """
         Generate a 60-frame kinematically stable reference trajectory tau_ref.
@@ -192,7 +194,17 @@ class MockTrajectoryDiffusion(TrajectoryGeneratorABC):
         discrepancy). Shifts the suggested grasp point toward how this user has
         actually been moving, so the plan visibly improves across iterations instead
         of suggesting the same generic approach every time.
+
+        action: how the spoken verb should be carried out. Previously the parsed
+        action was read by nobody and every utterance produced the same reach and
+        lift, so "push the cup" and "pick up the cup" were indistinguishable. The
+        plan describes the motion along axes this generator can execute -
+        approach direction, what happens on contact, what follows - which is what
+        lets an unseen phrase produce sensible motion. Passing None keeps the
+        original pick-and-lift exactly as it was.
         """
+        legacy = action is None
+        plan = action or ActionPlan()
         # Determine start wrist position
         if start_hand_pose is not None and len(start_hand_pose.keypoints_3d) > 0:
             p_start = start_hand_pose.keypoints_3d[0].copy()
@@ -204,8 +216,13 @@ class MockTrajectoryDiffusion(TrajectoryGeneratorABC):
             # information about the grasp, and dominates any view of it.
             # Camera frame: +X right, +Y down, +Z away, so this is up-and-left of
             # the object and nearer the camera.
-            p_start = (target_object.center
-                       + np.array([-0.05, -0.11, -0.04], dtype=np.float32))
+            if legacy or plan.approach == "above":
+                standoff = np.array([-0.05, -0.11, -0.04], dtype=np.float32)
+            elif plan.approach == "side":
+                standoff = np.array([-0.16, -0.03, -0.04], dtype=np.float32)
+            else:
+                standoff = np.array([-0.03, -0.05, -0.15], dtype=np.float32)
+            p_start = target_object.center + standoff
 
         bias = learned_bias if learned_bias is not None else np.zeros(3, dtype=np.float32)
 
@@ -215,8 +232,27 @@ class MockTrajectoryDiffusion(TrajectoryGeneratorABC):
         # fingertips at the centre buries them inside a solid object - harmless
         # in a flat overlay, obviously wrong the moment the same plan is
         # rendered in 3D. Camera frame has +Y down, so -Y is up.
-        obj_half_h = float(np.asarray(target_object.size, dtype=np.float32)[1]) * 0.5
-        approach_offset = np.array([0.0, -0.95 * obj_half_h, 0.0], dtype=np.float32)
+        size = np.asarray(target_object.size, dtype=np.float32)
+        obj_half_h = float(size[1]) * 0.5
+        if legacy or plan.approach == "above":
+            # Down onto the top surface.
+            approach_offset = np.array([0.0, -0.95 * obj_half_h, 0.0], dtype=np.float32)
+            lateral = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        elif plan.approach == "side":
+            # In from the left flank, at the object's mid height - the only way a
+            # push or a slide reads as deliberate rather than as a failed grasp.
+            approach_offset = np.array([-0.95 * float(size[0]) * 0.5, 0.0, 0.0],
+                                       dtype=np.float32)
+            lateral = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        else:                                            # "front", from the camera
+            approach_offset = np.array([0.0, 0.0, -0.95 * float(size[2]) * 0.5],
+                                       dtype=np.float32)
+            lateral = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+
+        # A non-contacting action stops short of the surface rather than reaching
+        # into it: pointing at something and touching it are different claims.
+        if plan.contact == "none":
+            approach_offset = approach_offset * 2.6
         # Nudged by whatever this user has demonstrated in prior attempts.
         p_grasp = self._solve_grasp_wrist(obj_center, approach_offset) + bias
         rot_grasp = self._rot_grasp.copy()
@@ -234,7 +270,36 @@ class MockTrajectoryDiffusion(TrajectoryGeneratorABC):
         # Post-grasp lifted position (-Y is up in the camera frame). 9 cm was
         # under 40 px on screen and easy to miss entirely; 14 cm reads clearly
         # against the locked camera without pushing the wrist out of frame.
-        p_lift = p_grasp + np.array([0.0, -0.14, 0.02], dtype=np.float32)
+        if legacy:
+            flex_closed = self._flex_closed
+            p_lift = p_grasp + np.array([0.0, -0.14, 0.02], dtype=np.float32)
+            rot_end = rot_grasp
+        else:
+            # Grip 0..1 onto the flexion the hand model understands. 0.85 - the
+            # schema's default for a plain grasp - lands on 0.58, just past the
+            # 0.55 tuned by hand for the original pick-and-lift.
+            flex_closed = float(np.clip(0.20 + 0.45 * plan.grip, 0.05, 0.75))
+            travel = float(plan.travel_m)
+            up = np.array([0.0, -1.0, 0.0], dtype=np.float32)
+            toward_user = np.array([0.0, 0.0, -1.0], dtype=np.float32)
+            if plan.follow_through == "lift":
+                delta = up * travel + np.array([0.0, 0.0, 0.02], dtype=np.float32)
+            elif plan.follow_through == "toward_user":
+                delta = toward_user * travel + up * (0.35 * travel)
+            elif plan.follow_through == "slide":
+                # Along the surface, not off it.
+                delta = lateral * travel
+            elif plan.follow_through == "tilt":
+                delta = up * (0.25 * travel)
+            elif plan.follow_through == "retreat":
+                delta = (p_start - p_grasp) * 0.55
+            else:                                        # "hold" / "none"
+                delta = np.zeros(3, dtype=np.float32)
+            p_lift = p_grasp + delta
+            # Tilt is expressed on the wrist roll axis, which is what pouring,
+            # drinking and unscrewing all actually are.
+            rot_end = rot_grasp + np.array(
+                [0.0, 0.0, np.radians(plan.tilt_deg)], dtype=np.float32)
 
         waypoints: List[ForeseenWaypoint] = []
         dt = 2.0 / num_steps # 2.0 seconds total
@@ -264,7 +329,7 @@ class MockTrajectoryDiffusion(TrajectoryGeneratorABC):
                 sub_t = minimum_jerk_step((t_frac - 0.28) / 0.22)
                 wrist_pos = p_grasp
                 wrist_rot = rot_grasp
-                finger_flex = 0.2 + (self._flex_closed - 0.2) * sub_t # Fingers enclose object
+                finger_flex = 0.2 + (flex_closed - 0.2) * sub_t # Fingers enclose object
                 obj_pos = np.concatenate([obj_center, target_object.rotation])
                 contact_val = float(sub_t)
                 gripper = float(sub_t)
@@ -272,13 +337,24 @@ class MockTrajectoryDiffusion(TrajectoryGeneratorABC):
             else:
                 sub_t = minimum_jerk_step((t_frac - 0.50) / 0.50)
                 wrist_pos = p_grasp + sub_t * (p_lift - p_grasp)
-                wrist_rot = rot_grasp
-                finger_flex = self._flex_closed # Firm grasp hold
-                # Object moves rigidly attached to hand
-                lifted_obj_center = obj_center + sub_t * (p_lift - p_grasp)
-                obj_pos = np.concatenate([lifted_obj_center, target_object.rotation])
-                contact_val = 1.0
-                gripper = 1.0
+                wrist_rot = rot_grasp + sub_t * (rot_end - rot_grasp)
+                finger_flex = flex_closed # Firm grasp hold
+                # The object only follows a hand that actually closed on it. A
+                # push shoves it along; a touch or a point leaves it alone. It
+                # used to be carried in every case, so pointing at a cup dragged
+                # the cup through the air.
+                carried = legacy or plan.contact in ("grasp", "pinch")
+                shoved = (not legacy) and plan.contact == "push"
+                if carried or shoved:
+                    moved = obj_center + sub_t * (p_lift - p_grasp)
+                else:
+                    moved = obj_center
+                obj_rot = np.asarray(target_object.rotation, dtype=np.float32).copy()
+                if not legacy and plan.tilt_deg and carried and len(obj_rot) >= 3:
+                    obj_rot[2] += float(np.radians(plan.tilt_deg)) * sub_t
+                obj_pos = np.concatenate([moved, obj_rot])
+                contact_val = 0.0 if (not legacy and plan.contact == "none") else 1.0
+                gripper = float(plan.grip) if not legacy else 1.0
 
             # Forward kinematics for 21 joints
             kpts_3d = self._generate_hand_keypoints_3d(wrist_pos, wrist_rot, finger_flex)

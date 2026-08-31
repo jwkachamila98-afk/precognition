@@ -209,7 +209,7 @@ _QUOTE_LINES = 2
 def _telemetry_items(*, phase_value, target, voice_status, adaptation_active,
                      error, loss, gripper, robot_connected, hand_conf,
                      is_recording, recorded_frames, utterance=None,
-                     intent_conditioned=False):
+                     intent_conditioned=False, action=None):
     """The card's contents, in order. One source of truth for draw and measure."""
     v_txt, v_col = {
         "LISTENING": ("listening", C["teal"]),
@@ -226,6 +226,9 @@ def _telemetry_items(*, phase_value, target, voice_status, adaptation_active,
         # interface never showed. The stage moved into the masthead to pay for
         # the room: it is headline state, and it reads better up there anyway.
         ("quote", utterance or "", intent_conditioned),
+        # The verb, not just the noun. An intent is what you are going to DO
+        # with something, and until now only the object survived parsing.
+        ("row", "action", (action or "reach and grasp")[:22], C["purple"]),
         ("row", "target", (target or "standby")[:18], C["orange"]),
         ("row", "voice", v_txt, v_col),
         ("rule",),
@@ -254,7 +257,7 @@ def telemetry_height(scale: float = 1.0, is_recording: bool = False) -> int:
     items = _telemetry_items(
         phase_value="IDLE", target="x", voice_status="IDLE", adaptation_active=True,
         error=0.0, loss=0.0, gripper=0.0, robot_connected=True, hand_conf=None,
-        is_recording=is_recording, recorded_frames=0, utterance="x")
+        is_recording=is_recording, recorded_frames=0, utterance="x", action="x")
     body = sum(_H[i[0]] for i in items)
     return int(round((body + 34) * scale))
 
@@ -264,7 +267,8 @@ def draw_telemetry_card(stage, rect: Rect, motion, *, fps, latency_ms, phase_val
                         loss, gripper, robot_connected, hand_conf: Optional[float],
                         is_recording, recorded_frames, scale: float,
                         utterance: Optional[str] = None,
-                        intent_conditioned: bool = False) -> None:
+                        intent_conditioned: bool = False,
+                        action: Optional[str] = None) -> None:
     """The primary readout: muted labels left, values right-aligned into a rail."""
     canvas = stage.canvas
     x1, y1, x2, y2 = rect
@@ -281,7 +285,7 @@ def draw_telemetry_card(stage, rect: Rect, motion, *, fps, latency_ms, phase_val
         adaptation_active=adaptation_active, error=error, loss=loss, gripper=gripper,
         robot_connected=robot_connected, hand_conf=hand_conf,
         is_recording=is_recording, recorded_frames=recorded_frames,
-        utterance=utterance, intent_conditioned=intent_conditioned)
+        utterance=utterance, intent_conditioned=intent_conditioned, action=action)
 
     for item in items:
         kind = item[0]

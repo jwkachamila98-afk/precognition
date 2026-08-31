@@ -10,6 +10,8 @@ import numpy as np
 import websockets
 from websockets.exceptions import ConnectionClosed
 
+from src.perception.action_schema import ActionPlan, plan_from_text
+from src.perception.gemini_action_parser import GeminiActionParser
 from src.perception.hand_tracker import HandPose, HandSide, HandTrackerABC
 from src.perception.depth_estimator import DepthEstimatorABC
 from src.perception.scene_parser import SceneParserABC
@@ -100,6 +102,11 @@ class WSInferenceServer:
         # which is exactly how the policy behaved before they existed.
         self._intent_embedder = None
         self._intent_vec: Optional[np.ndarray] = None
+        # Reads an arbitrary spoken action into a plan the trajectory generator
+        # can execute. None when no API key is available, in which case the
+        # offline rules stand in.
+        key = os.environ.get("GEMINI_API_KEY", "").strip()
+        self._action_parser = GeminiActionParser(api_key=key) if key else None
         self._intent_pending: set = set()
         key = os.environ.get("GEMINI_API_KEY")
         if key:
@@ -129,6 +136,21 @@ class WSInferenceServer:
         # When the current demo started waiting for a detectable target.
         self._autonomous_demo_wait_start = 0.0
         self._AUTONOMOUS_DEMO_TARGET_TIMEOUT_SEC = 12.0
+
+    def _action_plan_for(self, utterance: Optional[str]):
+        """How the spoken verb should be carried out.
+
+        The rules answer immediately so a plan is always available; the language
+        model's reading arrives a second or two later on a worker thread and is
+        cached against the utterance, so the next rollout for the same sentence
+        uses it. The request is never awaited here - this runs per frame.
+        """
+        said = (utterance or "").strip()
+        if not said or said.lower() in ("idle", "none", "standby"):
+            return ActionPlan()
+        if self._action_parser is not None:
+            return self._action_parser.plan_async(said)
+        return plan_from_text(said)
 
     def _refresh_intent_embedding(self, intent: Optional[str]) -> None:
         """Keep self._intent_vec in step with what was last said.
@@ -292,7 +314,8 @@ class WSInferenceServer:
                             affordance_map=affordance_map,
                             intent=frame_msg.intent,
                             num_steps=60,
-                            learned_bias=self._learned_wrist_bias
+                            learned_bias=self._learned_wrist_bias,
+                            action=self._action_plan_for(frame_msg.intent)
                         )
                         self.workflow.stored_foreseen_trajectory = self._cached_foreseen_traj
 
@@ -394,6 +417,7 @@ class WSInferenceServer:
                             intent=frame_msg.intent,
                             num_steps=60,
                             learned_bias=self._learned_wrist_bias,
+                            action=self._action_plan_for(frame_msg.intent),
                         )
                         self._apply_learned_correction(demo_traj, target_box, image.shape)
                         self._autonomous_demo_traj = demo_traj
