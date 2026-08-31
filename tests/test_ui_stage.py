@@ -183,20 +183,21 @@ def test_the_spoken_intent_is_shown_and_stays_inside_its_card():
 
 
 def test_long_utterances_are_wrapped_and_elided_not_run_off_the_edge():
-    # A width narrower than the text, or there is nothing to wrap: the string
-    # below measures 331 px at this size.
-    width = 250
-    lines = hud.wrap(chr(34) + "pick up the small black remote control on the table"
-                     + chr(34), 0.38, width)
+    # A width narrower than the text, or there is nothing to wrap.
+    from src.ui import typography as T
+    text = '"pick up the small black remote control on the table"'
+    width = max(60, T.measure(text, 14) // 2)
+    lines = hud.wrap(text, 14, width)
     assert len(lines) >= 2, "a long line should wrap"
     for line in lines:
-        assert cv2.getTextSize(line, cv2.FONT_HERSHEY_SIMPLEX, 0.38, 1)[0][0] <= width
+        assert T.measure(line, 14) <= width
 
 
-def test_no_non_ascii_glyphs_are_drawn():
-    """OpenCV's Hershey fonts are ASCII-only - typographic quotes rendered as
-    a literal '???' on screen."""
+def test_no_hershey_text_remains_in_the_hud():
+    """Every label goes through the real typeface. cv2.putText draws Hershey
+    plotter strokes, which is exactly the look this restyle removed - one call
+    creeping back would put 1960s lettering next to San Francisco."""
     import inspect
     source = inspect.getsource(hud)
-    for bad in ("“", "”", "‘", "’", "—", "·"):
-        assert bad not in source, f"non-ASCII {bad!r} will not render in a Hershey font"
+    assert "putText" not in source, "Hershey text found in the hud module"
+    assert "FONT_HERSHEY" not in source

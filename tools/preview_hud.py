@@ -73,12 +73,13 @@ def render(width: int, height: int, phase: str, motion, stage, cam, depth) -> np
         target="coffee cup", voice_status="IDLE", adaptation_active=True, reward=0.63,
         error=0.041, loss=0.060, gripper=0.42, robot_connected=True,
         hand_conf=0.92, is_recording=False, recorded_frames=0, scale=s,
-        utterance="I'm going to pick up this coffee cup", intent_conditioned=True)
+        utterance="I'm going to pick up this coffee cup", intent_conditioned=True,
+        action="grasp from above, then lift it")
     hud.draw_depth_card(stage, L.depth, depth, s)
     hud.draw_hotkey_card(stage, L.hotkeys, HOTKEYS, s)
     if L.learning:
         rng = np.random.default_rng(3)
-        hud.draw_learning_card(stage, L.learning, trials=7, init_err_mm=58.4,
+        hud.draw_learning_card(stage, L.learning, trials=7, init_err_mm=58.4, updates=57, pulse=0.7,
                                cur_err_mm=31.9,
                                rewards=list(np.cumsum(rng.normal(0.09, 0.3, 26)) * 0.1 - 0.5),
                                scale=s)
