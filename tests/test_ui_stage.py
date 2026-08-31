@@ -5,6 +5,7 @@ on top of one another, a card whose contents ran past its own bottom edge, and
 geometry that wrote outside the canvas when a rect was clipped.
 """
 
+import cv2
 import numpy as np
 import pytest
 
@@ -152,3 +153,50 @@ def test_a_card_never_draws_into_the_card_below_it():
     ys, xs = np.nonzero(changed)
     assert xs.min() >= L.telemetry[0] - inset and xs.max() < L.telemetry[2] + inset
     assert ys.min() >= L.telemetry[1] - inset and ys.max() < L.telemetry[3] + inset
+
+
+def test_the_spoken_intent_is_shown_and_stays_inside_its_card():
+    """The interface showed the parsed target noun but never the utterance it
+    came from, in a system whose whole premise is conditioning on what was
+    said."""
+    frame = np.random.default_rng(5).integers(0, 255, (480, 640, 3), dtype=np.uint8)
+    stage = Stage(1920, 804, telemetry_h=hud.telemetry_height(1.0),
+                  learning_h=hud.learning_height(1.0))
+    stage.compose_backdrop(frame)
+    L = stage.layout
+    baseline = stage.canvas.copy()
+
+    hud.draw_telemetry_card(
+        stage, L.telemetry, G.Motion(), fps=24.0, latency_ms=88.0,
+        phase_value="USER_EXECUTING", target="coffee cup", voice_status="IDLE",
+        adaptation_active=True, reward=0.4, error=0.04, loss=0.06, gripper=0.5,
+        robot_connected=True, hand_conf=0.9, is_recording=False, recorded_frames=0,
+        scale=L.scale,
+        utterance="I am going to pick up this coffee cup from the desk over there",
+        intent_conditioned=True)
+
+    changed = np.any(stage.canvas != baseline, axis=2)
+    ys, xs = np.nonzero(changed)
+    inset = 26                                   # clear of the shadow falloff
+    assert ys.max() < L.telemetry[3] + inset, "a long utterance overflowed the card"
+    assert xs.max() < L.telemetry[2] + inset
+
+
+def test_long_utterances_are_wrapped_and_elided_not_run_off_the_edge():
+    # A width narrower than the text, or there is nothing to wrap: the string
+    # below measures 331 px at this size.
+    width = 250
+    lines = hud.wrap(chr(34) + "pick up the small black remote control on the table"
+                     + chr(34), 0.38, width)
+    assert len(lines) >= 2, "a long line should wrap"
+    for line in lines:
+        assert cv2.getTextSize(line, cv2.FONT_HERSHEY_SIMPLEX, 0.38, 1)[0][0] <= width
+
+
+def test_no_non_ascii_glyphs_are_drawn():
+    """OpenCV's Hershey fonts are ASCII-only - typographic quotes rendered as
+    a literal '???' on screen."""
+    import inspect
+    source = inspect.getsource(hud)
+    for bad in ("“", "”", "‘", "’", "—", "·"):
+        assert bad not in source, f"non-ASCII {bad!r} will not render in a Hershey font"

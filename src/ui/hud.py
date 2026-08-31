@@ -45,6 +45,21 @@ _FONT = cv2.FONT_HERSHEY_SIMPLEX
 _FONT_HEAVY = cv2.FONT_HERSHEY_DUPLEX
 
 
+def wrap(s: str, scale: float, max_px: int, font=_FONT, weight=1) -> List[str]:
+    """Break text into lines that fit `max_px`, measured rather than guessed."""
+    words, lines, line = s.split(), [], ""
+    for word in words:
+        trial = f"{line} {word}".strip()
+        if cv2.getTextSize(trial, font, scale, weight)[0][0] <= max_px or not line:
+            line = trial
+        else:
+            lines.append(line)
+            line = word
+    if line:
+        lines.append(line)
+    return lines
+
+
 def text(canvas, s, org, scale, colour, weight=1, font=_FONT) -> int:
     cv2.putText(canvas, s, (int(org[0]), int(org[1])), font, scale, colour, weight, cv2.LINE_AA)
     return int(cv2.getTextSize(s, font, scale, weight)[0][0])
@@ -184,12 +199,17 @@ def phase_label(phase_value: str) -> str:
 # bottom edge and print over the panel below - which is exactly what happened
 # when the card was sized to "whatever space was left".
 _H = {"head": 76, "tiles": 90, "sec": 26, "chip": 30, "row": 26,
-      "gauge": 50, "rule": 24, "rec": 26}
+      "gauge": 50, "rule": 24, "rec": 26, "quote": 44}
+
+# Longest spoken intent shown before it is elided. Two lines is enough for the
+# phrasings people actually use ("I'm going to pick up the coffee cup").
+_QUOTE_LINES = 2
 
 
 def _telemetry_items(*, phase_value, target, voice_status, adaptation_active,
                      error, loss, gripper, robot_connected, hand_conf,
-                     is_recording, recorded_frames):
+                     is_recording, recorded_frames, utterance=None,
+                     intent_conditioned=False):
     """The card's contents, in order. One source of truth for draw and measure."""
     v_txt, v_col = {
         "LISTENING": ("listening", C["teal"]),
@@ -200,8 +220,12 @@ def _telemetry_items(*, phase_value, target, voice_status, adaptation_active,
     items = [
         ("head",),
         ("tiles",),
-        ("sec", "SESSION"),
-        ("chip", "stage", phase_label(phase_value), phase_colour(phase_value)),
+        ("sec", "INTENT"),
+        # What the user actually SAID, not just the noun parsed out of it. The
+        # whole system is conditioned on this, and it was the one thing the
+        # interface never showed. The stage moved into the masthead to pay for
+        # the room: it is headline state, and it reads better up there anyway.
+        ("quote", utterance or "", intent_conditioned),
         ("row", "target", (target or "standby")[:18], C["orange"]),
         ("row", "voice", v_txt, v_col),
         ("rule",),
@@ -230,7 +254,7 @@ def telemetry_height(scale: float = 1.0, is_recording: bool = False) -> int:
     items = _telemetry_items(
         phase_value="IDLE", target="x", voice_status="IDLE", adaptation_active=True,
         error=0.0, loss=0.0, gripper=0.0, robot_connected=True, hand_conf=None,
-        is_recording=is_recording, recorded_frames=0)
+        is_recording=is_recording, recorded_frames=0, utterance="x")
     body = sum(_H[i[0]] for i in items)
     return int(round((body + 34) * scale))
 
@@ -238,7 +262,9 @@ def telemetry_height(scale: float = 1.0, is_recording: bool = False) -> int:
 def draw_telemetry_card(stage, rect: Rect, motion, *, fps, latency_ms, phase_value,
                         target, voice_status, adaptation_active, reward, error,
                         loss, gripper, robot_connected, hand_conf: Optional[float],
-                        is_recording, recorded_frames, scale: float) -> None:
+                        is_recording, recorded_frames, scale: float,
+                        utterance: Optional[str] = None,
+                        intent_conditioned: bool = False) -> None:
     """The primary readout: muted labels left, values right-aligned into a rail."""
     canvas = stage.canvas
     x1, y1, x2, y2 = rect
@@ -254,7 +280,8 @@ def draw_telemetry_card(stage, rect: Rect, motion, *, fps, latency_ms, phase_val
         phase_value=phase_value, target=target, voice_status=voice_status,
         adaptation_active=adaptation_active, error=error, loss=loss, gripper=gripper,
         robot_connected=robot_connected, hand_conf=hand_conf,
-        is_recording=is_recording, recorded_frames=recorded_frames)
+        is_recording=is_recording, recorded_frames=recorded_frames,
+        utterance=utterance, intent_conditioned=intent_conditioned)
 
     for item in items:
         kind = item[0]
@@ -262,10 +289,15 @@ def draw_telemetry_card(stage, rect: Rect, motion, *, fps, latency_ms, phase_val
         if kind == "head":
             text(canvas, "Precognition", (lx, y + int(26 * s)), 0.62 * s,
                  C["label"], 1, _FONT_HEAVY)
-            live_dot(canvas, (rx - int(5 * s), y + int(18 * s)),
-                     C["green"] if fps >= 15 else C["orange"], time.time() * 3.0, 3.4 * s)
             text(canvas, "visuomotor hand policy", (lx, y + int(48 * s)),
                  0.36 * s, C["quaternary"])
+            ph_col = phase_colour(phase_value)
+            ph_txt = phase_label(phase_value)
+            pw = cv2.getTextSize(ph_txt, _FONT, 0.34 * s, 1)[0][0] + int(18 * s)
+            pill(canvas, (rx - pw, y + int(6 * s), rx, y + int(6 * s) + int(23 * s)), ph_col)
+            text_centre(canvas, ph_txt, rx - pw // 2, y + int(22 * s), 0.34 * s, ph_col)
+            live_dot(canvas, (rx - int(4 * s), y + int(46 * s)),
+                     C["green"] if fps >= 15 else C["orange"], time.time() * 3.0, 3.0 * s)
         elif kind == "tiles":
             tile_h = int(64 * s)
             gap = int(9 * s)
@@ -301,6 +333,31 @@ def draw_telemetry_card(stage, rect: Rect, motion, *, fps, latency_ms, phase_val
             gy = y + int(24 * s)
             progress_track(canvas, (lx, gy, rx, gy + int(10 * s)),
                            motion.to("grip", float(frac), 10.0), colour)
+        elif kind == "quote":
+            _, said, conditioned = item
+            if not said:
+                text(canvas, "nothing heard yet", (lx, y + int(16 * s)),
+                     0.36 * s, C["quaternary"])
+                text(canvas, "hold 'v' and say what to pick up",
+                     (lx, y + int(34 * s)), 0.32 * s, C["quaternary"])
+            else:
+                # ASCII only: the Hershey fonts OpenCV ships carry no glyphs
+                # beyond it, and typographic quotes rendered as a literal "???".
+                quoted = chr(34) + said + chr(34)
+                lines = wrap(quoted, 0.38 * s, rx - lx - int(10 * s))
+                for n, line in enumerate(lines[:_QUOTE_LINES]):
+                    if n == _QUOTE_LINES - 1 and len(lines) > _QUOTE_LINES:
+                        line = line.rstrip(chr(34) + " ") + "..." + chr(34)
+                    text(canvas, line, (lx, y + int(16 * s) + n * int(17 * s)),
+                         0.38 * s, C["label"])
+                if conditioned:
+                    # The embedding is what actually reaches the policy; say so,
+                    # because "heard you" and "learning from it" are different
+                    # claims and only one of them is being made here.
+                    cv2.circle(canvas, (lx + int(3 * s), y + int(38 * s)),
+                               int(2.5 * s), C["teal"], -1, cv2.LINE_AA)
+                    text(canvas, "conditioning the policy",
+                         (lx + int(12 * s), y + int(41 * s)), 0.30 * s, C["teal"])
         elif kind == "rule":
             rule(canvas, lx, rx, y + int(12 * s))
         elif kind == "rec":

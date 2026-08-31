@@ -72,7 +72,8 @@ def render(width: int, height: int, phase: str, motion, stage, cam, depth) -> np
         stage, L.telemetry, motion, fps=24.3, latency_ms=88, phase_value=phase,
         target="coffee cup", voice_status="IDLE", adaptation_active=True, reward=0.63,
         error=0.041, loss=0.060, gripper=0.42, robot_connected=True,
-        hand_conf=0.92, is_recording=False, recorded_frames=0, scale=s)
+        hand_conf=0.92, is_recording=False, recorded_frames=0, scale=s,
+        utterance="I'm going to pick up this coffee cup", intent_conditioned=True)
     hud.draw_depth_card(stage, L.depth, depth, s)
     hud.draw_hotkey_card(stage, L.hotkeys, HOTKEYS, s)
     if L.learning:

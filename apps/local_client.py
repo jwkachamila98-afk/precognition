@@ -930,6 +930,7 @@ class LocalClientRunner:
         # an API key is available, since it's confirmed higher quality than the local
         # tiny.en Whisper model and macOS 'say' - each still falls back automatically
         # to its non-Gemini counterpart internally on any network/API failure.
+        self.gemini_api_key = gemini_api_key
         if gemini_api_key:
             self.transcriber: AudioTranscriberABC = GeminiTranscriber(api_key=gemini_api_key)
             logger.info("LocalClient: Using GeminiTranscriber for voice intent capture.")
@@ -1142,6 +1143,13 @@ class LocalClientRunner:
                 "MockResidualPolicy, which DOES NOT LEARN."
             )
             return MockResidualPolicy()
+
+    def _spoken_intent(self) -> Optional[str]:
+        """The last utterance, or None if it is a placeholder rather than speech."""
+        said = (self.intent or "").strip()
+        if not said or said.lower() in ("idle", "none", "standby"):
+            return None
+        return said
 
     def _current_voice_status(self) -> str:
         """Voice status for display, expiring any transient notice."""
@@ -1481,7 +1489,11 @@ class LocalClientRunner:
             robot_connected=self.robot.is_connected,
             hand_conf=(poses[0].confidence if poses else None),
             is_recording=self.recorder.is_recording,
-            recorded_frames=self.recorder.frame_count, scale=s)
+            recorded_frames=self.recorder.frame_count, scale=s,
+            # What the user actually said, and whether it is reaching the policy
+            # as an embedding rather than merely having been heard.
+            utterance=self._spoken_intent(),
+            intent_conditioned=bool(self.gemini_api_key))
 
         UIH.draw_depth_card(stage, L.depth, depth_heatmap, s)
         UIH.draw_hotkey_card(stage, L.hotkeys, self.STAGE_HOTKEYS, s)
