@@ -66,6 +66,30 @@ class IntentParserABC(ABC):
         pass
 
 
+# Verbs that describe handling something, rather than naming it.
+_MANIPULATION_VERBS = {
+    "pick", "picking", "picks", "picked", "grasp", "grasping", "grab", "grabbing",
+    "take", "taking", "took", "get", "getting", "reach", "reaching", "lift",
+    "lifting", "hold", "holding", "push", "pushing", "move", "moving", "slide",
+    "sliding", "point", "pointing", "hand", "pass", "drink", "drinking", "open",
+    "opening", "press", "pressing", "touch", "touching", "use", "using", "put",
+}
+
+# Never part of the object's name: articles, prepositions, pronouns and verbs.
+_PHRASE_STOPWORDS = {
+    "please", "can", "you", "me", "to", "for", "a", "an", "the", "is", "of",
+    "on", "in", "at", "my", "some", "and", "then", "it", "up", "from", "with",
+    "so", "i", "im", "will", "by", "over", "into", "onto", "out", "off", "that",
+    "this", "there", "here", "now", "aside", "away", "please",
+}
+
+# Words that are never the thing being manipulated.
+_NON_OBJECTS = {
+    "it", "object", "item", "something", "up", "the", "and", "target", "standby",
+    "this", "that", "them", "these", "those", "one", "thing", "stuff", "there",
+}
+
+
 class MockLLMIntentParser(IntentParserABC):
     """
     Lightweight rule-based semantic parser simulating an LLM reasoning engine.
@@ -145,31 +169,60 @@ class MockLLMIntentParser(IntentParserABC):
             )
 
         # 1. Target Object Extraction
+        #
+        # Keep the words the user actually said. This used to rewrite the noun
+        # through KNOWN_OBJECTS, so "water cup" came back as "coffee cup" - a
+        # DIFFERENT object, silently substituted, and then hunted for in the
+        # scene. That mapping made sense when detection could only name eighty
+        # COCO classes and every phrase had to be forced onto one of them. With
+        # open-vocabulary detection the user's own phrase is the better query,
+        # and the alias table survives only to help matching downstream.
         target_obj = "none"
-        for key, canonical_name in self.KNOWN_OBJECTS.items():
-            if re.search(rf"\b{re.escape(key)}\b", transcript_lower):
-                target_obj = canonical_name
+
+        # The noun phrase governed by a manipulation verb: "pick up the small
+        # water cup" -> "small water cup". Up to three words, because that is
+        # where useful description ends and transcription noise begins.
+        # Verb forms vary - "pick up", "picking", "grabbed". Matching only the
+        # bare stem missed "picking this remote control" entirely.
+        phrase = re.search(
+            r"(?:pick(?:ing|s|ed)?\s+up|pick(?:ing|s|ed)?|grasp(?:ing|s|ed)?|"
+            r"grab(?:bing|s|bed)?|tak(?:e|ing)|took|get(?:ting)?|reach(?:ing)?\s+for|"
+            r"lift(?:ing|s|ed)?|hold(?:ing)?|push(?:ing|es|ed)?|mov(?:e|ing)|"
+            r"slid(?:e|ing)|point(?:ing)?\s+at|hand(?:ing)?\s+me|pass(?:ing)?\s+me|"
+            r"giv(?:e|ing)\s+me|drink(?:ing)?\s+from|open(?:ing)?|press(?:ing)?|"
+            r"touch(?:ing)?|us(?:e|ing))\s+"
+            r"(?:the\s+|a\s+|an\s+|this\s+|that\s+|my\s+)?"
+            r"((?:[a-zA-Z-]+\s+){0,2}[a-zA-Z-]+)",
+            transcript_lower)
+        if phrase:
+            candidate = phrase.group(1).strip()
+            candidate = re.sub(r"\b(?:and|then|it|up|from|with|to|so|i|im|will)\b.*$",
+                               "", candidate).strip()
+            if candidate and candidate not in _NON_OBJECTS:
+                target_obj = candidate
+
+        # Otherwise a known object word anchors it - as a MATCH, not a rewrite,
+        # so the spoken form survives. Longest key first, or "remote" would win
+        # over "remote control" purely because it is earlier in the table.
+        if target_obj == "none":
+            for key in sorted(self.KNOWN_OBJECTS, key=len, reverse=True):
+                if not re.search(rf"\b{re.escape(key)}\b", transcript_lower):
+                    continue
+                # Grow the phrase outward from the anchor in both directions.
+                # Restricting this to colours and sizes threw away the word that
+                # distinguishes the object - "water cup" is not "coffee cup" -
+                # and matching only backwards left "my coffee mug" as "coffee".
+                span = re.search(
+                    rf"\b(\w+\s+)?{re.escape(key)}(\s+\w+)?\b", transcript_lower)
+                lead = (span.group(1) or "").strip() if span else ""
+                trail = (span.group(2) or "").strip() if span else ""
+                parts = [key]
+                if lead and lead not in _PHRASE_STOPWORDS:
+                    parts.insert(0, lead)
+                if trail and trail not in _PHRASE_STOPWORDS:
+                    parts.append(trail)
+                target_obj = " ".join(parts)
                 break
-
-        # Fallback noun matching (e.g. "pick up the stapler")
-        if target_obj == "none":
-            match = re.search(r"(?:pick\s+up|grasp|grab|take|get|reach\s+for|lift|hold)\s+(?:the\s+|a\s+|an\s+|this\s+)?([a-zA-Z_-]+)", transcript_lower)
-            if match:
-                extracted = match.group(1).strip()
-                if extracted not in ("it", "object", "item", "something", "up", "the", "and", "target", "standby"):
-                    target_obj = extracted
-
-        # Final fallback: a short (1-2 word) bare noun phrase with no wrapping verb at
-        # all (e.g. just saying "wine glass" into the mic) becomes the target itself,
-        # rather than being silently dropped as "none". Capped at 2 words since every
-        # COCO-80 class name/alias is at most two words - longer phrases are far more
-        # likely to be noise/garbled transcription than a real object name.
-        if target_obj == "none":
-            stripped = re.sub(r"[^\w\s]", "", transcript_lower).strip()
-            words = stripped.split()
-            filler_words = {"please", "can", "you", "give", "me", "to", "for", "a", "an", "the"}
-            if 1 <= len(words) <= 2 and not (set(words) & filler_words):
-                target_obj = stripped
 
         # 2. Action Type Extraction
         action_type = "reach_and_grasp"

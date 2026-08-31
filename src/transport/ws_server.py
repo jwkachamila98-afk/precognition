@@ -137,6 +137,24 @@ class WSInferenceServer:
         self._autonomous_demo_wait_start = 0.0
         self._AUTONOMOUS_DEMO_TARGET_TIMEOUT_SEC = 12.0
 
+    def _record_trial_if_scorable(self, rep, intent=None) -> bool:
+        """Record a completed trial, unless there was nothing to score.
+
+        With no object detected there is no plan, so the comparison comes back
+        as zeros. Recording that as a trial reports PERFECT accuracy for an
+        attempt that was never measured - it flatters the error curve on screen
+        and feeds a fabricated reward into the policy's history.
+        """
+        if not rep.is_scorable:
+            logger.warning(
+                "Episode not scored: no foreseen plan to compare against "
+                f"({rep.num_steps_real} tracked frames, {rep.num_steps_sim} planned). "
+                "Usually means no object was detected - check the target is in view."
+            )
+            return False
+        self.benchmark.record_trial(rep, intent=intent if intent is not None else self.intent)
+        return True
+
     def _action_plan_for(self, utterance: Optional[str]):
         """How the spoken verb should be carried out.
 
@@ -351,7 +369,7 @@ class WSInferenceServer:
                         )
                         episode_report_dict = rep.to_dict()
                         self.workflow.last_adaptation_report = episode_report_dict
-                        self.benchmark.record_trial(rep, intent=frame_msg.intent)
+                        self._record_trial_if_scorable(rep, frame_msg.intent)
                         logger.info(f"Episode Discrepancy Compiled: Reward={rep.episode_reward:+.3f} | MSE={rep.mean_pose_error:.4f}m")
 
                         # Fold this episode's directional error into the accumulated

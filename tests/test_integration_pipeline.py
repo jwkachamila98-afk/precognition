@@ -35,7 +35,7 @@ def test_full_visuomotor_pipeline_end_to_end():
     intent_parser = MockLLMIntentParser()
     raw_speech = "grasp the red coffee cup by the handle"
     parsed_intent = intent_parser.parse_intent(raw_speech)
-    assert parsed_intent.target_object == "coffee cup"
+    assert parsed_intent.target_object == "red coffee cup"
     assert parsed_intent.affordance_hotspot == "handle"
 
     # 2. Perception: Scene Parsing & Depth

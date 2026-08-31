@@ -62,6 +62,18 @@ class EpisodeDiscrepancyReport:
     # The loop then converges to a fixed point that leaves roughly half the offset
     # standing. Measuring where the correction is actually applied closes that gap.
 
+    @property
+    def is_scorable(self) -> bool:
+        """Whether this episode was actually measured against anything.
+
+        With no object detected there is no plan, and the comparison returns
+        zeros throughout. Those zeros used to be recorded as a completed trial
+        with PERFECT accuracy and neutral reward, which flatters the error
+        curve, pollutes the reward history the policy trains on, and is simply
+        untrue - the attempt was never scored at all.
+        """
+        return self.num_steps_sim > 0 and self.num_steps_real > 0
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "mean_pose_error": float(self.mean_pose_error),

@@ -1182,6 +1182,24 @@ class LocalClientRunner:
             )
             return MockResidualPolicy()
 
+    def _record_trial_if_scorable(self, rep, intent=None) -> bool:
+        """Record a completed trial, unless there was nothing to score.
+
+        With no object detected there is no plan, so the comparison comes back
+        as zeros. Recording that as a trial reports PERFECT accuracy for an
+        attempt that was never measured - it flatters the error curve on screen
+        and feeds a fabricated reward into the policy's history.
+        """
+        if not rep.is_scorable:
+            logger.warning(
+                "Episode not scored: no foreseen plan to compare against "
+                f"({rep.num_steps_real} tracked frames, {rep.num_steps_sim} planned). "
+                "Usually means no object was detected - check the target is in view."
+            )
+            return False
+        self.benchmark.record_trial(rep, intent=intent if intent is not None else self.intent)
+        return True
+
     def _refresh_action_plan(self) -> ActionPlan:
         """The current reading of what the user said they would do."""
         said = self._spoken_intent()
@@ -1977,7 +1995,7 @@ class LocalClientRunner:
                             )
                             self.last_episode_report = rep
                             self._reward_history.append(float(rep.episode_reward))
-                            self.benchmark.record_trial(rep, intent=self.intent)
+                            self._record_trial_if_scorable(rep)
                             episode_offset = np.clip(
                                 np.array(rep.grasp_wrist_offset, dtype=np.float32), -0.05, 0.05
                             )

@@ -59,7 +59,11 @@ def test_mock_llm_intent_parser():
 
     # 1. Complex cup instruction
     intent_1 = parser.parse_intent("grasp the red coffee cup by the handle")
-    assert intent_1.target_object == "coffee cup"
+    # The target keeps the words the user said, descriptors included. It used
+    # to be rewritten through a canonical table ("water cup" -> "coffee cup"),
+    # which substituted a different object and discarded the very adjectives
+    # that let open-vocabulary grounding tell two cups apart.
+    assert intent_1.target_object == "red coffee cup"
     assert "red" in intent_1.spatial_attributes
     assert intent_1.affordance_hotspot == "handle"
     assert intent_1.action_type == "reach_and_grasp"
@@ -73,7 +77,7 @@ def test_mock_llm_intent_parser():
 
     # 3. Spatial attribute bottle instruction
     intent_3 = parser.parse_intent("pick up the tall water bottle on the right")
-    assert intent_3.target_object == "water bottle"
+    assert intent_3.target_object == "tall water bottle"
     assert "tall" in intent_3.spatial_attributes
     assert "right" in intent_3.spatial_attributes
     assert intent_3.is_active
@@ -140,7 +144,7 @@ async def test_phase6_websocket_e2e():
 
         parsed_intent = response.get_parsed_intent()
         assert parsed_intent is not None
-        assert parsed_intent.target_object == "coffee cup"
+        assert parsed_intent.target_object == "red coffee cup"
         assert parsed_intent.affordance_hotspot == "handle"
         assert "red" in parsed_intent.spatial_attributes
 
@@ -152,3 +156,41 @@ async def test_phase6_websocket_e2e():
     finally:
         await client.close()
         await server.stop()
+
+
+def test_the_target_keeps_the_words_the_user_actually_said():
+    """Saying "water cup" used to come back as "coffee cup".
+
+    KNOWN_OBJECTS rewrote the spoken noun into a canonical name, so the system
+    went looking for a different object than the one named. That mapping existed
+    because detection could only name eighty COCO classes and every phrase had
+    to be forced onto one of them; with open-vocabulary detection the user's own
+    words are the better query, and the descriptors are what tell two similar
+    objects apart.
+    """
+    parser = MockLLMIntentParser()
+    cases = {
+        "I'm going to pick up this water cup and drink from it": "water cup",
+        "grab the red coffee cup": "red coffee cup",
+        "push the small black remote aside": "small black remote",
+        "hand me the spoon": "spoon",
+        "point at the houseplant": "houseplant",
+        "take the utensil holder": "utensil holder",
+        "foresee me picking this remote control": "remote control",
+    }
+    for utterance, expected in cases.items():
+        got = parser.parse_intent(utterance).target_object
+        assert got == expected, f"{utterance!r} -> {got!r}, expected {expected!r}"
+
+
+def test_a_longer_known_name_wins_over_a_shorter_one():
+    """"remote" must not beat "remote control" just by being earlier in the table."""
+    parser = MockLLMIntentParser()
+    assert parser.parse_intent("the remote control please").target_object == "remote control"
+
+
+def test_filler_words_are_never_treated_as_the_object():
+    parser = MockLLMIntentParser()
+    for utterance in ("pick up this thing", "grab that one", "take it"):
+        target = parser.parse_intent(utterance).target_object
+        assert target in ("none", ""), f"{utterance!r} -> {target!r}"
