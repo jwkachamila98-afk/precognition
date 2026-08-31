@@ -35,6 +35,7 @@ from config.config_parser import AppConfig
 # Must run before torch/ultralytics are imported: they download models over
 # HTTPS and cannot be handed a custom SSL context (see src/utils/certs.py).
 from src.utils.certs import ensure_ca_bundle
+from src.utils.preflight import enforce, server_checks
 
 ensure_ca_bundle()
 
@@ -67,6 +68,11 @@ def main() -> None:
     parser.add_argument("--host", type=str, default=None, help="Host address to bind")
     parser.add_argument("--port", type=int, default=None, help="Port to listen on (default 8765)")
     parser.add_argument("--tracker", type=str, default="mediapipe", choices=["mediapipe", "mock"], help="Hand tracker backend")
+    parser.add_argument("--allow-degraded", action="store_true",
+                        help="Start even if real components are unavailable, substituting mocks. "
+                             "Output may be SYNTHETIC - never present it as real.")
+    parser.add_argument("--skip-preflight", action="store_true",
+                        help="Skip startup verification entirely.")
     args = parser.parse_args()
 
     config_path = Path(args.config)
@@ -76,6 +82,18 @@ def main() -> None:
     app_config = AppConfig.from_yaml(config_path)
     host = args.host or "0.0.0.0"
     port = args.port or app_config.network.server_port
+
+    # Verify before building anything. Every component below has a mock
+    # fallback that logs a warning and carries on; that is right for
+    # development and wrong for a demonstration, where it means presenting
+    # fabricated hand poses and a stub policy as though they were real.
+    if not args.skip_preflight:
+        checks = server_checks(port=port, require_cuda=not args.allow_degraded)
+        if not enforce(checks, "PRECOGNITION - inference server preflight",
+                       allow_degraded=args.allow_degraded):
+            sys.exit(1)
+
+    strict = not args.allow_degraded
 
     logger.info("Initializing Phase 8 perception, LLM intent reasoning, robot hardware, and co-adaptation analytics...")
 
@@ -96,8 +114,15 @@ def main() -> None:
             except Exception as e2:
                 logger.warning(f"Legacy MediaPipe hand tracker initialization also failed: {e2}")
     if hand_tracker is None:
+        if strict and args.tracker != "mock":
+            logger.error(
+                "RemoteServer: no real hand tracker available. Refusing to start on a "
+                "MockHandTracker, which would synthesise hand poses indistinguishable "
+                "from tracked ones. Pass --allow-degraded to override."
+            )
+            sys.exit(1)
         hand_tracker = MockHandTracker()
-        logger.warning("RemoteServer: Falling back to MockHandTracker (no real hand tracking available).")
+        logger.warning("RemoteServer: Falling back to MockHandTracker (SYNTHETIC hand poses).")
 
     # --- Depth: real MiDaS monocular depth on GPU -> mock synthetic depth ---
     try:
@@ -182,7 +207,14 @@ def main() -> None:
         scene_parser = MockSceneParser(
             num_points=app_config.perception.scene_parser.num_points
         )
-        logger.warning("RemoteServer: Falling back to MockSceneParser (no real object recognition available).")
+        if strict:
+            logger.error(
+                "RemoteServer: no real object detector available. Refusing to start on a "
+                "MockSceneParser, which would invent objects that are not in the scene. "
+                "Pass --allow-degraded to override."
+            )
+            sys.exit(1)
+        logger.warning("RemoteServer: Falling back to MockSceneParser (SYNTHETIC objects).")
     affordance_extractor = MockAffordanceExtractor()
     trajectory_diffusion = MockTrajectoryDiffusion()
     discrepancy_engine = DiscrepancyEngine()
@@ -198,7 +230,14 @@ def main() -> None:
             "trained online via Reward-Weighted Regression."
         )
     except ImportError as e:
-        logger.warning(f"NeuralResidualPolicy unavailable ({e}); falling back to MockResidualPolicy.")
+        if strict:
+            logger.error(
+                f"RemoteServer: NeuralResidualPolicy unavailable ({e}). Refusing to start on "
+                "a MockResidualPolicy, which does not learn - the adaptation shown would be "
+                "theatre. Pass --allow-degraded to override."
+            )
+            sys.exit(1)
+        logger.warning(f"NeuralResidualPolicy unavailable ({e}); using MockResidualPolicy (DOES NOT LEARN).")
         policy = MockResidualPolicy()
 
     workflow = WorkflowController(foresee_steps=60, wait_user_timeout=2.0, auto_advance=True)

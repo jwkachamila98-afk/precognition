@@ -15,6 +15,7 @@ import argparse
 import importlib.util
 import asyncio
 import collections
+from dataclasses import replace
 import math
 import threading
 import logging
@@ -41,6 +42,7 @@ from config.config_parser import AppConfig
 # Must run before torch/ultralytics are imported: they download models over
 # HTTPS and cannot be handed a custom SSL context (see src/utils/certs.py).
 from src.utils.certs import ensure_ca_bundle
+from src.utils.preflight import client_checks, enforce
 
 ensure_ca_bundle()
 
@@ -186,6 +188,25 @@ class LocalVisualizer:
         # only refreshes once per server round-trip (~250-400ms), so without smoothing
         # the ghost would visibly teleport to a new pose each update instead of gliding.
         self._smoothed_ghost_kpts: Optional[np.ndarray] = None
+        # Annotations used to be drawn on the 640x480 feed and then scaled up
+        # roughly threefold into the video card, which left every skeleton line,
+        # box and label soft next to the chrome around them. They are now drawn
+        # at the card's own resolution; this is the factor between the two, and
+        # line weights and type sizes are multiplied by it so the drawing keeps
+        # its proportions instead of becoming hairline-thin at the larger size.
+        self.draw_scale: float = 1.0
+
+    def _fs(self, base: float) -> float:
+        """Font size at the current drawing scale."""
+        return base * self.draw_scale
+
+    def _th(self, base: int = 1) -> int:
+        """Stroke weight at the current drawing scale, never thinner than 1."""
+        return max(1, int(round(base * self.draw_scale)))
+
+    def _px(self, base: float) -> int:
+        """A pixel offset or radius at the current drawing scale."""
+        return max(1, int(round(base * self.draw_scale)))
 
     def _rounded_panel_mask(self, w: int, h: int, radius: int):
         """Build (and cache) an anti-aliased rounded-rect alpha mask + border contour."""
@@ -247,7 +268,7 @@ class LocalVisualizer:
                 pt1 = (int(np.clip(kpts_2d[u, 0], 0, w - 1)), int(np.clip(kpts_2d[u, 1], 0, h - 1)))
                 pt2 = (int(np.clip(kpts_2d[v, 0], 0, w - 1)), int(np.clip(kpts_2d[v, 1], 0, h - 1)))
                 color = get_bone_color(u, v)
-                cv2.line(glow_layer, pt1, pt2, color, thickness=6, lineType=cv2.LINE_AA)
+                cv2.line(glow_layer, pt1, pt2, color, thickness=self._th(6), lineType=cv2.LINE_AA)
             cv2.addWeighted(glow_layer, 0.40, frame, 0.60, 0, frame)
 
             # 2. Core Sharp Bone Lines
@@ -255,7 +276,7 @@ class LocalVisualizer:
                 pt1 = (int(np.clip(kpts_2d[u, 0], 0, w - 1)), int(np.clip(kpts_2d[u, 1], 0, h - 1)))
                 pt2 = (int(np.clip(kpts_2d[v, 0], 0, w - 1)), int(np.clip(kpts_2d[v, 1], 0, h - 1)))
                 color = get_bone_color(u, v)
-                cv2.line(frame, pt1, pt2, color, thickness=2, lineType=cv2.LINE_AA)
+                cv2.line(frame, pt1, pt2, color, thickness=self._th(2), lineType=cv2.LINE_AA)
 
             # 3. High-Tech Joint Nodes & Fingertip Pulsing Halos
             for j_idx in range(21):
@@ -264,20 +285,20 @@ class LocalVisualizer:
                 
                 if is_tip:
                     # Pulsing outer ring
-                    halo_r = int(7 + 3 * pulse)
+                    halo_r = self._px(7 + 3 * pulse)
                     ring_col = (100, 255, 180) if adaptation_active else (255, 230, 100)
-                    cv2.circle(frame, pt, halo_r, ring_col, 1, lineType=cv2.LINE_AA)
-                    cv2.circle(frame, pt, 5, (10, 20, 25), -1, lineType=cv2.LINE_AA)
-                    cv2.circle(frame, pt, 4, ring_col, -1, lineType=cv2.LINE_AA)
-                    cv2.circle(frame, pt, 1, (255, 255, 255), -1, lineType=cv2.LINE_AA)
+                    cv2.circle(frame, pt, halo_r, ring_col, self._th(1), lineType=cv2.LINE_AA)
+                    cv2.circle(frame, pt, self._px(5), (10, 20, 25), -1, lineType=cv2.LINE_AA)
+                    cv2.circle(frame, pt, self._px(4), ring_col, -1, lineType=cv2.LINE_AA)
+                    cv2.circle(frame, pt, self._px(1), (255, 255, 255), -1, lineType=cv2.LINE_AA)
                 else:
-                    cv2.circle(frame, pt, 4, (15, 20, 30), -1, lineType=cv2.LINE_AA)
-                    cv2.circle(frame, pt, 3, (220, 235, 250), -1, lineType=cv2.LINE_AA)
+                    cv2.circle(frame, pt, self._px(4), (15, 20, 30), -1, lineType=cv2.LINE_AA)
+                    cv2.circle(frame, pt, self._px(3), (220, 235, 250), -1, lineType=cv2.LINE_AA)
 
             # 4. Stylized 3D Coordinate Reticle on Wrist
             wrist_2d = (int(np.clip(kpts_2d[0, 0], 0, w - 1)), int(np.clip(kpts_2d[0, 1], 0, h - 1)))
             wrist_z = max(kpts_3d[0, 2], 0.1)
-            axis_len = int(45 / wrist_z)
+            axis_len = self._px(45 / wrist_z)
             cv2.arrowedLine(frame, wrist_2d, (wrist_2d[0] + axis_len, wrist_2d[1]), (60, 60, 255), 2, tipLength=0.2)
             cv2.arrowedLine(frame, wrist_2d, (wrist_2d[0], wrist_2d[1] - axis_len), (80, 255, 120), 2, tipLength=0.2)
             
@@ -288,9 +309,9 @@ class LocalVisualizer:
             if sub_rect.size > 0:
                 dark_badge = np.full_like(sub_rect, (15, 20, 30))
                 cv2.addWeighted(dark_badge, 0.75, sub_rect, 0.25, 0, sub_rect)
-            cv2.rectangle(frame, (bx, by), (bx + badge_w, by + badge_h), PALETTE["cyan_electric"], 1)
+            cv2.rectangle(frame, (bx, by), (bx + badge_w, by + badge_h), PALETTE["cyan_electric"], self._th(1))
             cv2.putText(frame, f"MANO {pose.side.value[:1].upper()}:{pose.confidence*100:.0f}%", 
-                        (bx + 8, by + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 255, 255), 1, cv2.LINE_AA)
+                        (bx + 8, by + 14), cv2.FONT_HERSHEY_SIMPLEX, self._fs(0.38), (255, 255, 255), 1, cv2.LINE_AA)
 
     @staticmethod
     def _compute_similarity_transform(
@@ -521,7 +542,7 @@ class LocalVisualizer:
             cv2.ellipse(frame, (cx_i, cy_i), (px_w // 2, px_h // 2), 0, 0, 360, (0, 235, 255), 2, cv2.LINE_AA)
         label = target_bbox.label.replace("_", " ")
         cv2.putText(frame, label, (cx_i - px_w // 2, cy_i - px_h // 2 - 6),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.34, (0, 235, 255), 1, cv2.LINE_AA)
+                    cv2.FONT_HERSHEY_SIMPLEX, self._fs(0.34), (0, 235, 255), 1, cv2.LINE_AA)
 
     def draw_hand_replay(
         self,
@@ -603,7 +624,7 @@ class LocalVisualizer:
         if label:
             wrist_pt = (int(np.clip(ghost_kpts_2d[0, 0], 0, w - 1)), int(np.clip(ghost_kpts_2d[0, 1], 0, h - 1)))
             cv2.putText(frame, label, (wrist_pt[0] - 60, wrist_pt[1] - 14),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, color, 1, cv2.LINE_AA)
+                        cv2.FONT_HERSHEY_SIMPLEX, self._fs(0.38), color, 1, cv2.LINE_AA)
 
         return idx + 1
 
@@ -1168,6 +1189,44 @@ class LocalClientRunner:
                 self._mesh_author_busy.discard(label)
 
         threading.Thread(target=_work, name=f"mesh-author:{label}", daemon=True).start()
+
+    def _to_display_resolution(self, frame, poses):
+        """Enlarge the feed to its card size and rescale 2-D landmarks to match.
+
+        Returns the enlarged frame and a SEPARATE list of display poses. The
+        originals are left alone: they are still being recorded, scored and
+        replayed in sensor pixels, and rescaling them in place would silently
+        corrupt the episode the user is performing - it happens to be safe today
+        only because the recorder reads them a few lines earlier.
+        """
+        L = self.stage.layout
+        target_w, target_h = L.video[2] - L.video[0], L.video[3] - L.video[1]
+        src_h, src_w = frame.shape[:2]
+        if target_w <= 0 or target_h <= 0 or (target_w, target_h) == (src_w, src_h):
+            self.visualizer.draw_scale = 1.0
+            return frame, list(poses or [])
+
+        sx, sy = target_w / float(src_w), target_h / float(src_h)
+        # One factor drives type and stroke weight; the axes differ only by the
+        # rounding of an aspect-preserving fit, so their mean is exact enough.
+        self.visualizer.draw_scale = float((sx + sy) * 0.5)
+
+        scale = np.array([sx, sy], dtype=np.float32)
+        display_poses = [replace(p, keypoints_2d=(p.keypoints_2d * scale).astype(np.float32))
+                         for p in (poses or [])]
+        return cv2.resize(frame, (target_w, target_h),
+                          interpolation=cv2.INTER_LINEAR), display_poses
+
+    def _scale_poses_for_display(self, poses):
+        """Display copies of `poses` at the current annotation scale."""
+        if not poses:
+            return poses
+        k = self.visualizer.draw_scale
+        if abs(k - 1.0) < 1e-3:
+            return poses
+        scale = np.array([k, k], dtype=np.float32)
+        return [replace(p, keypoints_2d=(p.keypoints_2d * scale).astype(np.float32))
+                for p in poses]
 
     def _update_lab_panel(
         self,
@@ -1990,9 +2049,17 @@ class LocalClientRunner:
                     fps_val = self.visualizer.update_fps()
                     print("\n" + self.profiler.format_table(fps=fps_val) + "\n")
 
-                # Render Visualizations
+                # Render Visualizations.
+                #
+                # Annotations are drawn at the VIDEO CARD's resolution, not the
+                # sensor's. Drawing them on the 640x480 feed and letting the
+                # stage scale it up left every line and label soft next to the
+                # crisp chrome around it - and the upscale happens either way,
+                # so doing it first costs nothing. Line drawing is vector work,
+                # so a larger canvas is essentially free; only the pixel-for-
+                # pixel lab render still pays for its own resolution.
                 fps = self.visualizer.update_fps()
-                self.visualizer.draw_hand_skeleton(frame, poses, residuals=residuals, adaptation_active=self.adaptation_active)
+                frame, display_poses = self._to_display_resolution(frame, poses)
                 # While a ghost hand is grasping on the live view, drop the 3-D
                 # wireframe to a plain rectangle - its pillars cut through the
                 # fingers exactly where the grasp needs to be legible.
@@ -2028,8 +2095,14 @@ class LocalClientRunner:
                 # rendered as a 3-D reenactment inside the simulated lab, which is
                 # composited over the whole frame further down (_update_lab_panel).
 
+                # The ghost is replayed from recordings held in SENSOR pixels;
+                # on the enlarged card they would be drawn at a fraction of the
+                # right position. Scale display copies, never the recordings -
+                # they are the episode being scored.
+                replay_poses = self._scale_poses_for_display(replay_poses)
+
                 foreseen_step = self.visualizer.draw_hand_replay(
-                    frame, replay_poses, real_poses=poses, reanchor=replay_reanchor, label=ghost_label,
+                    frame, replay_poses, real_poses=display_poses, reanchor=replay_reanchor, label=ghost_label,
                     target_bbox=bboxes[0] if bboxes else None, object_sprite=self._object_sprite
                 )
                 # The simulated-lab reenactment irises open over the camera
@@ -2139,6 +2212,10 @@ def main() -> None:
     parser.add_argument("--record", action="store_true", help="Automatically begin session recording on launch")
     parser.add_argument("--server-url", type=str, default=None, help="Custom WebSocket server URL (e.g. ws://<CLOUD_GPU_IP>:8765)")
     parser.add_argument("--gemini-key", type=str, default=os.environ.get("GEMINI_API_KEY"), help="Gemini API key for voice transcription + TTS (defaults to $GEMINI_API_KEY)")
+    parser.add_argument("--allow-degraded", action="store_true",
+                        help="Start even if the camera, microphone or server are unavailable. "
+                             "Output may be SYNTHETIC - never present it as real.")
+    parser.add_argument("--skip-preflight", action="store_true", help="Skip startup verification.")
     args = parser.parse_args()
 
     config_path = Path(args.config)
@@ -2148,6 +2225,21 @@ def main() -> None:
     app_config = AppConfig.from_yaml(config_path)
     if args.device is not None:
         app_config.camera.device_id = args.device
+
+    # Verify before opening a window. A camera that opens but delivers nothing,
+    # or a server that is still installing, both otherwise present as a blank
+    # or frozen display with the reason buried in the log.
+    if not args.skip_preflight:
+        if args.gemini_key:
+            os.environ.setdefault("GEMINI_API_KEY", args.gemini_key)
+        remote = (args.mode or app_config.system.mode or "").startswith(("remote", "mock_remote"))
+        url = args.server_url or (
+            f"ws://{app_config.network.server_host}:{app_config.network.server_port}"
+            if remote else None)
+        checks = client_checks(server_url=url, device_id=app_config.camera.device_id)
+        if not enforce(checks, "PRECOGNITION - local client preflight",
+                       allow_degraded=args.allow_degraded):
+            sys.exit(1)
 
     runner = LocalClientRunner(
         config=app_config,
