@@ -69,6 +69,7 @@ from src.safety.safety_monitor import SafetyMonitor, SafetyStatus
 from src.mocks.mock_hand_tracker import MockHandTracker
 from src.ui import glass as UIG
 from src.ui import hud as UIH
+from src.ui import typography as T
 from src.ui.stage import Stage
 from src.mocks.mock_depth_estimator import MockDepthEstimator
 from src.mocks.mock_scene_parser import MockSceneParser
@@ -97,53 +98,16 @@ PRESET_INTENTS = [
     "grab the stylus pen near the keyboard",
 ]
 
-# Modern Cyber-Sleek Color Palette (BGR)
-PALETTE = {
-    "cyan_electric": (255, 240, 0),      # #00F0FF Electric Cyan
-    "neon_green": (80, 255, 120),        # #78FF50 Neon Emerald
-    "neon_violet": (255, 60, 180),       # #B43CFF Neon Purple
-    "amber_gold": (0, 205, 255),         # #FFCD00 Amber Gold
-    "laser_red": (60, 60, 255),          # #FF3C3C Warning Red
-    "dark_glass_bg": (12, 16, 22),       # Dark Slate Glass
-    "glass_border": (70, 85, 110),       # High-tech Border
-    "text_white": (245, 248, 252),       # Clean Crisp White
-    "text_dim": (140, 155, 175),         # Muted Blue-Grey
-    "text_mute": (105, 120, 140),        # Label column - recedes behind values
-    "hairline": (62, 74, 94),            # Section rules, barely there
-}
-
-# Anatomical finger bone colors (BGR)
-FINGER_COLORS = {
-    "thumb": (0, 215, 255),    # Gold
-    "index": (80, 255, 100),   # Neon Green
-    "middle": (255, 230, 40),  # Bright Cyan
-    "ring": (255, 130, 20),    # Electric Azure
-    "pinky": (240, 50, 240),   # Neon Magenta
-    "palm": (190, 210, 225),   # Cool Slate
-}
-
-# 3D bounding box wireframe edges connecting 8 corner vertices
-BBOX_EDGES = [
-    (0, 1), (1, 2), (2, 3), (3, 0), # Bottom face
-    (4, 5), (5, 6), (6, 7), (7, 4), # Top face
-    (0, 4), (1, 5), (2, 6), (3, 7)  # Vertical pillars
-]
-
-
-def get_bone_color(idx1: int, idx2: int) -> tuple:
-    """Select color based on anatomical finger group."""
-    joints = {idx1, idx2}
-    if 1 in joints or 2 in joints or 3 in joints or 4 in joints:
-        return FINGER_COLORS["thumb"]
-    elif 5 in joints or 6 in joints or 7 in joints or 8 in joints:
-        return FINGER_COLORS["index"]
-    elif 9 in joints or 10 in joints or 11 in joints or 12 in joints:
-        return FINGER_COLORS["middle"]
-    elif 13 in joints or 14 in joints or 15 in joints or 16 in joints:
-        return FINGER_COLORS["ring"]
-    elif 17 in joints or 18 in joints or 19 in joints or 20 in joints:
-        return FINGER_COLORS["pinky"]
-    return FINGER_COLORS["palm"]
+# The overlay speaks the same language as the chrome around it: the macOS
+# dark-mode system set from src/ui/hud.py, one accent, quiet neutrals. The
+# old overlay had its own neon palette, which made the video card read as a
+# different app from the panels beside it.
+INK = UIH.C
+# Drawing ON VIDEO needs two tones the glass chrome doesn't: a bone/line
+# colour bright enough to survive any room, and a backing dark enough to
+# seat a label on live footage.
+BONE = (236, 234, 233)
+SCRIM = (14, 13, 12)
 
 
 _FINGER_BASE_JOINT = {
@@ -200,10 +164,6 @@ class LocalVisualizer:
         # its proportions instead of becoming hairline-thin at the larger size.
         self.draw_scale: float = 1.0
 
-    def _fs(self, base: float) -> float:
-        """Font size at the current drawing scale."""
-        return base * self.draw_scale
-
     def _th(self, base: int = 1) -> int:
         """Stroke weight at the current drawing scale, never thinner than 1."""
         return max(1, int(round(base * self.draw_scale)))
@@ -246,80 +206,43 @@ class LocalVisualizer:
         residuals: Optional[List[float]] = None,
         adaptation_active: bool = True
     ) -> None:
-        """Draw tracked 21-joint hand skeleton with glowing bones and pulsing nodes."""
+        """The tracked 21-joint hand, drawn the way a pro tool annotates video:
+        thin near-white bones, small joints, the single accent on the
+        fingertips. No glow passes, no pulsing halos, no coordinate reticle -
+        the hand on screen is the user's own, and decoration on it competes
+        with the thing being demonstrated.
+
+        The joints are drawn exactly where the tracker put them. An earlier
+        version displaced the fingertips by the policy residuals, which
+        rendered the user's REAL hand somewhere it wasn't; corrections belong
+        on the plan (see draw_hand_replay), never on the measurement.
+        """
         if not self.config.visualization.draw_skeleton:
             return
 
         h, w = frame.shape[:2]
-        t = time.time()
-        pulse = 0.5 + 0.5 * np.sin(t * 6.0)
-
         for pose in poses:
-            kpts_2d = pose.keypoints_2d.copy()
-            kpts_3d = pose.keypoints_3d.copy()
+            kpts_2d = pose.keypoints_2d
 
-            if adaptation_active and residuals is not None and len(residuals) >= 7:
-                res_arr = np.array(residuals[:7], dtype=np.float32)
-                tip_indices = [4, 8, 12, 16, 20]
-                for i, tip in enumerate(tip_indices):
-                    delta_px = res_arr[i % len(res_arr)] * 80.0
-                    kpts_2d[tip, 0] += delta_px
-                    kpts_2d[tip, 1] -= delta_px * 0.5
+            def pt(i: int) -> tuple:
+                return (int(np.clip(kpts_2d[i, 0], 0, w - 1)),
+                        int(np.clip(kpts_2d[i, 1], 0, h - 1)))
 
-            # 1. Outer Glow Pass for bones
-            glow_layer = frame.copy()
             for u, v in HAND_CONNECTIONS:
-                pt1 = (int(np.clip(kpts_2d[u, 0], 0, w - 1)), int(np.clip(kpts_2d[u, 1], 0, h - 1)))
-                pt2 = (int(np.clip(kpts_2d[v, 0], 0, w - 1)), int(np.clip(kpts_2d[v, 1], 0, h - 1)))
-                color = get_bone_color(u, v)
-                cv2.line(glow_layer, pt1, pt2, color, thickness=self._th(6), lineType=cv2.LINE_AA)
-            cv2.addWeighted(glow_layer, 0.40, frame, 0.60, 0, frame)
-
-            # 2. Core Sharp Bone Lines
-            for u, v in HAND_CONNECTIONS:
-                pt1 = (int(np.clip(kpts_2d[u, 0], 0, w - 1)), int(np.clip(kpts_2d[u, 1], 0, h - 1)))
-                pt2 = (int(np.clip(kpts_2d[v, 0], 0, w - 1)), int(np.clip(kpts_2d[v, 1], 0, h - 1)))
-                color = get_bone_color(u, v)
-                cv2.line(frame, pt1, pt2, color, thickness=self._th(2), lineType=cv2.LINE_AA)
-
-            # 3. High-Tech Joint Nodes & Fingertip Pulsing Halos
+                cv2.line(frame, pt(u), pt(v), BONE, self._th(2), cv2.LINE_AA)
             for j_idx in range(21):
-                pt = (int(np.clip(kpts_2d[j_idx, 0], 0, w - 1)), int(np.clip(kpts_2d[j_idx, 1], 0, h - 1)))
-                is_tip = j_idx in (4, 8, 12, 16, 20)
-                
-                if is_tip:
-                    # Pulsing outer ring
-                    halo_r = self._px(7 + 3 * pulse)
-                    ring_col = (100, 255, 180) if adaptation_active else (255, 230, 100)
-                    cv2.circle(frame, pt, halo_r, ring_col, self._th(1), lineType=cv2.LINE_AA)
-                    cv2.circle(frame, pt, self._px(5), (10, 20, 25), -1, lineType=cv2.LINE_AA)
-                    cv2.circle(frame, pt, self._px(4), ring_col, -1, lineType=cv2.LINE_AA)
-                    cv2.circle(frame, pt, self._px(1), (255, 255, 255), -1, lineType=cv2.LINE_AA)
+                p = pt(j_idx)
+                if j_idx in (4, 8, 12, 16, 20):
+                    cv2.circle(frame, p, self._px(4), SCRIM, -1, cv2.LINE_AA)
+                    cv2.circle(frame, p, self._px(3), INK["blue"], -1, cv2.LINE_AA)
                 else:
-                    cv2.circle(frame, pt, self._px(4), (15, 20, 30), -1, lineType=cv2.LINE_AA)
-                    cv2.circle(frame, pt, self._px(3), (220, 235, 250), -1, lineType=cv2.LINE_AA)
-
-            # 4. Stylized 3D Coordinate Reticle on Wrist
-            wrist_2d = (int(np.clip(kpts_2d[0, 0], 0, w - 1)), int(np.clip(kpts_2d[0, 1], 0, h - 1)))
-            wrist_z = max(kpts_3d[0, 2], 0.1)
-            axis_len = self._px(45 / wrist_z)
-            cv2.arrowedLine(frame, wrist_2d, (wrist_2d[0] + axis_len, wrist_2d[1]), (60, 60, 255), 2, tipLength=0.2)
-            cv2.arrowedLine(frame, wrist_2d, (wrist_2d[0], wrist_2d[1] - axis_len), (80, 255, 120), 2, tipLength=0.2)
-            
-            # Wrist badge pill
-            badge_w, badge_h = 100, 20
-            bx, by = wrist_2d[0] - 50, wrist_2d[1] + 20
-            sub_rect = frame[max(0, by):min(h, by+badge_h), max(0, bx):min(w, bx+badge_w)]
-            if sub_rect.size > 0:
-                dark_badge = np.full_like(sub_rect, (15, 20, 30))
-                cv2.addWeighted(dark_badge, 0.75, sub_rect, 0.25, 0, sub_rect)
-            cv2.rectangle(frame, (bx, by), (bx + badge_w, by + badge_h), PALETTE["cyan_electric"], self._th(1))
-            cv2.putText(frame, f"MANO {pose.side.value[:1].upper()}:{pose.confidence*100:.0f}%", 
-                        (bx + 8, by + 14), cv2.FONT_HERSHEY_SIMPLEX, self._fs(0.38), (255, 255, 255), 1, cv2.LINE_AA)
+                    cv2.circle(frame, p, self._px(3), SCRIM, -1, cv2.LINE_AA)
+                    cv2.circle(frame, p, self._px(2), BONE, -1, cv2.LINE_AA)
 
     @staticmethod
     def _compute_similarity_transform(
-        src_p0: np.ndarray, src_p1: np.ndarray, dst_p0: np.ndarray, dst_p1: np.ndarray
+        src_p0: np.ndarray, src_p1: np.ndarray, dst_p0: np.ndarray, dst_p1: np.ndarray,
+        scale_limits: tuple = (0.4, 2.5),
     ) -> tuple:
         """2D rotation+scale+translation mapping the (src_p0 -> src_p1) frame onto the
         (dst_p0 -> dst_p1) frame. Used to retarget the ghost hand's baked-in wrist ->
@@ -332,7 +255,7 @@ class LocalVisualizer:
         if len_src < 1e-3 or len_dst < 1e-3:
             return np.eye(2, dtype=np.float32), (dst_p0 - src_p0).astype(np.float32)
 
-        scale = float(np.clip(len_dst / len_src, 0.4, 2.5))
+        scale = float(np.clip(len_dst / len_src, *scale_limits))
         angle = math.atan2(v_dst[1], v_dst[0]) - math.atan2(v_src[1], v_src[0])
         cos_a, sin_a = math.cos(angle), math.sin(angle)
         R = np.array([[cos_a, -sin_a], [sin_a, cos_a]], dtype=np.float32) * scale
@@ -437,7 +360,7 @@ class LocalVisualizer:
         center: tuple,
         px_w: int,
         px_h: int,
-        tint: tuple = (0, 235, 255),
+        tint: tuple = INK["teal"],
         alpha: float = 0.80,
     ) -> None:
         """Blend a captured real photo of the object into the frame at (center),
@@ -471,7 +394,8 @@ class LocalVisualizer:
         mask_roi = mask_f[sy0:sy1, sx0:sx1][..., None]
         frame[fy0:fy1, fx0:fx1] = (roi * (1.0 - mask_roi) + sprite_roi * mask_roi).astype(np.uint8)
 
-        cv2.ellipse(frame, (int(center[0]), int(center[1])), (px_w // 2, px_h // 2), 0, 0, 360, tint, 2, cv2.LINE_AA)
+        cv2.ellipse(frame, (int(center[0]), int(center[1])), (px_w // 2, px_h // 2),
+                    0, 0, 360, tint, self._th(1), cv2.LINE_AA)
 
     def _draw_object_replay_afterimage(
         self,
@@ -531,7 +455,7 @@ class LocalVisualizer:
             cx_i, cy_i = int(np.clip(center[0], 0, w - 1)), int(np.clip(center[1], 0, h - 1))
             age = (idx - s) / float(trail_span)
             in_contact = s >= grasp_idx
-            color = (0, 210, 255) if in_contact else (150, 210, 255)
+            color = INK["teal"] if in_contact else tuple(int(c * 0.55) for c in INK["teal"])
             cv2.ellipse(overlay, (cx_i, cy_i), (px_w // 2, px_h // 2), 0, 0, 360, color, -1, cv2.LINE_AA)
             cv2.addWeighted(overlay, 0.30 * (1.0 - age), frame, 1.0 - 0.30 * (1.0 - age), 0, dst=frame)
             overlay = frame.copy()
@@ -543,10 +467,8 @@ class LocalVisualizer:
         if sprite is not None and sprite.size > 0:
             self._stamp_object_sprite(frame, sprite, (cx_i, cy_i), px_w, px_h)
         else:
-            cv2.ellipse(frame, (cx_i, cy_i), (px_w // 2, px_h // 2), 0, 0, 360, (0, 235, 255), 2, cv2.LINE_AA)
-        label = target_bbox.label.replace("_", " ")
-        cv2.putText(frame, label, (cx_i - px_w // 2, cy_i - px_h // 2 - 6),
-                    cv2.FONT_HERSHEY_SIMPLEX, self._fs(0.34), (0, 235, 255), 1, cv2.LINE_AA)
+            cv2.ellipse(frame, (cx_i, cy_i), (px_w // 2, px_h // 2), 0, 0, 360,
+                        INK["teal"], self._th(1), cv2.LINE_AA)
 
     def draw_hand_replay(
         self,
@@ -555,7 +477,7 @@ class LocalVisualizer:
         real_poses: Optional[List[HandPose]] = None,
         reanchor: bool = False,
         label: str = "",
-        color: tuple = (255, 235, 100),
+        color: tuple = INK["teal"],
         target_bbox: Optional[BoundingBox3D] = None,
         object_sprite: Optional[np.ndarray] = None,
     ) -> int:
@@ -586,9 +508,35 @@ class LocalVisualizer:
         if reanchor and real_poses and len(real_poses[0].keypoints_2d) > 9:
             real_kpts = real_poses[0].keypoints_2d
             replay_kpts0 = replay_poses[0].keypoints_2d
-            self._ghost_transform = self._compute_similarity_transform(
-                replay_kpts0[0], replay_kpts0[9], real_kpts[0], real_kpts[9]
-            )
+            anchored_to_object = False
+            if target_bbox is not None and num_frames > 1:
+                # Anchor the PATH, not the starting pose: map the recorded
+                # (start wrist -> grasp wrist) segment onto (live wrist ->
+                # object). The ghost then leaves from wherever the real hand is
+                # AND its grasp frame lands on the object where it is NOW - so
+                # it visibly closes on the live bounding box instead of
+                # grabbing empty air wherever the object used to be. Both ends
+                # are re-read every frame, so it follows a moving hand and a
+                # moving object alike.
+                bbox_2d, _, _ = self._bbox_screen_rect(target_bbox, w, h)
+                dists = [float(np.linalg.norm(p.keypoints_3d[0] - target_bbox.center))
+                         for p in replay_poses]
+                grasp_idx = int(np.argmin(dists))
+                grasp_wrist = replay_poses[grasp_idx].keypoints_2d[0]
+                # A degenerate recording (grasp at the very first frame, or a
+                # reach too short to define a direction) can't anchor a path.
+                if grasp_idx > 0 and np.linalg.norm(grasp_wrist - replay_kpts0[0]) > 24.0:
+                    self._ghost_transform = self._compute_similarity_transform(
+                        replay_kpts0[0], grasp_wrist, real_kpts[0], bbox_2d,
+                        # Wider than the pose-matching clamp: reaching the
+                        # object is the point, however far away it now is.
+                        scale_limits=(0.2, 5.0),
+                    )
+                    anchored_to_object = True
+            if not anchored_to_object:
+                self._ghost_transform = self._compute_similarity_transform(
+                    replay_kpts0[0], replay_kpts0[9], real_kpts[0], real_kpts[9]
+                )
             R, t = self._ghost_transform
         else:
             R, t = np.eye(2, dtype=np.float32), np.zeros(2, dtype=np.float32)
@@ -606,14 +554,14 @@ class LocalVisualizer:
             (int(np.clip(u, 0, w - 1)), int(np.clip(v, 0, h - 1))) for u, v in trail_pts_raw
         ]
         if len(trail_pts) > 1:
+            # One colour, brightening toward the destination - the path reads
+            # as a single gesture, not a rainbow.
             for i in range(len(trail_pts) - 1):
-                alpha_frac = i / float(len(trail_pts))
-                trail_color = (
-                    int(255 * (1.0 - alpha_frac * 0.5)),
-                    int(240 * alpha_frac),
-                    int(80 * (1.0 - alpha_frac))
-                )
-                cv2.line(frame, trail_pts[i], trail_pts[i + 1], trail_color, 1 + int(alpha_frac * 2), lineType=cv2.LINE_AA)
+                along = i / float(len(trail_pts))
+                k = 0.30 + 0.70 * along
+                trail_color = tuple(int(c * k) for c in color)
+                cv2.line(frame, trail_pts[i], trail_pts[i + 1], trail_color,
+                         self._th(1 + along), lineType=cv2.LINE_AA)
 
         # Holographic afterimage hand, smoothed frame-to-frame so the loop glides
         # rather than snapping between recorded samples.
@@ -626,9 +574,11 @@ class LocalVisualizer:
         self._draw_hand_mesh(frame, ghost_kpts_2d, color, alpha=0.80)
 
         if label:
-            wrist_pt = (int(np.clip(ghost_kpts_2d[0, 0], 0, w - 1)), int(np.clip(ghost_kpts_2d[0, 1], 0, h - 1)))
-            cv2.putText(frame, label, (wrist_pt[0] - 60, wrist_pt[1] - 14),
-                        cv2.FONT_HERSHEY_SIMPLEX, self._fs(0.38), color, 1, cv2.LINE_AA)
+            wrist_pt = (int(np.clip(ghost_kpts_2d[0, 0], 0, w - 1)),
+                        int(np.clip(ghost_kpts_2d[0, 1], 0, h - 1)))
+            self._video_label(frame, label,
+                              (wrist_pt[0] - self._px(60), wrist_pt[1] + self._px(30)),
+                              colour=color, px=11)
 
         return idx + 1
 
@@ -708,7 +658,7 @@ class LocalVisualizer:
         content = cv2.resize(lab_image, (pw, ph), interpolation=cv2.INTER_LINEAR)
         roi = frame[y1:y2, x1:x2]
         roi[:] = (content * mask_f + roi * (1.0 - mask_f)).astype(np.uint8)
-        cv2.drawContours(roi, contours, -1, PALETTE["cyan_electric"], 1, lineType=cv2.LINE_AA)
+        cv2.drawContours(roi, contours, -1, (72, 70, 68), 1, lineType=cv2.LINE_AA)
 
         if e < 0.985:
             return  # chrome would be unreadable mid-flight
@@ -717,124 +667,137 @@ class LocalVisualizer:
 
     def _draw_lab_chrome(self, frame: np.ndarray, rect: tuple, target_label: str,
                          telemetry: dict, progress: float) -> None:
-        """Header, corner brackets, and the live plan telemetry strip."""
+        """Header and the live plan telemetry strip, in the app's own voice:
+        quiet tracked eyebrows, real type, one accent - no corner brackets."""
         x1, y1, x2, y2 = rect
-        pulse = 0.5 + 0.5 * float(np.sin(time.time() * 6.0))
-
-        for cx, cy, dx, dy in ((x1, y1, 1, 1), (x2, y1, -1, 1), (x1, y2, 1, -1), (x2, y2, -1, -1)):
-            cv2.line(frame, (cx, cy), (cx + dx * 16, cy), PALETTE["cyan_electric"], 2, cv2.LINE_AA)
-            cv2.line(frame, (cx, cy), (cx, cy + dy * 16), PALETTE["cyan_electric"], 2, cv2.LINE_AA)
 
         # Header strip
-        hh = 22
+        hh = self._px(26)
         head = frame[y1 + 1:y1 + 1 + hh, x1 + 1:x2 - 1]
         if head.size:
-            cv2.addWeighted(np.full_like(head, PALETTE["dark_glass_bg"]), 0.78, head, 0.22, 0, dst=head)
-        cv2.circle(frame, (x1 + 14, y1 + 12), int(3 + 2 * pulse), PALETTE["cyan_electric"], -1, cv2.LINE_AA)
-        cv2.putText(frame, "SIMULATED LAB  -  REENACTMENT", (x1 + 26, y1 + 16),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, PALETTE["cyan_electric"], 1, cv2.LINE_AA)
-        label = (target_label or "object").replace("_", " ").upper()
-        (lw, _), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.36, 1)
-        cv2.putText(frame, label, (x2 - 12 - lw, y1 + 16),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.36, PALETTE["text_white"], 1, cv2.LINE_AA)
+            cv2.addWeighted(np.full_like(head, SCRIM), 0.78, head, 0.22, 0, dst=head)
+        cv2.circle(frame, (x1 + self._px(15), y1 + hh // 2), self._px(3),
+                   INK["teal"], -1, cv2.LINE_AA)
+        T.draw_tracked(frame, "SIMULATED LAB · REENACTMENT",
+                       (x1 + self._px(26), y1 + self._px(18)), self._px(10),
+                       INK["secondary"])
+        label = (target_label or "object").replace("_", " ").capitalize()
+        T.draw(frame, label, (x2 - self._px(12), y1 + self._px(18)), self._px(11),
+               INK["label"], weight="medium", align="right")
 
         # Phase progress, hairline along the header's lower edge
         bar_w = int((x2 - x1 - 4) * float(np.clip(progress, 0.0, 1.0)))
         if bar_w > 0:
             cv2.line(frame, (x1 + 2, y1 + hh), (x1 + 2 + bar_w, y1 + hh),
-                     PALETTE["cyan_electric"], 2, cv2.LINE_AA)
+                     INK["blue"], self._th(2), cv2.LINE_AA)
 
         if not telemetry:
             return
 
         # Footer telemetry: every number here comes from the executed plan.
-        fh = 30
+        fh = self._px(34)
         fy1 = y2 - 1 - fh
         foot = frame[fy1:y2 - 1, x1 + 1:x2 - 1]
         if foot.size:
-            cv2.addWeighted(np.full_like(foot, PALETTE["dark_glass_bg"]), 0.80, foot, 0.20, 0, dst=foot)
+            cv2.addWeighted(np.full_like(foot, SCRIM), 0.80, foot, 0.20, 0, dst=foot)
 
-        ty = fy1 + 12
-        cv2.putText(frame, f"STEP {telemetry.get('step', 0):02d}/{telemetry.get('num_steps', 0):02d}",
-                    (x1 + 12, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.34, PALETTE["text_white"], 1, cv2.LINE_AA)
-        cv2.putText(frame, f"T+{telemetry.get('sim_time', 0.0):.2f}s", (x1 + 92, ty),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.34, PALETTE["text_dim"], 1, cv2.LINE_AA)
-        cv2.putText(frame, f"LIFT {telemetry.get('lift_cm', 0.0):4.1f} cm", (x1 + 154, ty),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.34, PALETTE["amber_gold"], 1, cv2.LINE_AA)
+        ty = fy1 + self._px(13)
+        px = self._px(10)
+        T.draw(frame, f"Step {telemetry.get('step', 0):02d}/{telemetry.get('num_steps', 0):02d}",
+               (x1 + self._px(12), ty), px, INK["label"], weight="medium")
+        T.draw(frame, f"T+{telemetry.get('sim_time', 0.0):.2f}s",
+               (x1 + self._px(94), ty), px, INK["tertiary"])
+        T.draw(frame, f"Lift {telemetry.get('lift_cm', 0.0):4.1f} cm",
+               (x1 + self._px(156), ty), px, INK["orange"], weight="medium")
 
         # Gripper aperture bar
-        gx, gy, gw = x1 + 12, fy1 + 19, 96
-        cv2.putText(frame, "GRIP", (gx, gy + 7), cv2.FONT_HERSHEY_SIMPLEX, 0.30,
-                    PALETTE["text_dim"], 1, cv2.LINE_AA)
-        cv2.rectangle(frame, (gx + 32, gy), (gx + 32 + gw, gy + 6), (40, 50, 60), -1)
-        fill = int(gw * float(np.clip(telemetry.get("gripper", 0.0), 0.0, 1.0)))
-        if fill > 0:
-            cv2.rectangle(frame, (gx + 32, gy), (gx + 32 + fill, gy + 6),
-                          PALETTE["neon_green"], -1)
+        gx, gy, gw = x1 + self._px(12), fy1 + self._px(20), self._px(96)
+        T.draw_tracked(frame, "GRIP", (gx, gy + self._px(7)), self._px(8), INK["tertiary"])
+        bx = gx + self._px(34)
+        bh = self._px(5)
+        UIH.progress_track(frame, (bx, gy, bx + gw, gy + bh),
+                           float(np.clip(telemetry.get("gripper", 0.0), 0.0, 1.0)),
+                           INK["teal"])
 
         # Per-fingertip contact indicators
         contact = float(np.clip(telemetry.get("contact", 0.0), 0.0, 1.0))
-        cx0 = gx + 32 + gw + 20
-        cv2.putText(frame, "CONTACT", (cx0, gy + 7), cv2.FONT_HERSHEY_SIMPLEX, 0.30,
-                    PALETTE["text_dim"], 1, cv2.LINE_AA)
+        cx0 = bx + gw + self._px(20)
+        T.draw_tracked(frame, "CONTACT", (cx0, gy + self._px(7)), self._px(8),
+                       INK["tertiary"])
+        dot0 = cx0 + self._px(64)
         for i in range(5):
             on = contact > (i + 0.5) / 5.0
-            cv2.circle(frame, (cx0 + 60 + i * 11, gy + 3), 3,
-                       PALETTE["neon_green"] if on else (55, 62, 72), -1, cv2.LINE_AA)
+            cv2.circle(frame, (dot0 + i * self._px(11), gy + self._px(2)), self._px(3),
+                       INK["green"] if on else INK["separator"], -1, cv2.LINE_AA)
+
+    def _video_label(self, frame: np.ndarray, text: str, org: tuple,
+                     colour: tuple = BONE, px: float = 12) -> None:
+        """A caption seated on live video: SF type on a soft dark capsule.
+
+        Chrome cards get their labels from the glass they sit on; a caption on
+        footage has to bring its own backing or vanish into a bright room.
+        """
+        h, w = frame.shape[:2]
+        size = self._px(px)
+        tw = T.measure(text, size, "medium")
+        pad_x, above, below = self._px(8), self._px(13), self._px(6)
+        x, y = int(org[0]), int(org[1])
+        x = int(np.clip(x, 2, max(2, w - tw - 2 * pad_x - 2)))
+        y = int(np.clip(y, above + 2, h - below - 2))
+        x1, y1 = x, y - above
+        x2, y2 = x + tw + 2 * pad_x, y + below
+        roi = frame[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
+        if roi.size:
+            backing = np.full_like(roi, SCRIM)
+            cv2.addWeighted(backing, 0.72, roi, 0.28, 0, dst=roi)
+        T.draw(frame, text, (x + pad_x, y), size, colour, weight="medium")
 
     def draw_3d_bounding_boxes(self, frame: np.ndarray, bboxes: List[BoundingBox3D],
                                simplified: bool = False) -> None:
-        """Render 3D bounding wireframes with corner brackets and a target badge.
+        """The identified object, marked the way a pro tool marks a selection:
+        a hairline rectangle around its projected extent, accent ticks at the
+        corners, and its name with the measured depth in real type. The old
+        12-edge cyan wireframe read as a different app from the chrome.
 
-        `simplified` collapses the 12-edge wireframe to a plain 2-D rectangle.
-        Used while a ghost hand is grasping on the live view: the wireframe's
-        pillars and corner nodes run straight through the fingers, and at that
-        moment the hand is the thing to look at, not the box around it.
+        `simplified` drops the corner ticks while a ghost hand is grasping on
+        the live view - at that moment the hand is the thing to look at.
         """
         if not self.show_bounding_box or not bboxes:
             return
 
         h, w = frame.shape[:2]
-
         for bbox in bboxes:
             corners_2d = bbox.project_to_2d(image_shape=(h, w))
-
-            if simplified:
-                x0 = int(np.clip(corners_2d[:, 0].min(), 0, w - 1))
-                x1 = int(np.clip(corners_2d[:, 0].max(), 0, w - 1))
-                y0 = int(np.clip(corners_2d[:, 1].min(), 0, h - 1))
-                y1 = int(np.clip(corners_2d[:, 1].max(), 0, h - 1))
-                cv2.rectangle(frame, (x0, y0), (x1, y1), (0, 215, 255), 1, cv2.LINE_AA)
-                label_text = bbox.label.replace("_", " ").upper()
-                cv2.putText(frame, label_text, (x0, max(12, y0 - 6)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.34, (0, 215, 255), 1, cv2.LINE_AA)
+            x0 = int(np.clip(corners_2d[:, 0].min(), 0, w - 1))
+            x1 = int(np.clip(corners_2d[:, 0].max(), 0, w - 1))
+            y0 = int(np.clip(corners_2d[:, 1].min(), 0, h - 1))
+            y1 = int(np.clip(corners_2d[:, 1].max(), 0, h - 1))
+            if x1 - x0 < 4 or y1 - y0 < 4:
                 continue
 
-            # Draw translucent base wireframe
-            for u, v in BBOX_EDGES:
-                pt1 = (int(np.clip(corners_2d[u, 0], -100, w + 100)), int(np.clip(corners_2d[u, 1], -100, h + 100)))
-                pt2 = (int(np.clip(corners_2d[v, 0], -100, w + 100)), int(np.clip(corners_2d[v, 1], -100, h + 100)))
-                cv2.line(frame, pt1, pt2, (0, 215, 255), thickness=1, lineType=cv2.LINE_AA)
+            # Hairline outline, blended so it sits IN the footage rather than
+            # on top of it.
+            box_layer = frame.copy()
+            cv2.rectangle(box_layer, (x0, y0), (x1, y1), BONE, self._th(1), cv2.LINE_AA)
+            cv2.addWeighted(box_layer, 0.55, frame, 0.45, 0, dst=frame)
 
-            # High-tech L-brackets on the 8 corners
-            for c_idx in range(8):
-                pt = (int(np.clip(corners_2d[c_idx, 0], 0, w - 1)), int(np.clip(corners_2d[c_idx, 1], 0, h - 1)))
-                cv2.circle(frame, pt, 4, (10, 20, 30), -1, lineType=cv2.LINE_AA)
-                cv2.circle(frame, pt, 3, PALETTE["cyan_electric"], -1, lineType=cv2.LINE_AA)
+            if not simplified:
+                tick = min(self._px(14), (x1 - x0) // 3, (y1 - y0) // 3)
+                thick = self._th(2)
+                for cx_, cy_, dx, dy in ((x0, y0, 1, 1), (x1, y0, -1, 1),
+                                         (x0, y1, 1, -1), (x1, y1, -1, -1)):
+                    cv2.line(frame, (cx_, cy_), (cx_ + dx * tick, cy_),
+                             INK["blue"], thick, cv2.LINE_AA)
+                    cv2.line(frame, (cx_, cy_), (cx_, cy_ + dy * tick),
+                             INK["blue"], thick, cv2.LINE_AA)
 
-            # Target Lock Badge
-            top_y_idx = np.argmin(corners_2d[:, 1])
-            lx = int(np.clip(corners_2d[top_y_idx, 0] - 40, 10, w - 280))
-            ly = int(np.clip(corners_2d[top_y_idx, 1] - 16, 20, h - 10))
-            
-            label_text = f"TARGET: {bbox.label.upper()} [{bbox.center[2]:.2f}m]"
-            lw = len(label_text) * 8 + 12
-            cv2.rectangle(frame, (lx, ly - 14), (lx + lw, ly + 4), (15, 20, 30), -1)
-            cv2.rectangle(frame, (lx, ly - 14), (lx + lw, ly + 4), PALETTE["cyan_electric"], 1)
-            cv2.putText(frame, label_text, (lx + 6, ly - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.36, PALETTE["cyan_electric"], 1, cv2.LINE_AA)
+            name = bbox.label.replace("_", " ").capitalize()
+            self._video_label(frame, f"{name} · {bbox.center[2]:.2f} m",
+                              (x0, y0 - self._px(10)))
 
     def draw_affordance_hotspots(self, frame: np.ndarray, affordance_map: Optional[AffordanceMap]) -> None:
-        """Project and draw glowing surface contact hotspots."""
+        """Candidate contact points: a quiet accent dot and a thin ring each.
+        They support the grasp story - they don't get names shouted at them."""
         if affordance_map is None or not len(affordance_map.hotspots):
             return
 
@@ -842,17 +805,14 @@ class LocalVisualizer:
         fx = fy = 0.8 * w
         cx = w / 2.0
         cy = h / 2.0
-        t = time.time()
 
-        for h_idx, hs in enumerate(affordance_map.hotspots):
+        for hs in affordance_map.hotspots:
             z = max(hs[2], 0.1)
             u = int(fx * (hs[0] / z) + cx)
             v = int(fy * (hs[1] / z) + cy)
             if 0 <= u < w and 0 <= v < h:
-                r = int(9 + 2 * np.sin(t * 6.0))
-                cv2.circle(frame, (u, v), r, PALETTE["neon_green"], 1, cv2.LINE_AA)
-                cv2.drawMarker(frame, (u, v), PALETTE["neon_green"], cv2.MARKER_CROSS, 8, 1)
-                cv2.putText(frame, f"HOTSPOT #{h_idx+1}", (u + 12, v + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.34, PALETTE["neon_green"], 1, cv2.LINE_AA)
+                cv2.circle(frame, (u, v), self._px(7), INK["blue"], self._th(1), cv2.LINE_AA)
+                cv2.circle(frame, (u, v), self._px(2), INK["blue"], -1, cv2.LINE_AA)
 
 class SyntheticCamera:
     """Generates synthetic animated RGB video frames when webcam is inaccessible."""
@@ -876,8 +836,9 @@ class SyntheticCamera:
         for y in range(0, self.height, 40):
             cv2.line(frame, (0, y), (self.width, y), (45, 45, 50), 1)
 
-        cv2.putText(frame, "SYNTHETIC VIDEO STREAM (Mac CPU Mode)", (self.width // 2 - 160, self.height - 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (120, 120, 120), 1, cv2.LINE_AA)
+        T.draw(frame, "Synthetic video stream — no camera",
+               (self.width // 2, self.height - 20), 13, (120, 120, 120),
+               align="center")
 
         return True, frame
 
@@ -2180,8 +2141,9 @@ class LocalClientRunner:
                         self._sound_phase_change(workflow_phase, previous)
 
                     if not self._network_got_first_response:
-                        cv2.putText(frame, f"CONNECTING TO {self.server_url or self.config.network.server_host}...",
-                                    (30, frame.shape[0] // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA)
+                        T.draw(frame, f"Connecting to {self.server_url or self.config.network.server_host}…",
+                               (30, frame.shape[0] // 2), 15, UIH.C["orange"],
+                               weight="medium")
 
                 # Client-side afterimage recording: capture the user's OWN real hand
                 # poses (already tracked locally every frame in both modes) while they
@@ -2280,11 +2242,11 @@ class LocalClientRunner:
                 if workflow_phase == ExecutionPhase.FORESEEING and self._last_completed_recording:
                     replay_poses = self._last_completed_recording
                     replay_reanchor = True
-                    ghost_label = "PREVIEW: YOUR LAST ATTEMPT"
+                    ghost_label = "Preview · your last attempt"
                 elif workflow_phase == ExecutionPhase.ADAPTING and self._last_completed_recording:
                     replay_poses = self._last_completed_recording
                     replay_reanchor = False
-                    ghost_label = "REPLAY: WHAT YOU JUST DID"
+                    ghost_label = "Replay · what you just did"
                 # The Autonomous Demo is deliberately absent from this list: it is
                 # not drawn as an overlay at all any more. It is staged and
                 # rendered as a 3-D reenactment inside the simulated lab, which is

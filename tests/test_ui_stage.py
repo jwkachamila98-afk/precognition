@@ -201,3 +201,13 @@ def test_no_hershey_text_remains_in_the_hud():
     source = inspect.getsource(hud)
     assert "putText" not in source, "Hershey text found in the hud module"
     assert "FONT_HERSHEY" not in source
+
+
+def test_no_hershey_text_remains_in_the_video_overlay():
+    """The overlay drawn ON the video - skeleton labels, the object box name,
+    ghost captions, the lab chrome - shares the frame with the SF chrome, so
+    the same rule holds for the whole client module."""
+    import inspect
+    from apps import local_client
+    source = inspect.getsource(local_client)
+    assert "putText" not in source, "Hershey text found in the client overlay"
