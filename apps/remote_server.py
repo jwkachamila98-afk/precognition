@@ -62,6 +62,32 @@ logging.basicConfig(
 logger = logging.getLogger("RemoteServer")
 
 
+class _AlreadyBuilt(Exception):
+    """A detector was already chosen; skip the rest of the fallback chain."""
+
+
+def _build_gemini_scene_parser(api_key, app_config, vision_grounder):
+    """Open-vocabulary detection, or None to fall through to YOLO."""
+    if not api_key:
+        return None
+    try:
+        from src.perception.gemini_scene_detector import GeminiObjectDetector
+        from src.perception.live_scene_parser import LiveSceneParser
+        detector = GeminiObjectDetector(
+            api_key=api_key,
+            cadence_sec=float(os.environ.get("GEMINI_DETECT_CADENCE_SEC", "1.5")))
+        parser = LiveSceneParser(
+            object_detector=detector,
+            num_points=app_config.perception.scene_parser.num_points,
+            vision_grounder=vision_grounder)
+        logger.info("RemoteServer: Using Gemini open-vocabulary detection "
+                    "(cadence-driven, tracked between calls).")
+        return parser
+    except Exception as e:
+        logger.warning(f"Gemini scene detector unavailable ({e}); falling back to YOLO.")
+        return None
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Visuomotor Hand Policy Remote Inference Server (Phase 8)")
     parser.add_argument("--config", type=str, default="config/system_config.yaml", help="Path to config YAML")
@@ -173,8 +199,15 @@ def main() -> None:
     else:
         logger.info("RemoteServer: GEMINI_API_KEY not set. Open-vocabulary vision grounding disabled (COCO-80 only).")
 
-    # --- Object detection: GPU YOLO -> CPU MediaPipe EfficientDet -> mock canned bbox ---
-    scene_parser = None
+    # --- Object detection: Gemini open-vocabulary -> GPU YOLO -> CPU MediaPipe -> mock ---
+    #
+    # Gemini leads because YOLO can only name the eighty COCO classes: anything
+    # else is missed or forced onto the nearest wrong label, and a real desk is
+    # full of things COCO has no word for. A call takes seconds and is billed,
+    # so it runs on a cadence with the boxes tracked between calls, and the
+    # frame loop never waits on it.
+    scene_parser = _build_gemini_scene_parser(gemini_api_key, app_config, vision_grounder)
+
     try:
         from src.perception.yolo_object_detector import YoloObjectDetector
         from src.perception.live_scene_parser import LiveSceneParser
@@ -182,6 +215,8 @@ def main() -> None:
         # which paces the whole workflow. YOLO_MODEL lets a slow host drop to
         # yolov8n without changing what a GPU deployment runs.
         yolo_model = os.environ.get("YOLO_MODEL", "yolov8s.pt")
+        if scene_parser is not None:
+            raise _AlreadyBuilt
         object_detector = YoloObjectDetector(model_name=yolo_model, conf_threshold=0.30)
         scene_parser = LiveSceneParser(
             object_detector=object_detector,
@@ -189,6 +224,8 @@ def main() -> None:
             vision_grounder=vision_grounder
         )
         logger.info("RemoteServer: Using live YoloObjectDetector-backed LiveSceneParser (real GPU object recognition).")
+    except _AlreadyBuilt:
+        pass
     except Exception as e:
         logger.warning(f"YOLO object detector initialization failed: {e}")
         try:
