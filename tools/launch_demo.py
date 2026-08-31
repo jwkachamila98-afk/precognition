@@ -12,6 +12,13 @@ This does all of it:
     python tools/launch_demo.py --local            # no GPU pod at all
 
 Pod discovery needs RUNPOD_API_KEY. Without it, pass --server-url.
+
+A pod this launcher discovered is STOPPED when the session ends - on a
+normal exit, a crash, or Ctrl-C. It used to be left running, and an idle
+RUNNING pod bills exactly like a working one; that is what took the account
+to a 402 and left the demo without a GPU. Pass --keep-pod for back-to-back
+sessions. A pod reached through an explicit --server-url is never stopped:
+this launcher did not start it and does not know whose it is.
 """
 
 import argparse
@@ -37,13 +44,14 @@ def _c(text, colour):
     return f"{codes[colour]}{text}\033[0m" if sys.stdout.isatty() else text
 
 
-def _api(path, api_key):
-    req = urllib.request.Request(f"{REST}{path}",
+def _api(path, api_key, method="GET"):
+    req = urllib.request.Request(f"{REST}{path}", method=method,
                                  headers={"Authorization": f"Bearer {api_key}"})
     ctx = ssl.create_default_context()
     try:
         with urllib.request.urlopen(req, context=ctx, timeout=20) as resp:
-            return json.loads(resp.read().decode())
+            body = resp.read().decode()
+            return json.loads(body) if body.strip() else {}
     except urllib.error.HTTPError as e:
         print(_c(f"  RunPod API {e.code}: {e.read().decode()[:200]}", "red"))
         return None
@@ -52,15 +60,34 @@ def _api(path, api_key):
         return None
 
 
+def stop_pod(pod_id, api_key):
+    """Stop a pod. Returns True if RunPod accepted the request.
+
+    An idle RUNNING pod bills at the same rate as a working one, so a session
+    that ends without this is a session that keeps charging - which is what
+    took the account to a 402 and left the demo with no GPU.
+    """
+    print(_c(f"  stopping pod {pod_id}...", "dim"))
+    if _api(f"/pods/{pod_id}/stop", api_key, method="POST") is None:
+        print(_c(f"  COULD NOT STOP POD {pod_id} - it may still be billing.",
+                 "red"))
+        print(_c("  Stop it at https://console.runpod.io/pods", "dim"))
+        return False
+    print(_c("  pod stopped (its disk persists; restart it for the next run)",
+             "green"))
+    return True
+
+
 def discover_pod_url(api_key, pod_name=None):
     """Find a running pod's public endpoint for the inference port.
 
     The port is read from the live runtime rather than remembered, because it
-    is reassigned every time the container restarts.
+    is reassigned every time the container restarts. Returns (url, pod_id) so
+    the caller can stop the pod it found when the session ends.
     """
     data = _api("/pods", api_key)
     if not data:
-        return None
+        return None, None
     pods = data if isinstance(data, list) else data.get("pods", data.get("data", []))
     for pod in pods:
         if pod.get("desiredStatus") != "RUNNING" and pod.get("status") != "RUNNING":
@@ -75,8 +102,8 @@ def discover_pod_url(api_key, pod_name=None):
             if private == 8765 and ip and public:
                 print(f"  pod {_c(pod.get('name', pod.get('id')), 'bold')} "
                       f"({pod.get('id')}) in {pod.get('dataCenterId', '?')}")
-                return f"ws://{ip}:{public}"
-    return None
+                return f"ws://{ip}:{public}", pod.get("id")
+    return None, None
 
 
 def wait_for_server(url, timeout_s=1200):
@@ -118,6 +145,9 @@ def main():
     ap.add_argument("--api-key", type=str, default=os.environ.get("RUNPOD_API_KEY"))
     ap.add_argument("--no-wait", action="store_true", help="Do not wait for the server")
     ap.add_argument("--device", type=int, default=None, help="Camera device index")
+    ap.add_argument("--keep-pod", action="store_true",
+                    help="Leave the GPU pod RUNNING after the client exits. It "
+                         "keeps billing - only for back-to-back sessions.")
     args = ap.parse_args()
 
     print()
@@ -128,6 +158,10 @@ def main():
               "--tracker", "mediapipe"]
     if args.device is not None:
         client += ["--device", str(args.device)]
+
+    # Set only when THIS launcher discovered the pod, so a session started
+    # against someone else's --server-url never stops a pod it doesn't own.
+    pod_to_stop = None
 
     if args.local:
         print("  mode: local (no GPU pod)")
@@ -142,14 +176,26 @@ def main():
                 print()
                 return 2
             print("  discovering pod...")
-            url = discover_pod_url(args.api_key, args.pod_name)
+            url, pod_id = discover_pod_url(args.api_key, args.pod_name)
             if not url:
                 print(_c("  No running pod exposing port 8765 was found.", "red"))
                 print(_c("  Start one, or pass --server-url explicitly.", "dim"))
                 print()
                 return 2
+            if pod_id and not args.keep_pod:
+                pod_to_stop = pod_id
         print(f"  server: {_c(url, 'bold')}")
+        if pod_to_stop:
+            print(_c("  the pod will be STOPPED when this session ends "
+                     "(--keep-pod to leave it running)", "dim"))
+        elif not args.local and args.keep_pod:
+            print(_c("  --keep-pod: the pod will keep running, and keep "
+                     "billing, after this session", "yellow"))
         if not args.no_wait and not wait_for_server(url):
+            # The pod is up and billing but unusable - stopping it is the whole
+            # point of this change, so do it on the failure path too.
+            if pod_to_stop:
+                stop_pod(pod_to_stop, args.api_key)
             return 1
         client += ["--mode", "remote", "--server-url", url]
 
@@ -159,8 +205,20 @@ def main():
 
     print(_c("  starting client...", "dim"))
     print()
-    return subprocess.call(client, cwd=str(PROJECT_ROOT),
-                           env={**os.environ, "PYTHONPATH": str(PROJECT_ROOT)})
+    try:
+        return subprocess.call(client, cwd=str(PROJECT_ROOT),
+                               env={**os.environ, "PYTHONPATH": str(PROJECT_ROOT)})
+    except KeyboardInterrupt:
+        print()
+        print(_c("  interrupted", "dim"))
+        return 130
+    finally:
+        # Every exit path, including Ctrl-C and a client crash: an idle pod
+        # left RUNNING is what emptied the account before.
+        if pod_to_stop:
+            print()
+            stop_pod(pod_to_stop, args.api_key)
+            print()
 
 
 if __name__ == "__main__":
