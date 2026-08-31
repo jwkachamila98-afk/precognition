@@ -86,3 +86,25 @@ def test_scaling_is_a_no_op_when_the_card_matches_the_sensor():
     runner.visualizer.draw_scale = 1.0
     poses = [_pose(4)]
     assert runner._scale_poses_for_display(poses) is poses
+
+
+def test_the_execution_phase_explains_itself():
+    """USER_EXECUTING advances on frames in which a hand was DETECTED, not on
+    elapsed time, so it stalls indefinitely and silently when tracking drops.
+    That ended three live sessions before an episode ever completed, so the
+    count and the reason for a stall are both on screen."""
+    from src.policy.workflow_state import ExecutionPhase
+
+    _, body = LocalClientRunner._status_message(
+        ExecutionPhase.USER_EXECUTING, "coffee cup", False, progress=0.4, tracking=True)
+    assert "24/60" in body, f"frame progress not shown: {body}"
+
+    _, stalled = LocalClientRunner._status_message(
+        ExecutionPhase.USER_EXECUTING, "coffee cup", False, progress=0.4, tracking=False)
+    assert "Raise your hand" in stalled and "nothing is being captured" in stalled, \
+        f"a stall must say why: {stalled}"
+
+    # Every phase must produce something to show.
+    for phase in ExecutionPhase:
+        title, text = LocalClientRunner._status_message(phase, "cup", True)
+        assert title and text, f"{phase} has no guidance"

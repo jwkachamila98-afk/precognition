@@ -1439,7 +1439,8 @@ class LocalClientRunner:
 
         phase_value = workflow_phase.value
         colour = UIH.phase_colour(phase_value)
-        title, body = self._status_message(workflow_phase, target_label, has_replay)
+        title, body = self._status_message(workflow_phase, target_label, has_replay,
+                                           progress=phase_progress, tracking=bool(poses))
         progress = None if workflow_phase == ExecutionPhase.IDLE else phase_progress
 
         UIH.draw_telemetry_card(
@@ -1472,9 +1473,22 @@ class LocalClientRunner:
                         colour=colour, progress=progress, scale=s)
         return stage.canvas
 
+    # Tracked frames the execution phase needs before it will advance. Mirrors
+    # WorkflowController.foresee_steps; shown to the user because the phase ends
+    # on frames CAPTURED, not on elapsed time.
+    _EXECUTION_FRAMES = 60
+
     @staticmethod
-    def _status_message(phase: ExecutionPhase, target_label: str, has_replay: bool):
-        """Plain language for what to do right now."""
+    def _status_message(phase: ExecutionPhase, target_label: str, has_replay: bool,
+                        progress: float = 0.0, tracking: bool = True):
+        """Plain language for what to do right now.
+
+        The execution phase advances on the number of frames in which a hand was
+        actually DETECTED, not on elapsed time, so it stalls indefinitely and
+        silently if tracking drops. That has ended three separate live sessions
+        before an episode ever completed. The count and the reason for a stall
+        are now on screen.
+        """
         target = (target_label.replace("_", " ")
                   if target_label and target_label.lower() not in ("none", "") else "an object")
         foreseeing = (f"Watch a replay of your last attempt at the {target}, or press 'a'"
@@ -1483,7 +1497,13 @@ class LocalClientRunner:
             ExecutionPhase.IDLE: ("STANDBY", "Hold 'v' and say what to pick up, e.g. \"wine glass\""),
             ExecutionPhase.FORESEEING: ("PREVIEWING", foreseeing),
             ExecutionPhase.WAIT_USER: ("YOUR TURN", "Get in position and press 'c' - or 'a' for the demo"),
-            ExecutionPhase.USER_EXECUTING: ("GO", f"Reach for the {target} now - do it your way"),
+            ExecutionPhase.USER_EXECUTING: (
+                "GO",
+                (f"Reach for the {target} - keep your hand in view "
+                 f"({int(progress * LocalClientRunner._EXECUTION_FRAMES)}"
+                 f"/{LocalClientRunner._EXECUTION_FRAMES} frames)")
+                if tracking else
+                "Raise your hand into view - nothing is being captured"),
             ExecutionPhase.ADAPTING: ("REVIEW", "Here's a replay of what you just did"),
             ExecutionPhase.RESTARTING: ("TRY AGAIN", f"Restarting with an improved plan for the {target}"),
             ExecutionPhase.AUTONOMOUS_DEMO: ("AUTONOMOUS DEMO",
