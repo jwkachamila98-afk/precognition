@@ -1127,3 +1127,24 @@ def test_authored_profile_survives_the_round_trip_into_geometry():
     foot = float(radius[v[:, 1] < v[:, 1].min() + 1e-3].max())
     stem = float(radius[lower].min())
     assert stem < 0.4 * foot, f"stem {stem*100:.2f} cm vs foot {foot*100:.2f} cm"
+
+
+def test_a_too_short_recording_is_not_passed_off_as_a_replay():
+    """A handful of frames is what you get when the execution phase is entered
+    and left almost at once. Staging it produced a seven-frame 'reenactment'
+    that was over before it could be seen, while the log and the panel both
+    claimed to be showing the user their own motion. It must decline instead,
+    so the caller falls back to the generated plan.
+    """
+    centre = np.array([0.02, 0.03, 0.50], np.float32)
+    bbox = BoundingBox3D(label="coffee cup", center=centre,
+                         size=np.array([0.09, 0.09, 0.09], dtype=np.float32))
+    sim = LabSimulator(width=96, height=72)
+
+    for n in (4, 7, 15, 23):
+        assert not sim.prepare_from_demonstration(_synthetic_recording(centre, n=n), bbox, None), \
+            f"{n} frames should be refused as a demonstration"
+
+    # A real recording is still accepted.
+    assert sim.prepare_from_demonstration(_synthetic_recording(centre, n=48), bbox, None)
+    assert sim._num_steps >= 24

@@ -72,6 +72,9 @@ _HAND_APPROACH_OFFSET_DEG = 330.0
 
 # How long the completed grasp is held on screen once the plan has played out.
 _END_HOLD_SEC = 1.4
+# Fewest tracked frames that can carry a reach. Below roughly two seconds of
+# tracking there is no motion to show, only a pose.
+_MIN_DEMONSTRATION_POSES = 24
 
 # When a recording must be trimmed, how much of the window sits before contact.
 # Weighted after it: the reach is context, the carry is the point.
@@ -317,7 +320,19 @@ class LabSimulator:
         object in 3-D. From there the object inherits the hand's displacement
         since that frame, so it is carried rather than scripted.
         """
-        if not recorded_poses or len(recorded_poses) < 4 or target_bbox is None:
+        if (not recorded_poses or len(recorded_poses) < _MIN_DEMONSTRATION_POSES
+                or target_bbox is None):
+            # Too short to be a replay of anything. A handful of frames is what
+            # you get when the execution phase is entered and left almost
+            # immediately, and staging it produced a "reenactment" seven frames
+            # long that was over before it could be seen - while claiming, in
+            # the log and on screen, to be showing the user their own motion.
+            # Better to fall back to the generated plan and say so.
+            if recorded_poses and target_bbox is not None:
+                logger.info(
+                    f"LabSimulator: only {len(recorded_poses)} tracked frames - too "
+                    f"short to replay, falling back to the generated plan."
+                )
             self._ready = False
             return False
 
