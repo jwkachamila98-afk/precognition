@@ -1,8 +1,28 @@
 # Visuomotor Hand Policy & Residual Adaptation Architecture
 
-A modular, hardware-decoupled **Visuomotor Hand Policy & Residual Adaptation Architecture** designed for real-time robotic manipulation, 3D hand mesh estimation (MANO), metric depth estimation, continuous speech-to-text audio ingestion (Whisper / Silero VAD), structured LLM intent reasoning, a **Staged 'Foresee-then-Execute' Workflow State Machine**, **Robot Hardware Actuation Bridges (ROS 2 / Mock)**, **Persistent Policy Checkpointing**, **Multi-Trial Co-Adaptation Analytics**, **Real-Time Safety Guardrails & Collision Interlocks**, intent-conditioned 3D spatial scene parsing, physics simulation, online episode discrepancy learning, and cloud GPU deployment.
+A modular, hardware-decoupled **Visuomotor Hand Policy & Residual Adaptation Architecture** for real-time robotic manipulation: 3D hand tracking (MANO-convention, 21 joints), monocular metric depth, speech-to-text intent capture (Gemini, with an offline mock), structured LLM intent reasoning, a **Staged 'Foresee-then-Execute' Workflow State Machine**, **Robot Hardware Actuation Bridges (ROS 2 / Mock)**, **Persistent Policy Checkpointing**, **Multi-Trial Co-Adaptation Analytics**, **Real-Time Safety Guardrails & Collision Interlocks**, intent-conditioned 3D spatial scene parsing, physics simulation, online episode discrepancy learning, and cloud GPU deployment.
 
-Runs in real-time ($30+\text{ FPS}$) on resource-constrained **Intel Mac CPU** hardware while remaining 100% plug-and-play compatible with cloud GPU backends (CUDA / TensorRT / MuJoCo MJX on RunPod, Lambda Labs, AWS EC2).
+Measured on the target hardware (2019 Intel MacBook Pro, Iris Plus 645), so you
+know what to expect rather than what was hoped for:
+
+| Per frame | Cost | Notes |
+|---|---|---|
+| Camera read | **0.3 ms** | was 33 ms before capture moved to a reader thread |
+| Hand tracking (MediaPipe, local) | ~18-24 ms | runs on the client for a responsive overlay |
+| HUD + stage composition | ~15 ms | glass panels, cards, backdrop |
+| `cv2.imshow` + `waitKey` | ~35 ms | macOS window blit, ~23 ns/pixel; scales with stage size |
+| JPEG encode for the wire | ~1 ms | |
+| **Total** | **~75 ms → 13-14 fps** | |
+
+The largest single cost is handing the finished frame to the OS window, not any
+part of the pipeline. The server's GPU work (MiDaS depth, YOLO detection, the
+policy) happens off the render loop entirely - the round-trip is issued in the
+background and the loop reads whatever snapshot has most recently completed, so
+a slow link lowers freshness rather than frame rate. Round-trip was ~80-250 ms
+to a US pod and 400 ms+ to one in Europe.
+
+The simulated lab renders in ~35 ms at 384x288, capped at 20 fps; at video-card
+resolution it would cost 161 ms, which is why it stays where it is.
 
 ```
                                       COMPLETE SYSTEM ARCHITECTURE
@@ -16,7 +36,7 @@ Runs in real-time ($30+\text{ FPS}$) on resource-constrained **Intel Mac CPU** h
   |  +---------------------+        |  3D Bounding Box & Affordance Hot |      +------------------+   |
   |                                 |  Simulated Lab reenactment panel  |               ^             |
   |  +---------------------+        |  [1/3] Foresee -> [2/3] Execute   |               |             |
-  |  | Audio STT (Whisper/ |  --->  |  [3/3] Discrepancy Adapt Banner   |               |             |
+  |  | Audio STT (Gemini / |  --->  |  [3/3] Discrepancy Adapt Banner   |               |             |
   |  |  MockTranscriber)   |        |  Co-Adaptation Benchmark Panel    |               |             |
   |  +---------------------+        |  Safety Guardrail & Limits Banner |               |             |
   |                                 |  Voice Telemetry & Intent Banner  |               |             |
@@ -98,7 +118,7 @@ Precognition/
 │   ├── analytics/
 │   │   └── benchmark.py               # CoAdaptationBenchmark, TrialMetrics, ASCII trend graphs
 │   ├── audio/
-│   │   └── speech_to_text.py          # AudioTranscriberABC, MockTranscriber, WhisperTranscriber
+│   │   └── speech_to_text.py          # AudioTranscriberABC, GeminiTranscriber, MockTranscriber
 │   ├── hardware/
 │   │   └── robot_interface.py         # RobotHardwareABC, MockRobotHardware, ROS2ControlBridge
 │   ├── perception/
@@ -159,22 +179,47 @@ Precognition/
 
 ---
 
-## Quickstart & Unified Demo Launcher
-
-Launch the entire client-server system with automated pre-flight checks and background server management using a single command:
+## Quickstart
 
 ```bash
-# 1. Activate virtual environment
 source venv/bin/activate
+export GEMINI_API_KEY=...          # speech + open-vocabulary object grounding
 
-# 2. Run Unified Demo Launcher (Client + Server + GUI HUD)
-python apps/run_demo.py --mode mock_remote
+# Discovers the running GPU pod, waits for it to finish installing, launches the client
+python tools/launch_demo.py
+
+# Or point it at a server yourself
+python tools/launch_demo.py --server-url ws://<ip>:<port>
+
+# Or run entirely on this machine, no GPU pod
+python tools/launch_demo.py --local
 ```
 
-### Standalone Local Execution (CPU-Only)
-```bash
-python apps/run_demo.py --mode mock_local
+The pod's public port is reassigned every time the container restarts, which is
+why the launcher reads it live rather than remembering one.
+
+### Preflight
+
+Both the client and the server verify what they depend on before starting, and
+**refuse to start if a required component is missing**. This is deliberate:
+every heavy component has a mock fallback, and a silent fallback means the app
+comes up, the HUD fills with plausible numbers, and nothing on screen reveals
+that the hand tracker is synthesising a hand or that the policy is a stub which
+does not learn.
+
 ```
+  PRECOGNITION - local client preflight
+  ----------------------------------------------------------------
+  OpenCV             OK               4.11.0
+  MediaPipe          OK               0.10.21
+  Camera             OK               device 0 delivering 1280x720
+  Microphone         OK               MacBook Pro Microphone
+  Gemini API key     WARN             GEMINI_API_KEY not set
+  Inference server   FAIL             10.0.0.4:8765 - ConnectionRefusedError
+```
+
+Pass `--allow-degraded` to run on mocks anyway. Anything produced in that mode
+is **synthetic** and must not be presented as real output.
 
 ---
 

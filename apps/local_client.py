@@ -41,6 +41,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from config.config_parser import AppConfig
 # Must run before torch/ultralytics are imported: they download models over
 # HTTPS and cannot be handed a custom SSL context (see src/utils/certs.py).
+from src.utils.camera_stream import CameraStream
 from src.utils.certs import ensure_ca_bundle
 from src.utils.preflight import client_checks, enforce
 
@@ -979,6 +980,7 @@ class LocalClientRunner:
         self.is_synthetic_camera = False
         self._audio_stream: Optional["sd.InputStream"] = None
         self._is_fullscreen = False
+        self.camera: Optional[CameraStream] = None
         self._screen_w, self._screen_h = self._detect_screen_size()
         # The composition surface. Chrome is drawn on it at its own resolution
         # rather than on the 640x480 feed, so type is rasterised at the size it
@@ -1703,6 +1705,12 @@ class LocalClientRunner:
     async def run(self) -> None:
         """Main application execution loop."""
         self.setup_camera()
+        # Take the sensor's cadence off the render loop. VideoCapture.read()
+        # blocks until the device has a frame, which measured ~33 ms - about a
+        # third of the whole frame budget - spent waiting on hardware. The
+        # reader thread also drops frames the loop was too slow to take, so what
+        # is displayed is the present rather than a backlog.
+        self.camera = CameraStream(self.cap)
         self.setup_microphone()
         cv2.namedWindow(self.config.visualization.window_name, cv2.WINDOW_NORMAL)
         # Open at the stage's own size. Sizing the window to the CAMERA's
@@ -1731,7 +1739,7 @@ class LocalClientRunner:
 
                 # Stage 1: Frame Ingestion & Preprocessing
                 with self.profiler.profile("1. Frame Ingestion"):
-                    ret, frame = self.cap.read()
+                    ret, frame = self.camera.read()
 
                 if not ret or frame is None:
                     consecutive_failures += 1
@@ -1743,12 +1751,16 @@ class LocalClientRunner:
                         logger.warning("Camera unresponsive for 150 frames. Automatically switching to Synthetic Camera generator.")
                         if self.cap:
                             self.cap.release()
+                        # Hand the reader thread the new device rather than
+                        # leaving it pumping a released one.
                         self.cap = SyntheticCamera(
                             width=self.config.camera.width,
                             height=self.config.camera.height,
                             fps=self.config.camera.fps
                         )
                         self.is_synthetic_camera = True
+                        if self.camera is not None:
+                            self.camera.replace_capture(self.cap)
                         consecutive_failures = 0
 
                     await asyncio.sleep(0.005)
@@ -2192,7 +2204,12 @@ class LocalClientRunner:
                 self._audio_stream.close()
             if self.recorder.is_recording:
                 self.recorder.stop_recording()
-            if self.cap:
+            # The reader thread owns the device once started; stopping it
+            # releases the capture, so do not release it twice.
+            if self.camera is not None:
+                self.camera.release()
+                self.cap = None
+            elif self.cap:
                 self.cap.release()
             self.robot.disconnect()
             self.speaker.stop()
