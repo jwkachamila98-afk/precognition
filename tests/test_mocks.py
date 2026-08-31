@@ -145,6 +145,23 @@ class TestMockPipeline(unittest.TestCase):
         decoded_img = reconstructed.decode_image()
         self.assertEqual(decoded_img.shape, (100, 100, 3))
 
+    def test_policy_update_count_survives_the_wire(self):
+        """The learning card's heartbeat counts real RWR gradient steps. In
+        remote mode that count lives on the server, so if serialization drops
+        it the pulse silently reads 0 forever while the policy trains."""
+        resp = InferenceResponse(
+            frame_id=1, client_timestamp=0.0, server_timestamp=0.0,
+            policy_updates=57,
+        )
+        back = InferenceResponse.from_json(resp.to_json())
+        self.assertEqual(back.policy_updates, 57)
+        # An old server that predates the field must read as 0, not crash.
+        legacy = InferenceResponse.from_json(
+            InferenceResponse(frame_id=1, client_timestamp=0.0,
+                              server_timestamp=0.0).to_json().replace(
+                                  '"policy_updates": 0, ', ''))
+        self.assertEqual(legacy.policy_updates, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1112,8 +1112,14 @@ class LocalClientRunner:
             "depth_heatmap": None, "gripper_cmd": 0.0, "residuals": None, "reward_score": 0.0,
             "discrepancy_norm": 0.0, "buffer_steps": 0, "parsed_intent": None,
             "workflow_phase": ExecutionPhase.IDLE, "phase_progress": 0.0,
-            "benchmark_summary": None, "policy_loss": 0.0,
+            "benchmark_summary": None, "policy_loss": 0.0, "policy_updates": 0,
         }
+        # The learning card's training heartbeat. The count is read from
+        # whichever policy is really learning (local or the server's); the
+        # pulse timestamp marks the instant it last incremented, so each RWR
+        # gradient step is a visible flash rather than a silent number change.
+        self._policy_updates_seen = 0
+        self._policy_update_pulse_at = 0.0
 
     def toggle_voice_mode(self) -> None:
         """Toggle Push-To-Talk voice listening / transcription."""
@@ -1562,6 +1568,26 @@ class LocalClientRunner:
                      learning_h=UIH.learning_height(probe.layout.scale),
                      depth_h=UIH.depth_height(probe.layout.scale, rail_w))
 
+    def _training_pulse(self) -> tuple:
+        """The policy's cumulative RWR gradient-step count, and a 1 -> 0 flash
+        that starts the instant the count last rose.
+
+        The count comes from whichever policy is actually training: the local
+        one in mock_local, the server's (carried on the wire) in remote mode.
+        """
+        if self.mode == "mock_local":
+            updates = int(getattr(self.local_policy, "cumulative_adaptations", 0))
+        else:
+            updates = int(self._remote_snapshot.get("policy_updates", 0))
+        if updates > self._policy_updates_seen:
+            self._policy_updates_seen = updates
+            self._policy_update_pulse_at = time.time()
+        elif updates < self._policy_updates_seen:   # policy reset ('x')
+            self._policy_updates_seen = updates
+        pulse = max(0.0, 1.0 - (time.time() - self._policy_update_pulse_at) / 0.9) \
+            if self._policy_update_pulse_at else 0.0
+        return updates, pulse
+
     def _compose_stage(self, frame, *, fps, latency_ms, workflow_phase, phase_progress,
                        parsed_intent, depth_heatmap, poses, gripper_cmd, reward_score,
                        discrepancy_norm, policy_loss, benchmark_summary,
@@ -1602,11 +1628,13 @@ class LocalClientRunner:
         UIH.draw_hotkey_card(stage, L.hotkeys, self.STAGE_HOTKEYS, s)
         if L.learning:
             summary = benchmark_summary or {}
+            updates, pulse = self._training_pulse()
             UIH.draw_learning_card(
                 stage, L.learning, trials=int(summary.get("total_trials", 0)),
                 init_err_mm=float(summary.get("initial_error_mm", 0.0)),
                 cur_err_mm=float(summary.get("latest_error_mm", 0.0)),
-                rewards=list(self._reward_history), scale=s)
+                rewards=list(self._reward_history), scale=s,
+                updates=updates, pulse=pulse)
 
         UIH.draw_status_bar(stage, L.status, self.motion, title=title, body=body,
                             colour=colour, progress=progress, scale=s)
@@ -1721,6 +1749,7 @@ class LocalClientRunner:
             "phase_progress": response.phase_progress,
             "benchmark_summary": response.benchmark_summary or self._remote_snapshot["benchmark_summary"],
             "policy_loss": response.policy_loss,
+            "policy_updates": response.policy_updates,
         })
 
     def _audio_callback(self, indata: np.ndarray, frames: int, time_info: Any, status: Any) -> None:

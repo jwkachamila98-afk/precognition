@@ -89,6 +89,9 @@ class InferenceResponse:
     adaptation_status: str = "ACTIVE"
     buffer_step_count: int = 0
     policy_loss: float = 0.0
+    # Cumulative RWR gradient steps the policy has taken, so the client can
+    # show training happening as a countable, visible event.
+    policy_updates: int = 0
     gripper_action: float = 0.0
     server_processing_ms: float = 0.0
     msg_type: str = MessageType.INFERENCE_RESPONSE.value
@@ -121,6 +124,7 @@ class InferenceResponse:
             adaptation_status=data.get("adaptation_status", "ACTIVE"),
             buffer_step_count=int(data.get("buffer_step_count", 0)),
             policy_loss=float(data.get("policy_loss", 0.0)),
+            policy_updates=int(data.get("policy_updates", 0)),
             gripper_action=float(data.get("gripper_action", 0.0)),
             server_processing_ms=float(data.get("server_processing_ms", 0.0)),
             msg_type=data.get("msg_type", MessageType.INFERENCE_RESPONSE.value)
