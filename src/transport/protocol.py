@@ -92,6 +92,9 @@ class InferenceResponse:
     # Cumulative RWR gradient steps the policy has taken, so the client can
     # show training happening as a countable, visible event.
     policy_updates: int = 0
+    # The accumulated (x, y, z) wrist bias, in metres, that learning has
+    # folded into the plan - what the correction arrows on the client render.
+    learned_wrist_bias: Optional[List[float]] = None
     gripper_action: float = 0.0
     server_processing_ms: float = 0.0
     msg_type: str = MessageType.INFERENCE_RESPONSE.value
@@ -125,6 +128,7 @@ class InferenceResponse:
             buffer_step_count=int(data.get("buffer_step_count", 0)),
             policy_loss=float(data.get("policy_loss", 0.0)),
             policy_updates=int(data.get("policy_updates", 0)),
+            learned_wrist_bias=data.get("learned_wrist_bias"),
             gripper_action=float(data.get("gripper_action", 0.0)),
             server_processing_ms=float(data.get("server_processing_ms", 0.0)),
             msg_type=data.get("msg_type", MessageType.INFERENCE_RESPONSE.value)

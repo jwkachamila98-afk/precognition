@@ -22,7 +22,9 @@ from config.config_parser import AppConfig                    # noqa: E402
 from apps.local_client import LocalVisualizer                 # noqa: E402
 from src.perception.hand_tracker import HandPose, HandSide    # noqa: E402
 from src.perception.scene_parser import BoundingBox3D         # noqa: E402
-from src.simulation.trajectory_generator import AffordanceMap  # noqa: E402
+from src.mocks.mock_trajectory_diffusion import minimum_jerk_step  # noqa: E402
+from src.simulation.trajectory_generator import (                # noqa: E402
+    AffordanceMap, ForeseenTrajectory, ForeseenWaypoint)
 from src.ui import glass as G                                  # noqa: E402
 from src.ui import hud                                         # noqa: E402
 from src.ui.stage import Stage                                 # noqa: E402
@@ -92,6 +94,39 @@ def _recording(bbox: BoundingBox3D, n=48):
     return poses
 
 
+def _plan(bbox: BoundingBox3D, bias: np.ndarray, n=60) -> ForeseenTrajectory:
+    """A biased plan shaped like the real generator's.
+
+    Deliberately mirrors MockTrajectoryDiffusion's phase split: the wrist
+    reaches the (biased) grasp point at 28% of the rollout and the bias is
+    fully present from there on. A preview that ramped the bias linearly to
+    the end would make the correction arrows look smaller here than they are
+    in the app - the preview has to be at least as honest as the thing it
+    stands in for.
+    """
+    start = np.array([-0.16, 0.14, 0.5], dtype=np.float32)
+    grasp = bbox.center + bias
+    lift = grasp + np.array([0.0, -0.14, 0.02], dtype=np.float32)
+    wps = []
+    for i in range(n):
+        t = i / (n - 1)
+        if t <= 0.28:
+            p = start + minimum_jerk_step(t / 0.28) * (grasp - start)
+        elif t <= 0.50:
+            p = grasp.copy()
+        else:
+            p = grasp + minimum_jerk_step((t - 0.50) / 0.50) * (lift - grasp)
+        wps.append(ForeseenWaypoint(
+            timestep=i + 1, time_offset=i / 30.0,
+            hand_keypoints_3d=np.zeros((21, 3), np.float32),
+            hand_keypoints_2d=np.zeros((21, 2), np.float32),
+            wrist_pose=np.array([p[0], p[1], p[2], 0, 0, 0], np.float32),
+            object_pose=np.zeros(6, np.float32),
+            contact_state=np.zeros(5, np.float32)))
+    return ForeseenTrajectory(intent="pick up the coffee cup",
+                              target_label=bbox.label, waypoints=wps)
+
+
 def render(stage, motion, vis, phase: str, out: str) -> None:
     cam = fake_camera(CAM_W, CAM_H)
     L = stage.layout
@@ -118,6 +153,9 @@ def render(stage, motion, vis, phase: str, out: str) -> None:
                            adaptation_active=True)
     grasping = phase in ("FORESEEING", "ADAPTING")
     vis.draw_3d_bounding_boxes(frame, [bbox], simplified=grasping)
+    if phase in ("FORESEEING", "WAIT_USER"):
+        bias = np.array([0.021, -0.012, 0.0], dtype=np.float32)
+        vis.draw_policy_corrections(frame, _plan(bbox, bias), bias)
     hotspots = np.array([bbox.center + [0.012, -0.03, 0.0],
                          bbox.center + [-0.02, 0.01, 0.0]], dtype=np.float32)
     vis.draw_affordance_hotspots(frame, AffordanceMap(

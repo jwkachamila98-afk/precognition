@@ -561,6 +561,7 @@ class WSInferenceServer:
                     buffer_step_count=step_cnt,
                     policy_loss=p_loss,
                     policy_updates=getattr(self.policy, "cumulative_adaptations", 0),
+                    learned_wrist_bias=self._learned_wrist_bias.tolist(),
                     gripper_action=action.gripper_action,
                     server_processing_ms=proc_time_ms
                 )

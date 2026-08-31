@@ -74,7 +74,7 @@ from src.ui.stage import Stage
 from src.mocks.mock_depth_estimator import MockDepthEstimator
 from src.mocks.mock_scene_parser import MockSceneParser
 from src.mocks.mock_affordance_extractor import MockAffordanceExtractor
-from src.mocks.mock_trajectory_diffusion import MockTrajectoryDiffusion
+from src.mocks.mock_trajectory_diffusion import MockTrajectoryDiffusion, minimum_jerk_step
 from src.mocks.mock_physics_engine import MockPhysicsEngine
 from src.mocks.mock_policy import MockResidualPolicy
 from src.policy.policy_base import PolicyObservation
@@ -795,6 +795,76 @@ class LocalVisualizer:
             self._video_label(frame, f"{name} · {bbox.center[2]:.2f} m",
                               (x0, y0 - self._px(10)))
 
+    def draw_policy_corrections(self, frame: np.ndarray, foreseen_traj,
+                                learned_bias: Optional[np.ndarray]) -> None:
+        """The learned residual, made visible ON the plan.
+
+        The planned wrist path is drawn as a quiet dotted line, and at a few
+        points along the reach an accent arrow points from where the
+        uncorrected plan would have passed to where the learned bias moved it
+        - that is, toward how this user actually reaches. The plan already
+        CONTAINS the bias (see generate_foreseen_rollout), so the arrows
+        depict a real nudge, not an illustration of one.
+
+        Nothing is drawn while the bias is still ~zero: an arrow on screen
+        always means the network changed something.
+        """
+        if foreseen_traj is None or not getattr(foreseen_traj, "waypoints", None):
+            return
+        if learned_bias is None:
+            return
+        bias = np.asarray(learned_bias, dtype=np.float32).reshape(-1)[:3]
+        if bias.shape[0] < 3 or float(np.linalg.norm(bias)) < 0.004:   # < 4 mm
+            return
+
+        h, w = frame.shape[:2]
+        fx = 0.8 * w
+        cx, cy = w / 2.0, h / 2.0
+
+        def proj(p3: np.ndarray) -> tuple:
+            z = max(float(p3[2]), 0.1)
+            return (int(fx * float(p3[0]) / z + cx), int(fx * float(p3[1]) / z + cy))
+
+        wrists = [np.asarray(wp.wrist_pose[:3], dtype=np.float32)
+                  for wp in foreseen_traj.waypoints]
+        pts = [proj(p) for p in wrists]
+
+        # The plan's path: dotted, receding - context for the arrows, not a
+        # second ghost.
+        for i in range(0, len(pts) - 1, 2):
+            cv2.line(frame, pts[i], pts[i + 1], INK["tertiary"], self._th(1),
+                     cv2.LINE_AA)
+
+        # The plan carries the full correction from the end of the approach
+        # onward, so these three are all full-size arrows, spread along the
+        # reach and clear of the endpoint the ghost hand occupies.
+        n = len(wrists)
+        samples = sorted({(2 * n) // 5, (11 * n) // 20, (7 * n) // 10})
+        drawn = None
+        for i in samples:
+            # How much of the bias is in the plan AT waypoint i. The generator
+            # folds the bias into the grasp point and everything after it, and
+            # interpolates into that over the approach phase (the first 28% of
+            # the rollout, minimum-jerk) - it is NOT a linear ramp to the end.
+            # Scaling these arrows linearly drew them at a third of the real
+            # correction over most of the path.
+            t_frac = i / max(n - 1, 1)
+            ramp = minimum_jerk_step(t_frac / 0.28) if t_frac < 0.28 else 1.0
+            tail = proj(wrists[i] - bias * ramp)
+            head = pts[i]
+            if abs(head[0] - tail[0]) + abs(head[1] - tail[1]) < 6:
+                continue
+            cv2.arrowedLine(frame, tail, head, INK["blue"], self._th(2),
+                            line_type=cv2.LINE_AA, tipLength=0.30)
+            drawn = head
+        if drawn is not None:
+            mm = float(np.linalg.norm(bias)) * 1000.0
+            # Below the arrow: the object's own name sits above the box, and
+            # the two captions were landing on each other.
+            self._video_label(frame, f"Learned correction · {mm:.0f} mm",
+                              (drawn[0] + self._px(14), drawn[1] + self._px(26)),
+                              colour=INK["blue"], px=11)
+
     def draw_affordance_hotspots(self, frame: np.ndarray, affordance_map: Optional[AffordanceMap]) -> None:
         """Candidate contact points: a quiet accent dot and a thin ring each.
         They support the grasp story - they don't get names shouted at them."""
@@ -1074,6 +1144,7 @@ class LocalClientRunner:
             "discrepancy_norm": 0.0, "buffer_steps": 0, "parsed_intent": None,
             "workflow_phase": ExecutionPhase.IDLE, "phase_progress": 0.0,
             "benchmark_summary": None, "policy_loss": 0.0, "policy_updates": 0,
+            "learned_wrist_bias": None,
         }
         # The learning card's training heartbeat. The count is read from
         # whichever policy is really learning (local or the server's); the
@@ -1711,6 +1782,7 @@ class LocalClientRunner:
             "benchmark_summary": response.benchmark_summary or self._remote_snapshot["benchmark_summary"],
             "policy_loss": response.policy_loss,
             "policy_updates": response.policy_updates,
+            "learned_wrist_bias": response.learned_wrist_bias,
         })
 
     def _audio_callback(self, indata: np.ndarray, frames: int, time_info: Any, status: Any) -> None:
@@ -2226,6 +2298,16 @@ class LocalClientRunner:
                 self.visualizer.draw_3d_bounding_boxes(frame, bboxes,
                                                        simplified=ghost_is_grasping)
                 self.visualizer.draw_affordance_hotspots(frame, affordance_map)
+
+                # What learning has changed about the plan, drawn on the plan.
+                # Shown while the system is previewing or waiting - never while
+                # the user executes, when their hand needs a clear stage.
+                if workflow_phase in (ExecutionPhase.FORESEEING, ExecutionPhase.WAIT_USER):
+                    display_bias = (self._local_learned_wrist_bias
+                                    if self.mode == "mock_local"
+                                    else self._remote_snapshot["learned_wrist_bias"])
+                    self.visualizer.draw_policy_corrections(frame, foreseen_traj,
+                                                            display_bias)
                 
                 # Ghost hand is an afterimage/replay of the user's OWN real recorded
                 # motion, never a synthetic generated plan:
