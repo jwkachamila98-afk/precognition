@@ -53,6 +53,7 @@ from src.perception.hand_tracker import HAND_CONNECTIONS, HandPose, HandTrackerA
 from src.perception.scene_parser import BoundingBox3D, ParsedScene
 from src.perception.mediapipe_tracker import MediaPipeHandTracker, MEDIAPIPE_AVAILABLE
 from src.perception.intent_parser import IntentParserABC, MockLLMIntentParser, ParsedIntent
+from src.audio.notification_sounds import NotificationSounds
 from src.audio.speech_to_text import AudioTranscriberABC, GeminiTranscriber, MockTranscriber, WhisperTranscriber
 from src.audio.text_to_speech import GeminiSpeaker, SpeechSynthesizerABC, SystemSpeaker
 from src.simulation.trajectory_generator import AffordanceMap, ForeseenTrajectory
@@ -1062,6 +1063,9 @@ class LocalClientRunner:
         self._network_task: Optional[asyncio.Task] = None
         self._network_latency_ms = 0.0
         self._network_got_first_response = False
+        # Calming tones in place of spoken guidance. See notification_sounds
+        # for why speech was the wrong instrument here.
+        self.sounds = NotificationSounds()
         self._last_announced_phase: Optional[ExecutionPhase] = None
         self._training_target_announced: Optional[str] = None
 
@@ -1116,6 +1120,7 @@ class LocalClientRunner:
         if not self.transcriber.is_listening:
             self.transcriber.start_listening()
             self.voice_status = "LISTENING"
+            self.sounds.play("listening")
             logger.info("Voice Mode: LISTENING... Speak your intent.")
         else:
             self.voice_status = "TRANSCRIBING"
@@ -1124,6 +1129,7 @@ class LocalClientRunner:
                 # The transcriber declined to guess. Say so on the HUD rather
                 # than silently leaving the old target in place.
                 logger.warning("Voice Mode: nothing transcribed - target unchanged.")
+                self.sounds.play("attention")
                 self.voice_status = "FAILED"
                 self._voice_status_until = time.time() + 4.0
                 return
@@ -1131,6 +1137,7 @@ class LocalClientRunner:
                 self.intent = transcript
                 self.current_parsed_intent = self.intent_parser.parse_intent(transcript)
                 self.workflow.trigger_intent(self.current_parsed_intent.target_object if self.current_parsed_intent.is_active else "none")
+                self.sounds.play("heard")
                 logger.info(f"Voice Mode Transcribed: '{transcript}' -> Target: {self.current_parsed_intent.target_object}")
             self.voice_status = "IDLE"
 
@@ -1226,12 +1233,37 @@ class LocalClientRunner:
             self._voice_status_until = 0.0
         return self.voice_status
 
-    def toggle_voice_guidance(self) -> None:
-        """Toggle spoken workflow guidance (announcements on each phase transition)."""
-        self.workflow.voice_guidance_enabled = not self.workflow.voice_guidance_enabled
+    # Which cue marks arriving in each phase.
+    _PHASE_CUES = {
+        ExecutionPhase.FORESEEING: "ready",
+        ExecutionPhase.WAIT_USER: "ready",
+        ExecutionPhase.USER_EXECUTING: "go",
+        ExecutionPhase.ADAPTING: "complete",
+        ExecutionPhase.AUTONOMOUS_DEMO: "improved",
+    }
+
+    def _sound_phase_change(self, phase, previous) -> None:
+        """Sound the cue for arriving in `phase`."""
         if not self.workflow.voice_guidance_enabled:
-            self.speaker.stop()
-        logger.info(f"Voice Guidance: {'ON' if self.workflow.voice_guidance_enabled else 'MUTED'}")
+            return
+        if phase == ExecutionPhase.IDLE:
+            # Returning to standby is only worth a sound if something was
+            # actually completed, not every time the workflow unwinds.
+            self._training_target_announced = None
+            if previous == ExecutionPhase.ADAPTING:
+                self.sounds.play("complete")
+            return
+        cue = self._PHASE_CUES.get(phase)
+        if cue:
+            self.sounds.play(cue)
+
+    def toggle_voice_guidance(self) -> None:
+        """Toggle the notification cues ('g')."""
+        self.workflow.voice_guidance_enabled = not self.workflow.voice_guidance_enabled
+        self.sounds.enabled = self.workflow.voice_guidance_enabled
+        if not self.workflow.voice_guidance_enabled:
+            self.sounds.stop()
+        logger.info(f"Notification sounds: {'ON' if self.sounds.enabled else 'MUTED'}")
 
     def cycle_intent(self) -> None:
         """Cycle through preset natural language intent prompts."""
@@ -1509,8 +1541,8 @@ class LocalClientRunner:
 
     STAGE_HOTKEYS = [
         ("v", "talk"), ("a", "auto demo"), ("c", "step"), ("r", "record"),
-        ("p", "adapt"), ("f", "ghost"), ("m", "stats"), ("k", "save"),
-        ("l", "load"), ("x", "reset"), ("i", "intent"), ("q", "quit"),
+        ("p", "adapt"), ("f", "ghost"), ("m", "stats"), ("g", "sound"),
+        ("l", "load"), ("x", "reset"), ("k", "save"), ("q", "quit"),
     ]
 
     # Composing at the full width of a 3440-pixel display costs more than the
@@ -2105,31 +2137,16 @@ class LocalClientRunner:
                     if snap["benchmark_summary"]:
                         benchmark_summary = snap["benchmark_summary"]
 
-                    # The server's workflow controller is headless (no speakers on the
-                    # GPU pod), so the client announces locally instead - but only ONCE,
-                    # right when a training session first starts (the first FORESEEING
-                    # entry for a given target), not on every phase transition or every
-                    # RESTARTING-loop iteration. The on-screen instruction bar carries
-                    # ongoing guidance instead of narrating every step out loud.
+                    # A short tone on each phase change, rather than a spoken
+                    # sentence. Speech arrived a second or two after the moment
+                    # it described, talked over someone concentrating on a
+                    # reach, and consumed Gemini quota that transcription and
+                    # detection need more. A tone says "something changed"
+                    # without asking to be listened to.
                     if workflow_phase != self._last_announced_phase:
+                        previous = self._last_announced_phase
                         self._last_announced_phase = workflow_phase
-                        current_target = self.workflow._target_label
-                        if workflow_phase == ExecutionPhase.FORESEEING and current_target != self._training_target_announced:
-                            self._training_target_announced = current_target
-                            if self.workflow.voice_guidance_enabled:
-                                instruction = self.workflow._phase_instruction(workflow_phase)
-                                if instruction:
-                                    self.speaker.speak(instruction)
-                        elif workflow_phase == ExecutionPhase.AUTONOMOUS_DEMO:
-                            # A one-off, explicitly requested action (the 'a' hotkey) -
-                            # announce every time it's triggered, not deduped per-target
-                            # like the training loop's FORESEEING entry above.
-                            if self.workflow.voice_guidance_enabled:
-                                instruction = self.workflow._phase_instruction(workflow_phase)
-                                if instruction:
-                                    self.speaker.speak(instruction)
-                        elif workflow_phase == ExecutionPhase.IDLE:
-                            self._training_target_announced = None  # a future new intent should announce again
+                        self._sound_phase_change(workflow_phase, previous)
 
                     if not self._network_got_first_response:
                         cv2.putText(frame, f"CONNECTING TO {self.server_url or self.config.network.server_host}...",
@@ -2287,7 +2304,7 @@ class LocalClientRunner:
                     self.visualizer.show_analytics_panel = not self.visualizer.show_analytics_panel
                 elif key == ord("h"): # Toggle expanded telemetry detail
                     self.visualizer.show_telemetry_detail = not self.visualizer.show_telemetry_detail
-                elif key == ord("g"): # Toggle spoken workflow guidance
+                elif key == ord("g"): # Toggle notification cues
                     self.toggle_voice_guidance()
                 elif key == ord("e"): # Export co-adaptation benchmark trials to JSON + CSV
                     if self.benchmark.total_trials == 0:
@@ -2348,6 +2365,7 @@ class LocalClientRunner:
                 self.cap.release()
             self.robot.disconnect()
             self.speaker.stop()
+            self.sounds.close()
             cv2.destroyAllWindows()
             await self.ws_client.close()
 
