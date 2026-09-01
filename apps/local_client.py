@@ -1481,9 +1481,10 @@ class LocalClientRunner:
                 staged = self.lab_sim.prepare(foreseen_traj, target_bbox, self._object_sprite)
             if staged:
                 self._lab_staged = True
-                # Rebuild the room once per demo, from the depth of the frame
-                # the reenactment is being staged against.
-                self.lab_sim.set_scene_from_depth(self._latest_depth_m, frame)
+                # Authored ground at the real surface, rather than a mesh
+                # reconstructed from depth: a single webcam's depth is too soft
+                # to carry a room, and a desk comes back as a relief.
+                self.lab_sim.set_stylised_room()
                 # Back-date the local clock onto the SERVER's phase clock. Starting
                 # it at the moment of staging left the playback trailing the phase
                 # by however long detection and staging took, so the panel closed

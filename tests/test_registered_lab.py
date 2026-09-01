@@ -180,3 +180,44 @@ def test_a_short_recording_still_plays_at_real_speed():
     # A third of the way through a 12 s phase is 4 s of wall clock, by which
     # point a 3 s recording is finished.
     assert sim.step_for_progress(1.0 / 3.0) >= sim._num_steps - 1.5
+
+
+def test_the_stylised_pad_sits_under_the_object_and_is_scaled_to_it():
+    """A floor is the wrong metaphor. A horizontal plane large enough to read as
+    ground runs to the horizon from a camera at the origin looking level: at
+    1.3 m it covered the upper half of the frame and left the actors a sliver.
+    The pad is scaled to the object so it stages without dominating, and sits at
+    the object's underside, which is the one height we actually know - the object
+    is resting on it.
+    """
+    bbox = _bbox()
+    sim = LabSimulator(width=W, height=H, registered=True)
+    assert sim.prepare_from_demonstration(_demonstration(bbox), bbox, None)
+    assert sim.set_stylised_room()
+
+    mesh = sim.scene_mesh
+    assert mesh is not None
+    ys = mesh.vertices[:, 1]
+    base = sim._object_path_lab[0][1] - sim.object_size[1] * 0.5
+    assert np.allclose(ys, base, atol=1e-4), "the pad is not at the object's base"
+
+    span = float(np.linalg.norm(
+        mesh.vertices[:, [0, 2]].max(axis=0) - mesh.vertices[:, [0, 2]].min(axis=0)))
+    footprint = float(np.max(sim.object_size[[0, 2]]))
+    assert span < 12.0 * footprint, f"pad spans {span:.2f} m for a {footprint:.2f} m object"
+
+
+def test_the_stylised_set_replaces_the_photograph_rather_than_covering_it():
+    """Its ground fades to black, which only vanishes against black. Composited
+    over a lighter camera frame the same fade became a hard dark bar cutting
+    across the actors, which is what it looked like when first tried."""
+    bbox = _bbox()
+    sim = LabSimulator(width=W, height=H, registered=True)
+    assert sim.prepare_from_demonstration(_demonstration(bbox), bbox, None)
+    assert sim.set_stylised_room()
+
+    background = np.full((H, W, 3), (200, 200, 200), np.uint8)   # a bright room
+    out = sim.render(0.0, elapsed=0.0, background=background)
+    assert out is not None
+    # None of that brightness may survive: the set is not a layer on the video.
+    assert out.mean() < 90, "the photograph is showing through the stylised set"

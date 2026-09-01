@@ -38,6 +38,7 @@ from src.simulation.render import shading as SH
 from src.simulation.render.camera import Camera
 from src.simulation.render.raster import Material, Mesh, Rasterizer
 from src.simulation.render.scene_mesh import build_scene_mesh
+from src.simulation.render.stylised_room import build_stylised_room
 from src.simulation.trajectory_generator import ForeseenTrajectory
 
 logger = logging.getLogger(__name__)
@@ -257,6 +258,12 @@ class LabSimulator:
         # the studio was: (lit image, coverage, g-buffer snapshot, depth).
         self.scene_mesh: Optional[Mesh] = None
         self._scene_bake = None
+        # Whether the staged scene REPLACES the photograph or sits over it.
+        # A stylised set is not a layer on the video: its ground fades to
+        # black, which only disappears against black. Composited over a
+        # lighter camera image the same fade reads as a hard dark bar cutting
+        # across the actors - measured, and it looked exactly like that.
+        self._scene_is_void = False
         self.transform: Optional[LabTransform] = None
         self.trajectory: Optional[ForeseenTrajectory] = None
         self.object_mesh: Optional[Mesh] = None
@@ -594,6 +601,63 @@ class LabSimulator:
     def is_ready(self) -> bool:
         return self._ready and self.camera is not None
 
+    def set_stylised_room(self, radius: Optional[float] = None) -> bool:
+        """Stage on authored ground placed at the real surface, and bake it.
+
+        The default for registered mode. Reconstructing the room from depth is
+        still available (set_scene_from_depth) but a single webcam's depth is
+        too soft to carry it: a desk comes back as a relief. Authored geometry
+        placed at the measured surface gets the registration - right camera,
+        right height, object where it really is - without claiming to be a
+        photograph of anything.
+
+        The surface height is taken from the underside of the staged object
+        rather than from the depth map, because where the object rests is a
+        thing we actually know: it is resting on it.
+        """
+        self.scene_mesh = None
+        self._scene_bake = None
+        if not self.registered or self.camera is None or self._object_path_lab is None:
+            return False
+
+        centre = self._object_path_lab[0]
+        surface_y = float(centre[1]) - float(self.object_size[1]) * 0.5
+        # A PAD under the object, not a floor. A horizontal plane big enough to
+        # read as ground runs to the horizon from a camera sitting at the origin
+        # looking level, and swallows the frame - measured at 1.3 m it covered
+        # the upper half of the shot and left the actors as a sliver. Scaled to
+        # the object instead, it stays a contained piece of staging that cannot
+        # dominate whatever it is holding.
+        footprint = float(np.max(self.object_size[[0, 2]]))
+        pad = float(np.clip(footprint * 3.0, 0.16, 0.45)) if radius is None else radius
+        mesh = build_stylised_room(
+            surface_y=surface_y,
+            centre_xz=(float(centre[0]), float(centre[2])),
+            radius=pad,
+            contact_radius=max(footprint * 0.6, 0.04),
+        )
+        self._bake_scene(mesh, "stylised ground", void=True)
+        return True
+
+    def _bake_scene(self, mesh: Mesh, what: str, void: bool = False) -> None:
+        """Rasterise and shade a static scene once, for the whole demo."""
+        t0 = time.perf_counter()
+        self._rast.clear()
+        self._rast.draw(mesh, self.camera)
+        snapshot = self._rast.snapshot()
+        depth = self._rast.depth.copy()
+        lit = SH.tonemap(SH.shade(self._rast, self.camera, self._lights, self._env))
+        cover = (self._rast.gbuffer[:, :, 12] > 0.5)[:, :, None]
+
+        self.scene_mesh = mesh
+        self._scene_bake = (lit, cover, snapshot, depth)
+        self._scene_is_void = void
+        logger.info(
+            f"LabSimulator: staged on {what} - {mesh.num_faces} triangles "
+            f"covering {100.0 * cover.mean():.0f}% of frame, baked in "
+            f"{(time.perf_counter() - t0) * 1000:.0f} ms."
+        )
+
     def set_scene_from_depth(self, depth_m: Optional[np.ndarray],
                              frame_bgr: Optional[np.ndarray],
                              grid_w: int = 72) -> bool:
@@ -610,22 +674,7 @@ class LabSimulator:
         mesh = build_scene_mesh(depth_m, frame_bgr, grid_w=grid_w)
         if mesh is None or self.camera is None:
             return False
-
-        t0 = time.perf_counter()
-        self._rast.clear()
-        self._rast.draw(mesh, self.camera)
-        snapshot = self._rast.snapshot()
-        depth = self._rast.depth.copy()
-        lit = SH.tonemap(SH.shade(self._rast, self.camera, self._lights, self._env))
-        cover = (self._rast.gbuffer[:, :, 12] > 0.5)[:, :, None]
-
-        self.scene_mesh = mesh
-        self._scene_bake = (lit, cover, snapshot, depth)
-        logger.info(
-            f"LabSimulator: reconstructed the scene as {mesh.num_faces} triangles "
-            f"covering {100.0 * cover.mean():.0f}% of frame, baked in "
-            f"{(time.perf_counter() - t0) * 1000:.0f} ms."
-        )
+        self._bake_scene(mesh, "the reconstructed scene")
         return True
 
     def _registered_camera(self) -> Camera:
@@ -995,11 +1044,18 @@ class LabSimulator:
         draped across the gap. Leaving the photograph visible there is a more
         honest seam than inventing a surface over it.
         """
-        img = background
-        if img.shape[:2] != (self.height, self.width):
-            img = cv2.resize(img, (self.width, self.height),
-                             interpolation=cv2.INTER_LINEAR)
-        img = np.ascontiguousarray(img.copy())
+        if self._scene_is_void:
+            # The set replaces the room: the actors stand in the app's own dark,
+            # not in a photograph. The client still dissolves from the live frame
+            # into this, so the cut reads as the scene being restaged rather than
+            # as a jump to somewhere else.
+            img = np.zeros((self.height, self.width, 3), np.uint8)
+        else:
+            img = background
+            if img.shape[:2] != (self.height, self.width):
+                img = cv2.resize(img, (self.width, self.height),
+                                 interpolation=cv2.INTER_LINEAR)
+            img = np.ascontiguousarray(img.copy())
 
         obj = self._object_mesh_for(step)
         if self._scene_bake is not None:
