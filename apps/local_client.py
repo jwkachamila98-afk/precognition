@@ -1123,7 +1123,9 @@ class LocalClientRunner:
         # and rendered in a 3-D lab (src/simulation/lab_sim.py) rather than drawn
         # as a flat overlay on the webcam image; `_lab_open` drives the iris that
         # opens and closes the viewport.
-        self.lab_sim = LabSimulator()
+        # Registered: the reenactment is staged in the real camera, over the
+        # live frame, at the object's own detected position and extent.
+        self.lab_sim = LabSimulator(registered=True)
         self._lab_staged = False
         self._lab_open = 0.0
         self._lab_image: Optional[np.ndarray] = None
@@ -1494,7 +1496,8 @@ class LocalClientRunner:
             else:
                 play = progress
             step = self.lab_sim.step_for_progress(play)
-            rendered = self.lab_sim.render(step, elapsed=now, push_in=play)
+            rendered = self.lab_sim.render(step, elapsed=now, push_in=play,
+                                           background=frame)
             if rendered is not None:
                 self._lab_image = rendered
             telemetry = self.lab_sim.telemetry(step)
@@ -1502,11 +1505,35 @@ class LocalClientRunner:
         else:
             telemetry, label = {}, ""
 
+        if self.lab_sim.registered:
+            # Registered: the render already IS this frame, with the object and
+            # hand standing in it. So it cross-fades in place rather than
+            # opening as a panel - a panel would rescale the image into a
+            # smaller rect and slide everything off the pixels it was
+            # registered to, which is the one thing this mode exists to avoid.
+            self._blend_registered_lab(frame, label, telemetry, progress)
+            return
+
         self.visualizer.draw_lab_panel(
             frame, self._lab_image, self._lab_open,
             anchor_rect=self._lab_anchor_rect, target_label=label,
             telemetry=telemetry, progress=progress,
         )
+
+    def _blend_registered_lab(self, frame, label, telemetry, progress) -> None:
+        """Dissolve the registered reenactment into the live frame, in place."""
+        if self._lab_image is None or self._lab_open <= 0.001:
+            return
+        img = self._lab_image
+        if img.shape[:2] != frame.shape[:2]:
+            img = cv2.resize(img, (frame.shape[1], frame.shape[0]),
+                             interpolation=cv2.INTER_LINEAR)
+        a = float(np.clip(self._lab_open, 0.0, 1.0))
+        cv2.addWeighted(img, a, frame, 1.0 - a, 0.0, dst=frame)
+        if self._lab_open > 0.985:
+            h, w = frame.shape[:2]
+            self.visualizer._draw_lab_chrome(frame, (0, 0, w - 1, h - 1),
+                                             label, telemetry or {}, progress)
 
     def save_checkpoint(self) -> None:
         """Save learned residual policy checkpoint."""

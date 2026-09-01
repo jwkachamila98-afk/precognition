@@ -225,7 +225,17 @@ class LabSimulator:
     """Renders the Autonomous Demo reenactment inside the simulated lab."""
 
     def __init__(self, width: int = 384, height: int = 288,
-                 max_fps: float = 20.0) -> None:
+                 max_fps: float = 20.0, registered: bool = False) -> None:
+        # REGISTERED mode drops the studio and puts the reenactment back in the
+        # real scene: the camera is the webcam's own pinhole, the object keeps
+        # the position and extent it was detected at, the hand keeps its tracked
+        # metric position, and the background is the live frame. The object then
+        # lands on exactly the pixels it occupies in the video - not because
+        # anything is fitted to match, but because nothing is moved.
+        #
+        # The studio look is not deleted, only switched off: it frames every
+        # reenactment identically, which registration cannot do.
+        self.registered = bool(registered)
         self.width = int(width)
         self.height = int(height)
         # The reenactment is a 2 s plan stretched over a ~6 s phase, so it has
@@ -428,8 +438,24 @@ class LabSimulator:
         # Hand scale first: it is the metric reference the object is sized against.
         measured_palm = float(np.median(
             np.linalg.norm(raw_kpts[:, HM._MCP["middle"]] - raw_kpts[:, HM.WRIST], axis=1)))
-        scale = float(np.clip(_REFERENCE_PALM_M / max(measured_palm, 1e-4), 0.15, 8.0))
-        longest = _object_longest_dimension(target_bbox, _REFERENCE_PALM_M, label=label)
+        if self.registered:
+            # Nothing is normalised: rescaling the hand or substituting a class
+            # prior for the object's extent would move both off the pixels they
+            # occupy in the video, which is the whole point of this mode.
+            #
+            # The class prior is the better estimate of how big the thing really
+            # IS - the detector's extent is back-projected through depth that is
+            # synthetic locally and only relative on GPU, so it has been wrong by
+            # 6x. But registration does not want metric truth, it wants agreement
+            # with the observation: the extent and the centre come from the same
+            # back-projection, so drawing the object at both reproduces the pixels
+            # it was measured from, however wrong the metres are.
+            scale = 1.0
+            longest = (float(np.max(np.asarray(target_bbox.size, dtype=np.float32)))
+                       if target_bbox is not None else _REFERENCE_PALM_M)
+        else:
+            scale = float(np.clip(_REFERENCE_PALM_M / max(measured_palm, 1e-4), 0.15, 8.0))
+            longest = _object_longest_dimension(target_bbox, _REFERENCE_PALM_M, label=label)
 
         origin_cam = (np.asarray(target_bbox.center, dtype=np.float32)
                       if target_bbox is not None else object_path_cam[0].copy())
@@ -461,28 +487,40 @@ class LabSimulator:
         self.object_mesh = mesh
         self.object_size = OM.mesh_extent(mesh)
 
-        anchor_lab = LS.OBJECT_ANCHOR + np.array(
-            [0.0, float(self.object_size[1]) * 0.5, 0.0], dtype=np.float32)
-        self.transform = LabTransform(origin_cam=origin_cam, anchor_lab=anchor_lab,
-                                      scale=scale)
+        if self.registered:
+            # The identity: perception metres, axis-flipped into the lab's
+            # handedness and left exactly where they were measured.
+            anchor_lab = np.zeros(3, dtype=np.float32)
+            self.transform = LabTransform(origin_cam=np.zeros(3, dtype=np.float32),
+                                          anchor_lab=anchor_lab, scale=1.0)
+        else:
+            anchor_lab = LS.OBJECT_ANCHOR + np.array(
+                [0.0, float(self.object_size[1]) * 0.5, 0.0], dtype=np.float32)
+            self.transform = LabTransform(origin_cam=origin_cam, anchor_lab=anchor_lab,
+                                          scale=scale)
 
         self._num_steps = int(len(raw_kpts))
         self._hand_paths_lab = self.transform(raw_kpts.reshape(-1, 3)).reshape(raw_kpts.shape)
         self._object_path_lab = self.transform(object_path_cam)
-        # Keep the staged object from sinking through or floating above the bench:
-        # its own motion is preserved, its resting height corrected.
-        self._object_path_lab[:, 1] += float(anchor_lab[1]) - float(self._object_path_lab[0, 1])
+        if not self.registered:
+            # Keep the staged object from sinking through or floating above the
+            # bench: its own motion is preserved, its resting height corrected.
+            # Registered mode has no bench to rest on, and shifting the object
+            # vertically would slide it off the pixels it was detected at.
+            self._object_path_lab[:, 1] += (float(anchor_lab[1])
+                                            - float(self._object_path_lab[0, 1]))
 
         # A DEMONSTRATION is left exactly as recorded. Rotating it to suit the
         # camera, or sliding the grasp onto the staged object, would be editing
         # the very thing it exists to show. A generated plan carries no such
         # claim - its orientation is canned - so it is still posed for legibility.
-        if not self._is_demonstration:
+        if not self._is_demonstration and not self.registered:
             self._present_hand_to_the_camera()
             self._seat_grasp_on_the_staged_object()
 
-        self.camera = self._fit_camera()
-        self._ensure_static_background()
+        self.camera = self._registered_camera() if self.registered else self._fit_camera()
+        if not self.registered:
+            self._ensure_static_background()
         self._ready = True
 
         logger.info(
@@ -556,6 +594,28 @@ class LabSimulator:
     @property
     def is_ready(self) -> bool:
         return self._ready and self.camera is not None
+
+    def _registered_camera(self) -> Camera:
+        """The webcam itself, as a lab camera.
+
+        The perception frame puts the camera at the origin looking along +Z with
+        fx = fy = 0.8 * width and the principal point at the image centre. In lab
+        world that is the origin looking along -Z, and the only thing left to
+        derive is the vertical field of view:
+
+            tan(fov_y / 2) = (h / 2) / (0.8 * w)
+
+        which is resolution-independent at a fixed aspect - 50.23 degrees for
+        4:3, against the 42 the studio rig used. With this camera the projection
+        agrees with BoundingBox3D.project_to_2d to the pixel, so an object drawn
+        at its detected position lands on the pixels it was detected from.
+        """
+        fov_y = math.degrees(2.0 * math.atan(
+            (self.height * 0.5) / (0.8 * float(self.width))))
+        return Camera(position=np.zeros(3, dtype=np.float32),
+                      target=np.array([0.0, 0.0, -1.0], dtype=np.float32),
+                      up=np.array([0.0, 1.0, 0.0], dtype=np.float32),
+                      fov_y_deg=fov_y, width=self.width, height=self.height)
 
     def _fit_camera(self) -> Camera:
         """Look at the staged object from the direction the real camera saw it.
@@ -875,8 +935,46 @@ class LabSimulator:
         return covered & (normal_y > 0.45) & (world_y > LS.BENCH_TOP_Y - 0.04) \
             & (world_y < LS.PEDESTAL_TOP_Y + 0.012)
 
+    def _render_registered(self, step: float, elapsed: float,
+                           background: np.ndarray) -> np.ndarray:
+        """Draw the object and hand over the live frame, in the real camera.
+
+        There is no static bake here and nothing to cache: the background is a
+        different image every frame. That costs nothing, because it also removes
+        the only geometry the bake existed to amortise - the bench and backdrop
+        are simply not in this shot. Only the object and the hand are rasterised,
+        and only their own pixels are shaded.
+        """
+        img = background
+        if img.shape[:2] != (self.height, self.width):
+            img = cv2.resize(img, (self.width, self.height),
+                             interpolation=cv2.INTER_LINEAR)
+        img = np.ascontiguousarray(img.copy())
+
+        obj = self._object_mesh_for(step)
+        self._rast.clear()
+        self._rast.draw(obj, self.camera)
+
+        idx = np.flatnonzero((self._rast.gbuffer[:, :, 12] > 0.5).ravel())
+        if len(idx) > 0:
+            gb_rows = self._rast.gbuffer.reshape(-1, 13)[idx]
+            lit = SH.shade_rows(gb_rows, self._rast.depth.reshape(-1)[idx],
+                                self.camera, self._lights, self._env)
+            img.reshape(-1, 3)[idx] = SH.tonemap(lit)
+
+        # The hand is seeded with the object's depth so the object still occludes
+        # it. Nothing else can: the real scene has no geometry here, so a hand
+        # behind a real table edge will draw over it. That is the honest limit of
+        # compositing without scene reconstruction.
+        self._ghost.clear()
+        self._ghost.seed_depth(self._rast.depth)
+        self._ghost.draw(self._hand_mesh_for(step), self.camera)
+        self._composite_hologram(img, elapsed)
+        return img
+
     def render(self, step: float, elapsed: float = 0.0,
-               push_in: float = 0.0) -> Optional[np.ndarray]:
+               push_in: float = 0.0,
+               background: Optional[np.ndarray] = None) -> Optional[np.ndarray]:
         """Render one frame of the reenactment as a BGR uint8 image.
 
         ``push_in`` in [0, 1] applies a slow zoom. A uniform scale about the
@@ -889,6 +987,18 @@ class LabSimulator:
         t0 = time.perf_counter()
 
         step = float(np.clip(step, 0.0, max(self._num_steps - 1, 0)))
+
+        if self.registered:
+            if background is None:
+                return None          # nothing to register against
+            # Deliberately uncached: the background moves every frame, so a hit
+            # on (step, push_in) would freeze the live image behind the actors.
+            img = self._render_registered(step, elapsed, background)
+            self.last_render_ms = (time.perf_counter() - t0) * 1000.0
+            self._last_render_t = t0
+            self._last_image = img
+            return img
+
         key = (round(step, 3), round(push_in, 3))
         if self._last_image is not None:
             if key == self._last_key:
