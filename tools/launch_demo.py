@@ -106,22 +106,56 @@ def discover_pod_url(api_key, pod_name=None):
     return None, None
 
 
+def server_is_up(url, timeout=6):
+    """Whether the INFERENCE SERVER is listening - not merely the port.
+
+    A bare TCP connect is not evidence. RunPod publishes a pod's ports through
+    a proxy that accepts connections whether or not anything is listening
+    behind them, so connect() succeeds the second the pod boots and the
+    launcher would announce "server ready after 0s" while apt and pip still
+    had five minutes to run. The client then started against nothing.
+
+    Completing a WebSocket handshake needs the server process itself, so that
+    is what gets tested.
+    """
+    try:
+        import asyncio
+
+        import websockets
+    except ImportError:                       # no websockets: fall back
+        import socket
+        host, _, port = url.replace("ws://", "").partition(":")
+        try:
+            with socket.create_connection((host, int(port)), timeout=timeout):
+                return True
+        except OSError:
+            return False
+
+    async def _handshake():
+        try:
+            async with websockets.connect(url, open_timeout=timeout,
+                                          close_timeout=2):
+                return True
+        except Exception:
+            return False
+
+    try:
+        return asyncio.run(_handshake())
+    except Exception:
+        return False
+
+
 def wait_for_server(url, timeout_s=1200):
-    """Block until the inference server accepts a connection."""
-    import socket
+    """Block until the inference server is genuinely serving."""
     host, _, port = url.replace("ws://", "").partition(":")
-    port = int(port)
     start = time.time()
     spinner, i = "|/-\\", 0
     while time.time() - start < timeout_s:
-        try:
-            with socket.create_connection((host, port), timeout=5):
-                elapsed = time.time() - start
-                sys.stdout.write("\r" + " " * 78 + "\r")
-                print(_c(f"  server ready after {elapsed:.0f}s", "green"))
-                return True
-        except OSError:
-            pass
+        if server_is_up(url):
+            elapsed = time.time() - start
+            sys.stdout.write("\r" + " " * 78 + "\r")
+            print(_c(f"  server ready after {elapsed:.0f}s", "green"))
+            return True
         elapsed = int(time.time() - start)
         sys.stdout.write(
             f"\r  {spinner[i % 4]} waiting for {host}:{port} "

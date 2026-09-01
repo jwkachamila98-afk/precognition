@@ -11,7 +11,9 @@ and a test that hit RunPod for real would be a test that costs money.
 """
 
 import importlib.util
+import socket
 import sys
+import threading
 import types
 from pathlib import Path
 
@@ -84,6 +86,49 @@ def test_local_mode_touches_no_pod_at_all():
     rc, stopped = _run(["launch_demo.py", "--local"])
     assert rc == 0
     assert stopped == []
+
+
+def test_an_accepting_socket_is_not_a_running_server():
+    """Readiness must mean the inference server, not an open port.
+
+    RunPod publishes pod ports through a proxy that completes a TCP connect
+    whether or not anything is listening behind it. The launcher trusted that
+    connect and announced "server ready after 0s" on a pod that still had
+    five minutes of apt and pip ahead of it - then started the client against
+    nothing. Observed live on pod ejrezqa8rj01vy, 2026-09-01.
+
+    This stands up the same shape locally: a socket that accepts and then
+    says nothing at all.
+    """
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(4)
+    port = listener.getsockname()[1]
+    held = []
+
+    def _accept_and_ignore():
+        while True:
+            try:
+                conn, _ = listener.accept()
+                held.append(conn)          # kept open, never spoken to
+            except OSError:
+                return
+
+    threading.Thread(target=_accept_and_ignore, daemon=True).start()
+    try:
+        # The check the launcher used to make succeeds against this.
+        with socket.create_connection(("127.0.0.1", port), timeout=2):
+            pass
+
+        mod = _launcher()
+        assert mod.server_is_up(f"ws://127.0.0.1:{port}", timeout=2) is False, (
+            "a socket that accepts but never handshakes was reported as a "
+            "running inference server")
+    finally:
+        listener.close()
+        for c in held:
+            c.close()
 
 
 def test_a_pod_that_never_comes_up_is_still_stopped():
