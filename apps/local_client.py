@@ -1553,6 +1553,100 @@ class LocalClientRunner:
         except Exception:
             return 1920, 1080
 
+    @staticmethod
+    def _solve_axis(p1: int, r1: int, p2: int, r2: int, target: int):
+        """The request that reports `target`, from two (request, reported)
+        probes. None when the axis does not respond, so the caller leaves it
+        alone rather than moving the window somewhere arbitrary."""
+        if p2 == p1 or r2 == r1:
+            return None
+        slope = (r2 - r1) / (p2 - p1)
+        if abs(slope) < 1e-6:
+            return None
+        return int(round(p1 + (target - r1) / slope))
+
+    def _solve_window_position(self, window_name, x, y):
+        """Move the window so its CONTENT lands at (x, y). Returns the final
+        rect, or None if the backend would not cooperate."""
+        probes = []
+        for delta in (0, 100):
+            try:
+                cv2.moveWindow(window_name, x + delta, y + delta)
+                cv2.waitKey(1)
+                probes.append((x + delta, y + delta,
+                               *cv2.getWindowImageRect(window_name)[:2]))
+            except (cv2.error, AttributeError):
+                return None
+        (px1, py1, rx1, ry1), (px2, py2, rx2, ry2) = probes
+        want_x = self._solve_axis(px1, rx1, px2, rx2, x)
+        want_y = self._solve_axis(py1, ry1, py2, ry2, y)
+        if want_x is None or want_y is None:
+            return None
+        try:
+            cv2.moveWindow(window_name, want_x, want_y)
+            cv2.waitKey(1)
+            return cv2.getWindowImageRect(window_name)
+        except (cv2.error, AttributeError):
+            return None
+
+    def _place_window_on_screen(self) -> None:
+        """Move the window to a known-visible origin and verify it landed.
+
+        The check is not decoration: the failure this guards against is
+        invisible from inside the process - the app runs perfectly, and the
+        user sees nothing at all - so the one cheap signal that it happened
+        belongs in the log rather than in someone's bug report.
+        """
+        window_name = self.config.visualization.window_name
+        x = max(0, (self._screen_w - self.stage.width) // 2)
+        # Below the menu bar, not centred vertically: the title bar is drawn
+        # ABOVE the content origin, so a centred window sits low.
+        y = 40
+        try:
+            # A window that has never been shown has no geometry: moveWindow
+            # does nothing and getWindowImageRect reports zeros. Realising it
+            # with one frame first is what makes the placement take effect -
+            # and it puts the stage on screen immediately rather than after
+            # the first camera frame arrives.
+            cv2.imshow(window_name, self.stage.canvas)
+            cv2.waitKey(1)
+            cv2.moveWindow(window_name, x, y)
+            cv2.waitKey(1)
+        except cv2.error as exc:
+            logger.warning(f"Could not position the window: {exc}")
+            return
+        try:
+            rx, ry, rw, rh = cv2.getWindowImageRect(window_name)
+        except (cv2.error, AttributeError):
+            return                       # not all backends report geometry
+        if rw <= 0 or rh <= 0:
+            return
+
+        # The coordinate moveWindow accepts is not the one getWindowImageRect
+        # reports. On this Cocoa backend the two are related by y_reported =
+        # 32 - 2*y_requested: a flipped origin and a Retina factor. Feeding
+        # back the raw error therefore DOUBLES it - asking for 40 gave -48,
+        # and "correcting" to 128 gave -224.
+        #
+        # So calibrate instead of guessing: two probes give the line, and the
+        # request that lands the window where we want it follows directly.
+        # Nothing here is display-specific; a backend where the mapping is the
+        # identity solves to the identity.
+        if (rx, ry) != (x, y):
+            placed = self._solve_window_position(window_name, x, y)
+            if placed is not None:
+                rx, ry, rw, rh = placed
+
+        visible_h = min(ry + rh, self._screen_h) - max(ry, 0)
+        if visible_h < 0.6 * rh:
+            logger.warning(
+                f"The window is mostly off-screen (at y={ry}, {rh} px tall, on "
+                f"a {self._screen_h} px display). Move it into view, or run "
+                f"with a smaller window.")
+        else:
+            logger.info(f"Window placed at ({rx}, {ry}) at {rw}x{rh} on a "
+                        f"{self._screen_w}x{self._screen_h} display.")
+
     def toggle_fullscreen(self) -> None:
         """Toggle the visualizer window between its native size and a maximized
         'fake fullscreen' that fills the screen.
@@ -1588,11 +1682,22 @@ class LocalClientRunner:
     # it, which still rasterises text far larger than the old 640-wide path did.
     _MAX_STAGE_W = 1920
 
+    # A window is not the same size as the screen it has to fit on. The menu
+    # bar, the title bar and the Dock all take vertical space, and a window
+    # sized to the full screen height does not fit: macOS pushed it down until
+    # only a ~100 px sliver of a 900 px window was on a 900 px display, which
+    # reads exactly like the app never opened. Measured on a 1440x900 Mac:
+    # the window's content origin came back at y=794.
+    _SCREEN_CHROME_H = 130
+    _SCREEN_CHROME_W = 80
+
     def _build_stage(self) -> Stage:
-        """Size the stage to the display's aspect, capped for cost."""
+        """Size the stage to fit the USABLE screen area, capped for cost."""
         sw, sh = max(640, self._screen_w), max(480, self._screen_h)
-        width = min(sw, self._MAX_STAGE_W)
-        height = max(360, int(round(width * sh / sw)))
+        avail_w = max(640, sw - self._SCREEN_CHROME_W)
+        avail_h = max(400, sh - self._SCREEN_CHROME_H)
+        width = min(avail_w, self._MAX_STAGE_W)
+        height = max(360, int(round(width * avail_h / avail_w)))
         probe = Stage(width, height)
         rail_w = probe.layout.telemetry[2] - probe.layout.telemetry[0]
         return Stage(width, height,
@@ -1942,6 +2047,11 @@ class LocalClientRunner:
         # box the moment the app started.
         cv2.resizeWindow(self.config.visualization.window_name,
                          self.stage.width, self.stage.height)
+        # And put it somewhere visible. Left to place the window itself, macOS
+        # dropped a full-height window below the bottom edge of the display -
+        # the app was running, drawing, and responding to keys, with a ~100 px
+        # sliver on screen. It looked exactly like nothing had opened.
+        self._place_window_on_screen()
         self.robot.connect()
         if self.server_url:
             mode_str = f"REMOTE CLOUD GPU ({self.server_url})"

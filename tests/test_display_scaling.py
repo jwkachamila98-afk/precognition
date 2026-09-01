@@ -131,3 +131,30 @@ def test_the_render_loop_actually_invokes_every_annotation_renderer():
     # originals, or they land at a fraction of their correct position.
     skeleton_call = source[source.index("draw_hand_skeleton("):][:200]
     assert "display_poses" in skeleton_call, "skeleton is not using display-scaled poses"
+
+
+def test_window_placement_solves_a_flipped_scaled_backend():
+    """Placing the window is not "set x and y".
+
+    On the Cocoa backend this project runs on, the coordinate moveWindow takes
+    and the one getWindowImageRect reports are related by y_reported = 32 -
+    2*y_requested - a flipped origin and a Retina factor. Feeding back the raw
+    error therefore doubles it: asking for 40 landed the window at -48, and
+    "correcting" to 128 landed it at -224, off the top of the screen. Two
+    probes and a solve get it right in one move.
+    """
+    solve = LocalClientRunner._solve_axis
+
+    def backend(req):                 # the mapping actually observed
+        return 32 - 2 * req
+
+    p1, p2 = 40, 140
+    want = solve(p1, backend(p1), p2, backend(p2), 40)
+    assert backend(want) == 40, "the solved request does not land on target"
+
+    # An identity backend must solve to the identity, not to something clever.
+    ident = solve(10, 10, 110, 110, 40)
+    assert ident == 40
+
+    # An axis that does not respond at all is left alone rather than guessed.
+    assert solve(10, 7, 110, 7, 40) is None
