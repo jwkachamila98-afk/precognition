@@ -194,3 +194,46 @@ def test_both_tracker_backends_share_one_anchoring_implementation():
 
     assert mp_tracker.anchor_hand is hand_anchoring.anchor_hand
     assert mediapipe_tasks_hand_tracker.anchor_hand is hand_anchoring.anchor_hand
+
+
+def test_the_anchored_hand_lives_in_the_same_camera_as_everything_else():
+    """One pinhole, or the hand and the object never share a geometry.
+
+    Every other metres-to-pixels step in this system uses fx = 0.8 * width
+    (BoundingBox3D.project_to_2d, the affordance hotspots, the trajectory
+    generator, the lab camera). This module used to assume a 60-degree
+    horizontal field of view instead, which is fx = 0.866 * width. Both numbers
+    are guesses about an uncalibrated webcam; the requirement is only that they
+    be the SAME guess.
+
+    They were not, and the cost was not cosmetic: the recovered depth came back
+    8% long - 45 mm of 3-D error at a normal reach - so a hand visually touching
+    an object still carried an offset. Episode reward, the co-adaptation wrist
+    bias and the lab's grasp-frame detection are all computed from exactly that
+    relationship, and the learned bias the demo exists to show is itself only a
+    couple of centimetres. The error was larger than the signal.
+    """
+    import cv2
+
+    from src.perception.hand_anchoring import anchor_hand
+
+    W, H = 640, 480
+    fx = 0.8 * W
+    rng = np.random.default_rng(3)
+
+    local = rng.normal(0, 0.030, (21, 3)).astype(np.float32)
+    local -= local.mean(axis=0)
+
+    # A known pose: off-centre and rotated, since an on-axis hand would hide a
+    # focal-length disagreement almost entirely.
+    R, _ = cv2.Rodrigues(np.array([0.3, -0.5, 0.2]))
+    t = np.array([0.10, -0.06, 0.55])
+    truth = local @ R.T + t
+    uv = np.stack([fx * truth[:, 0] / truth[:, 2] + W / 2,
+                   fx * truth[:, 1] / truth[:, 2] + H / 2], 1).astype(np.float32)
+
+    recovered = anchor_hand(local, uv, W, H)
+
+    assert np.abs(recovered - truth).max() < 1e-3, (
+        "the anchored hand does not land where it was observed - the tracker "
+        "and the projection convention disagree about the camera again")

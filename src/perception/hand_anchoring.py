@@ -24,9 +24,25 @@ MIN_DEPTH_M = 0.15
 MAX_DEPTH_M = 1.60
 NOMINAL_DEPTH_M = 0.50
 
-# Most laptop webcams sit near 60 degrees horizontally. An error here scales the
-# recovered depth proportionally but does not distort the hand's shape.
-DEFAULT_HFOV_DEG = 60.0
+# The pinhole the REST of this system assumes: fx = 0.8 * width, which is a
+# horizontal field of view of 2*atan(0.5/0.8) = 64.01 degrees. Everything that
+# turns metres into pixels uses it - BoundingBox3D.project_to_2d, the affordance
+# hotspots, the trajectory generator, the lab camera.
+#
+# This module used to assume 60 degrees instead, on the reasonable-sounding
+# grounds that most laptop webcams sit near there. The number is a guess either
+# way; what matters is that it is the SAME guess. It was not: the hand was
+# recovered in a 60-degree camera and the object placed in a 64-degree one, so
+# the two never shared a geometry. A hand visually touching an object still had
+# a 3-D offset - about 8% of its radial distance from the principal point, which
+# is 50 px on average and 122 px at the edge of a 640x480 frame, or one to two
+# centimetres of lateral error at a normal reach distance.
+#
+# That is not cosmetic. This module's own docstring lists what depends on it:
+# episode reward, the co-adaptation offset, and the lab's choice of when the
+# grasp happened. The learned wrist bias the demo is built to show is itself
+# only a couple of centimetres, so the mismatch was the same size as the signal.
+DEFAULT_HFOV_DEG = 64.01
 
 
 def focal_px(width: int, hfov_deg: float = DEFAULT_HFOV_DEG) -> float:
