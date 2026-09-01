@@ -35,6 +35,7 @@ from src.mocks.mock_policy import MockResidualPolicy
 from src.transport.protocol import (
     FrameMessage,
     InferenceResponse,
+    encode_depth_to_base64,
     encode_image_to_base64,
 )
 
@@ -544,6 +545,7 @@ class WSInferenceServer:
                     server_timestamp=time.time(),
                     hand_poses=[hp.to_dict() for hp in hand_poses],
                     depth_heatmap_base64=depth_b64,
+                    depth_raw_base64=encode_depth_to_base64(depth_map.depth),
                     parsed_scene=parsed_scene.to_dict(),
                     parsed_intent=parsed_intent.to_dict(),
                     affordance_map=affordance_dict,

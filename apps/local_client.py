@@ -57,7 +57,8 @@ from src.audio.notification_sounds import NotificationSounds
 from src.audio.speech_to_text import AudioTranscriberABC, GeminiTranscriber, MockTranscriber, WhisperTranscriber
 from src.audio.text_to_speech import MockSpeaker, SpeechSynthesizerABC
 from src.simulation.trajectory_generator import AffordanceMap, ForeseenTrajectory
-from src.simulation.lab_sim import LabSimulator
+from src.simulation.lab_sim import (
+    LabSimulator, _MIN_DEMONSTRATION_POSES as LAB_MIN_DEMONSTRATION_POSES)
 from src.simulation.render import object_library as OL
 from src.perception.gemini_mesh_author import GeminiMeshAuthor
 from src.policy.discrepancy import DiscrepancyEngine, DiscrepancyState, EpisodeDiscrepancyReport
@@ -1118,6 +1119,10 @@ class LocalClientRunner:
         # visible (not mid-grasp), so the ghost afterimage can look like the
         # actual object instead of an abstract colored shape.
         self._object_sprite: Optional[np.ndarray] = None
+        # A short-lived line on the status bar, for the moments the app has
+        # to decline something the user just asked for.
+        self._notice: Optional[str] = None
+        self._notice_until = 0.0
 
         # Simulated-lab reenactment for the Autonomous Demo. The plan is staged
         # and rendered in a 3-D lab (src/simulation/lab_sim.py) rather than drawn
@@ -1149,8 +1154,11 @@ class LocalClientRunner:
             "discrepancy_norm": 0.0, "buffer_steps": 0, "parsed_intent": None,
             "workflow_phase": ExecutionPhase.IDLE, "phase_progress": 0.0,
             "benchmark_summary": None, "policy_loss": 0.0, "policy_updates": 0,
-            "learned_wrist_bias": None,
+            "learned_wrist_bias": None, "depth_raw": None,
         }
+        # Metric depth for the scene reconstruction. The HUD's heatmap is a
+        # colourmapped picture and cannot be inverted back to metres.
+        self._latest_depth_m: Optional[np.ndarray] = None
         # The learning card's training heartbeat. The count is read from
         # whichever policy is really learning (local or the server's); the
         # pulse timestamp marks the instant it last incremented, so each RWR
@@ -1330,14 +1338,39 @@ class LocalClientRunner:
             self._control_cmd_to_send = "ADVANCE_PHASE"
         logger.info(f"Manually advanced workflow to: [{new_phase.value}]")
 
+    def _notify(self, text: str, seconds: float = 4.0) -> None:
+        """Say something to the user on the status bar, briefly."""
+        self._notice = text
+        self._notice_until = time.time() + float(seconds)
+        self.sounds.play("attention")
+
+    def _current_notice(self) -> Optional[str]:
+        if self._notice and time.time() < self._notice_until:
+            return self._notice
+        self._notice = None
+        return None
+
     def trigger_autonomous_demo(self) -> None:
-        """On-demand, hands-off simulated pick (the 'a' hotkey): replans fresh
-        from wherever the object currently is and runs it through the real
-        trained residual policy's correction, to showcase what co-adaptation
-        has learned so far. Requires an active intent - does nothing if the
-        user hasn't said what to pick up yet."""
+        """On-demand reenactment of the user's OWN recorded attempt (the 'a'
+        hotkey), staged in the lab and run through the trained residual policy.
+
+        It requires an active intent AND a real recording. It used to fall back
+        to a generated plan when there was no recording - silently, and while
+        still captioned as a reenactment, so a canned approach that was never
+        the user's was presented as a replay of them. Refusing and saying why is
+        the only honest option: the demo's whole claim is that it is showing
+        THEIR movement.
+        """
         if self.workflow._target_label in ("none", "", "idle", "clear"):
             logger.info("Autonomous Demo: no active intent - say what to pick up first.")
+            self._notify("Say what to pick up first — hold 'v'")
+            return
+        have = len(self._last_completed_recording)
+        if have < LAB_MIN_DEMONSTRATION_POSES:
+            logger.info(
+                f"Autonomous Demo: only {have} recorded frames "
+                f"(need {LAB_MIN_DEMONSTRATION_POSES}) - take a turn first.")
+            self._notify("Take a turn first — press 'c' and reach for it")
             return
         self.lab_sim.invalidate()
         self._lab_staged = False
@@ -1448,6 +1481,9 @@ class LocalClientRunner:
                 staged = self.lab_sim.prepare(foreseen_traj, target_bbox, self._object_sprite)
             if staged:
                 self._lab_staged = True
+                # Rebuild the room once per demo, from the depth of the frame
+                # the reenactment is being staged against.
+                self.lab_sim.set_scene_from_depth(self._latest_depth_m, frame)
                 # Back-date the local clock onto the SERVER's phase clock. Starting
                 # it at the moment of staging left the playback trailing the phase
                 # by however long detection and staging took, so the panel closed
@@ -1771,6 +1807,12 @@ class LocalClientRunner:
         colour = UIH.phase_colour(phase_value)
         title, body = self._status_message(workflow_phase, target_label, has_replay,
                                            progress=phase_progress, tracking=bool(poses))
+        notice = self._current_notice()
+        if notice:
+            # A declined request outranks the standing instruction: the user
+            # just pressed a key and needs to know why nothing happened.
+            title, body = "CAN'T DO THAT YET", notice
+            colour = UIH.C["orange"]
         progress = None if workflow_phase == ExecutionPhase.IDLE else phase_progress
 
         UIH.draw_telemetry_card(
@@ -1918,6 +1960,7 @@ class LocalClientRunner:
             "policy_loss": response.policy_loss,
             "policy_updates": response.policy_updates,
             "learned_wrist_bias": response.learned_wrist_bias,
+            "depth_raw": response.decode_depth_raw(),
         })
 
     def _audio_callback(self, indata: np.ndarray, frames: int, time_info: Any, status: Any) -> None:
@@ -2171,6 +2214,7 @@ class LocalClientRunner:
                         poses = self.active_tracker.estimate(frame)
                         depth_map = self.local_depth_estimator.estimate_depth(frame)
                         depth_heatmap = depth_map.to_colored_heatmap()
+                        self._latest_depth_m = depth_map.depth
                         
                         prompt_for_scene = self.current_parsed_intent.target_object if self.current_parsed_intent.is_active else self.intent
                         detector = getattr(self, "local_object_detector", None)
@@ -2329,6 +2373,8 @@ class LocalClientRunner:
                     affordance_map = snap["affordance_map"]
                     foreseen_traj = snap["foreseen_traj"]
                     depth_heatmap = snap["depth_heatmap"]
+                    if snap["depth_raw"] is not None:
+                        self._latest_depth_m = snap["depth_raw"]
                     gripper_cmd = snap["gripper_cmd"]
                     residuals = snap["residuals"]
                     reward_score = snap["reward_score"]

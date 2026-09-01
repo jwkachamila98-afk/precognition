@@ -994,9 +994,15 @@ def test_demonstration_plays_at_the_speed_it_was_performed():
     assert sim.step_for_progress(1.0) == pytest.approx(sim._num_steps - 1, abs=1.0)
 
 
-def test_a_long_recording_is_trimmed_around_the_grasp():
-    """A recording longer than the demo window keeps the part carrying the
-    grasp, at its own pace, rather than being squeezed in whole."""
+def test_a_long_recording_is_played_in_full():
+    """A recording longer than the demo window is compressed, never cut.
+
+    It used to be trimmed to a window around the grasp, on the grounds that
+    real speed matters more than completeness. That silently dropped the start
+    of the reach - the part the policy is learning the approach from - while
+    still being presented as a replay of the attempt. Whole recording now,
+    faster if it has to be.
+    """
     centre = np.array([0.02, 0.03, 0.50], np.float32)
     bbox = BoundingBox3D(label="coffee cup", center=centre,
                          size=np.array([0.09, 0.09, 0.09], dtype=np.float32))
@@ -1005,10 +1011,10 @@ def test_a_long_recording_is_trimmed_around_the_grasp():
     sim.demo_duration_sec = 12.0
     assert sim.prepare_from_demonstration(poses, bbox, None)
 
-    kept = sim._timestamps[-1] - sim._timestamps[0]
-    assert kept <= sim.demo_duration_sec + 0.5, f"kept {kept:.1f}s, window is 12s"
-    assert kept > 6.0, "trimmed far more than necessary"
-    assert 0 < sim._contact_step() < sim._num_steps - 1, "the grasp fell outside the window"
+    assert sim._num_steps == len(poses), "frames were dropped from the recording"
+    assert sim.step_for_progress(1.0) >= sim._num_steps - 1.5, (
+        "playback does not reach the end of the recording")
+    assert 0 < sim._contact_step() < sim._num_steps - 1
 
 
 def test_a_flat_class_is_never_lathed_from_an_authored_profile():
@@ -1035,9 +1041,9 @@ def test_real_epoch_timestamps_survive_the_replay_pipeline():
     """Recordings arrive stamped with wall-clock Unix time, not seconds since
     the take started. float32 has a 128-second ULP up at 1.79e9, so casting
     those stamps directly collapsed a 2050-frame recording to two distinct
-    values: the duration read as zero, the trim never fired, and real-speed
-    playback interpolated against a constant array. The fixtures used small
-    relative stamps, so every test passed while production was broken.
+    values: the duration read as zero and real-speed playback interpolated
+    against a constant array, so the replay never advanced. The fixtures used
+    small relative stamps, so every test passed while production was broken.
     """
     centre = np.array([0.02, 0.03, 0.50], np.float32)
     bbox = BoundingBox3D(label="coffee cup", center=centre,
@@ -1052,10 +1058,13 @@ def test_real_epoch_timestamps_survive_the_replay_pipeline():
     assert len(np.unique(stamps)) == len(stamps), "timestamps quantised into ties"
     assert np.all(np.diff(stamps) > 0.0), "playback clock is not strictly advancing"
 
-    # The 50 s take must have been trimmed, exactly as it is for relative stamps.
+    # The symptom the quantisation produced was a playback clock that never
+    # advanced, so what matters is that the 50 s take still plays through to
+    # its final frame - compressed into the window, with nothing dropped.
     kept = float(stamps[-1] - stamps[0])
-    assert kept <= sim.demo_duration_sec + 0.5, f"kept {kept:.1f}s of a 50s take"
-    assert sim._num_steps < len(poses), "the trim never fired"
+    assert kept > 45.0, f"a 50s take came back as {kept:.1f}s"
+    assert sim._num_steps == len(poses), "frames were dropped from the recording"
+    assert sim.step_for_progress(1.0) >= sim._num_steps - 1.5
     assert 0 < sim._contact_step() < sim._num_steps - 1
 
 

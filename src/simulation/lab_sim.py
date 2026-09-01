@@ -37,6 +37,7 @@ from src.simulation.render import object_mesh as OM
 from src.simulation.render import shading as SH
 from src.simulation.render.camera import Camera
 from src.simulation.render.raster import Material, Mesh, Rasterizer
+from src.simulation.render.scene_mesh import build_scene_mesh
 from src.simulation.trajectory_generator import ForeseenTrajectory
 
 logger = logging.getLogger(__name__)
@@ -75,10 +76,6 @@ _END_HOLD_SEC = 1.4
 # Fewest tracked frames that can carry a reach. Below roughly two seconds of
 # tracking there is no motion to show, only a pose.
 _MIN_DEMONSTRATION_POSES = 24
-
-# When a recording must be trimmed, how much of the window sits before contact.
-# Weighted after it: the reach is context, the carry is the point.
-_PRE_CONTACT_SHARE = 0.40
 
 # The lab camera is LOCKED: one pose, identical for every demo, regardless of
 # object or plan. Framing the shot adaptively made each reenactment look like a
@@ -254,6 +251,12 @@ class LabSimulator:
         self._static_depth: Optional[np.ndarray] = None
 
         self.camera: Optional[Camera] = None
+        # The real room, reconstructed from depth. When present the registered
+        # render is entirely geometry - no video plate anywhere in the shot -
+        # and, being static for the length of a demo, it is baked exactly like
+        # the studio was: (lit image, coverage, g-buffer snapshot, depth).
+        self.scene_mesh: Optional[Mesh] = None
+        self._scene_bake = None
         self.transform: Optional[LabTransform] = None
         self.trajectory: Optional[ForeseenTrajectory] = None
         self.object_mesh: Optional[Mesh] = None
@@ -369,24 +372,20 @@ class LabSimulator:
         stamps = np.asarray([p.timestamp for p in recorded_poses], dtype=np.float64)
         stamps = (stamps - stamps[0]).astype(np.float32)
         if len(stamps) > 1 and float(stamps[-1] - stamps[0]) > 0.0:
-            budget = max(self.demo_duration_sec - _END_HOLD_SEC, 1.0)
             duration = float(stamps[-1] - stamps[0])
+            budget = max(self.demo_duration_sec - _END_HOLD_SEC, 1.0)
             if duration > budget:
-                t_contact = float(stamps[contact])
-                lo_t = t_contact - budget * _PRE_CONTACT_SHARE
-                lo = int(np.searchsorted(stamps, lo_t, side="left"))
-                lo = int(np.clip(lo, 0, max(len(stamps) - 8, 0)))
-                hi = int(np.searchsorted(stamps, stamps[lo] + budget, side="right"))
-                hi = int(np.clip(hi, lo + 8, len(stamps)))
+                # The whole reach is replayed, compressed to fit. It used to be
+                # trimmed to a window around the grasp instead, on the grounds
+                # that real speed matters more than completeness - but a replay
+                # that silently drops the beginning of the movement is not a
+                # replay of the movement, and the missing start is exactly where
+                # the approach the policy is learning from happens.
                 logger.info(
-                    f"LabSimulator: recording runs {duration:.1f}s; replaying "
-                    f"{float(stamps[min(hi, len(stamps)-1)] - stamps[lo]):.1f}s around the "
-                    f"grasp at real speed rather than compressing all of it."
+                    f"LabSimulator: recording runs {duration:.1f}s against a "
+                    f"{budget:.1f}s window; replaying all of it at "
+                    f"{duration / budget:.1f}x speed rather than cutting it."
                 )
-                kpts = kpts[lo:hi]
-                object_path_cam = object_path_cam[lo:hi]
-                stamps = stamps[lo:hi]
-                contact = int(np.clip(contact - lo, 0, len(kpts) - 1))
 
         self._contact_override = contact
         return self._stage(
@@ -595,6 +594,40 @@ class LabSimulator:
     def is_ready(self) -> bool:
         return self._ready and self.camera is not None
 
+    def set_scene_from_depth(self, depth_m: Optional[np.ndarray],
+                             frame_bgr: Optional[np.ndarray],
+                             grid_w: int = 72) -> bool:
+        """Reconstruct the room from a depth map and bake it for this demo.
+
+        Called once when the demo is staged, not per frame: the camera does not
+        move and neither does the room, so re-deriving either would be paying
+        several thousand triangles a frame for an identical picture.
+        """
+        self.scene_mesh = None
+        self._scene_bake = None
+        if not self.registered or depth_m is None or frame_bgr is None:
+            return False
+        mesh = build_scene_mesh(depth_m, frame_bgr, grid_w=grid_w)
+        if mesh is None or self.camera is None:
+            return False
+
+        t0 = time.perf_counter()
+        self._rast.clear()
+        self._rast.draw(mesh, self.camera)
+        snapshot = self._rast.snapshot()
+        depth = self._rast.depth.copy()
+        lit = SH.tonemap(SH.shade(self._rast, self.camera, self._lights, self._env))
+        cover = (self._rast.gbuffer[:, :, 12] > 0.5)[:, :, None]
+
+        self.scene_mesh = mesh
+        self._scene_bake = (lit, cover, snapshot, depth)
+        logger.info(
+            f"LabSimulator: reconstructed the scene as {mesh.num_faces} triangles "
+            f"covering {100.0 * cover.mean():.0f}% of frame, baked in "
+            f"{(time.perf_counter() - t0) * 1000:.0f} ms."
+        )
+        return True
+
     def _registered_camera(self) -> Camera:
         """The webcam itself, as a lab camera.
 
@@ -762,10 +795,24 @@ class LabSimulator:
         n = max(self._num_steps, 1)
 
         if self._is_demonstration and self._timestamps is not None and n > 1:
-            # Real speed: wall-clock elapsed maps straight onto recorded time, so
-            # a slow reach looks slow. No easing - the recording already carries
-            # its own acceleration, and smoothing it again would be editing it.
-            elapsed = float(np.clip(progress, 0.0, 1.0)) * max(self.demo_duration_sec, 0.1)
+            # Real speed where it fits, compressed where it does not - but the
+            # whole recording plays either way. No easing: the recording carries
+            # its own acceleration and smoothing it again would be editing it.
+            #
+            # Mapping wall-clock straight onto recorded time is real speed, and
+            # that is right until the reach outlasts the window: then playback
+            # simply stopped wherever the phase ran out, silently dropping the
+            # end of the movement - including the grasp, if the approach was
+            # slow. A replay that omits the grasp is not showing the attempt.
+            span = max(self.demo_duration_sec, 0.5)
+            play_until = float(np.clip(1.0 - _END_HOLD_SEC / span, 0.5, 0.97))
+            recorded = float(self._timestamps[-1] - self._timestamps[0])
+            playable = span * play_until
+            if recorded <= playable:
+                elapsed = float(np.clip(progress, 0.0, 1.0)) * span
+            else:
+                play = float(np.clip(progress / play_until, 0.0, 1.0))
+                elapsed = play * recorded
             return float(np.clip(
                 np.interp(self._timestamps[0] + elapsed, self._timestamps, np.arange(n)),
                 0.0, n - 1))
@@ -940,10 +987,13 @@ class LabSimulator:
         """Draw the object and hand over the live frame, in the real camera.
 
         There is no static bake here and nothing to cache: the background is a
-        different image every frame. That costs nothing, because it also removes
-        the only geometry the bake existed to amortise - the bench and backdrop
-        are simply not in this shot. Only the object and the hand are rasterised,
-        and only their own pixels are shaded.
+        different image every frame.
+
+        With a `scene_mesh` set, the room is real geometry too and the frame is
+        only what shows through the holes the reconstruction could not fill -
+        where depth straddled a silhouette and the cell was dropped rather than
+        draped across the gap. Leaving the photograph visible there is a more
+        honest seam than inventing a surface over it.
         """
         img = background
         if img.shape[:2] != (self.height, self.width):
@@ -952,10 +1002,22 @@ class LabSimulator:
         img = np.ascontiguousarray(img.copy())
 
         obj = self._object_mesh_for(step)
-        self._rast.clear()
-        self._rast.draw(obj, self.camera)
+        if self._scene_bake is not None:
+            # The room is static geometry for the whole demo, so it is baked
+            # once and only the actors are redrawn - the same trick the studio
+            # used, and the reason this costs about what the studio did rather
+            # than rasterising several thousand background triangles per frame.
+            lit_bake, cover, snapshot, base_depth = self._scene_bake
+            np.copyto(img, lit_bake, where=cover)
+            self._rast.restore(snapshot)
+            self._rast.draw(obj, self.camera)
+            dirty = self._rast.depth != base_depth
+            idx = np.flatnonzero(dirty.ravel())
+        else:
+            self._rast.clear()
+            self._rast.draw(obj, self.camera)
+            idx = np.flatnonzero((self._rast.gbuffer[:, :, 12] > 0.5).ravel())
 
-        idx = np.flatnonzero((self._rast.gbuffer[:, :, 12] > 0.5).ravel())
         if len(idx) > 0:
             gb_rows = self._rast.gbuffer.reshape(-1, 13)[idx]
             lit = SH.shade_rows(gb_rows, self._rast.depth.reshape(-1)[idx],

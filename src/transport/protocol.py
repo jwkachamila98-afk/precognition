@@ -73,6 +73,10 @@ class InferenceResponse:
     server_timestamp: float
     hand_poses: List[dict] = field(default_factory=list)
     depth_heatmap_base64: Optional[str] = None
+    # Metric depth, in millimetres, as a 16-bit PNG. The heatmap beside it is a
+    # colourmapped picture for the HUD and cannot be inverted back to metres,
+    # so reconstructing the room as geometry needs the real numbers.
+    depth_raw_base64: Optional[str] = None
     parsed_scene: Optional[dict] = None
     parsed_intent: Optional[dict] = None
     affordance_map: Optional[dict] = None
@@ -111,6 +115,7 @@ class InferenceResponse:
             server_timestamp=float(data["server_timestamp"]),
             hand_poses=data.get("hand_poses", []),
             depth_heatmap_base64=data.get("depth_heatmap_base64"),
+            depth_raw_base64=data.get("depth_raw_base64"),
             parsed_scene=data.get("parsed_scene"),
             parsed_intent=data.get("parsed_intent"),
             affordance_map=data.get("affordance_map"),
@@ -181,12 +186,41 @@ class InferenceResponse:
             timestamp=float(self.safety_status.get("timestamp", time.time()))
         )
 
+    def decode_depth_raw(self) -> Optional[np.ndarray]:
+        """Metric depth in metres, or None if the server did not send any."""
+        if not self.depth_raw_base64:
+            return None
+        raw = np.frombuffer(base64.b64decode(self.depth_raw_base64), dtype=np.uint8)
+        mm = cv2.imdecode(raw, cv2.IMREAD_UNCHANGED)
+        if mm is None:
+            return None
+        return (mm.astype(np.float32) / 1000.0)
+
     def decode_depth_heatmap(self) -> Optional[np.ndarray]:
         if not self.depth_heatmap_base64:
             return None
         raw_bytes = base64.b64decode(self.depth_heatmap_base64)
         np_arr = np.frombuffer(raw_bytes, dtype=np.uint8)
         return cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+
+
+def encode_depth_to_base64(depth_m: np.ndarray, max_width: int = 160) -> Optional[str]:
+    """Metric depth -> base64 16-bit PNG in millimetres.
+
+    Downsampled first: the client rebuilds the scene on a lattice of well under
+    a hundred cells across, so sending full resolution would be spending
+    bandwidth on detail that is averaged away on arrival.
+    """
+    if depth_m is None or depth_m.size == 0:
+        return None
+    d = np.asarray(depth_m, dtype=np.float32)
+    h, w = d.shape[:2]
+    if w > max_width:
+        d = cv2.resize(d, (max_width, max(2, int(round(h * max_width / w)))),
+                       interpolation=cv2.INTER_NEAREST)
+    mm = np.clip(d * 1000.0, 0, 65535).astype(np.uint16)
+    ok, buf = cv2.imencode(".png", mm)
+    return base64.b64encode(buf.tobytes()).decode("utf-8") if ok else None
 
 
 def encode_image_to_base64(image: np.ndarray, quality: int = 80) -> str:

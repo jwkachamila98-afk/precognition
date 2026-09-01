@@ -132,3 +132,51 @@ def test_the_studio_mode_still_stages_the_old_way():
         sim.transform.origin_cam, np.zeros(3, dtype=np.float32)), (
         "the studio path is staging with the registered identity transform")
     assert sim.render(0.0, elapsed=0.0) is not None, "studio render needs no frame"
+
+
+def _timed_demonstration(bbox, n=120, fps=8.0):
+    """A reach whose wall-clock duration is set by its timestamps."""
+    poses = _demonstration(bbox, n)
+    return [HandPose(hand_id=p.hand_id, side=p.side, keypoints_3d=p.keypoints_3d,
+                     keypoints_2d=p.keypoints_2d, confidence=p.confidence,
+                     timestamp=i / fps)
+            for i, p in enumerate(poses)]
+
+
+@pytest.mark.parametrize("fps,label", [(8.0, "longer than the window"),
+                                       (40.0, "shorter than the window")])
+def test_the_whole_recording_plays(fps, label):
+    """The replay must reach the last recorded frame by the end of the demo.
+
+    Playback mapped wall-clock straight onto recorded time, which is real speed
+    - correct until the reach outlasts the demo window, at which point it simply
+    stopped wherever the phase ran out. A 15 s reach in a 12 s window lost its
+    last quarter, grasp included, while still being presented as a replay of the
+    attempt. Long recordings are now compressed to fit; short ones still play at
+    real speed.
+    """
+    bbox = _bbox()
+    sim = LabSimulator(width=W, height=H, registered=True)
+    sim.demo_duration_sec = 12.0
+    assert sim.prepare_from_demonstration(_timed_demonstration(bbox, fps=fps), bbox, None)
+
+    last = sim._num_steps - 1
+    assert sim.step_for_progress(1.0) >= last - 0.5, (
+        f"a recording {label} did not reach its final frame: "
+        f"stopped at {sim.step_for_progress(1.0):.1f} of {last}")
+    # And it is monotonic, so nothing plays backwards on the way there.
+    steps = [sim.step_for_progress(p) for p in np.linspace(0.0, 1.0, 40)]
+    assert all(b >= a - 1e-6 for a, b in zip(steps, steps[1:]))
+
+
+def test_a_short_recording_still_plays_at_real_speed():
+    """Compression is for recordings that do not fit. A three-second reach must
+    not be stretched across a twelve-second window."""
+    bbox = _bbox()
+    sim = LabSimulator(width=W, height=H, registered=True)
+    sim.demo_duration_sec = 12.0
+    assert sim.prepare_from_demonstration(
+        _timed_demonstration(bbox, n=90, fps=30.0), bbox, None)   # 3.0 s
+    # A third of the way through a 12 s phase is 4 s of wall clock, by which
+    # point a 3 s recording is finished.
+    assert sim.step_for_progress(1.0 / 3.0) >= sim._num_steps - 1.5
