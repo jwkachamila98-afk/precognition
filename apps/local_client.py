@@ -55,7 +55,7 @@ from src.perception.mediapipe_tracker import MediaPipeHandTracker, MEDIAPIPE_AVA
 from src.perception.intent_parser import IntentParserABC, MockLLMIntentParser, ParsedIntent
 from src.audio.notification_sounds import NotificationSounds
 from src.audio.speech_to_text import AudioTranscriberABC, GeminiTranscriber, MockTranscriber, WhisperTranscriber
-from src.audio.text_to_speech import GeminiSpeaker, SpeechSynthesizerABC, SystemSpeaker
+from src.audio.text_to_speech import MockSpeaker, SpeechSynthesizerABC
 from src.simulation.trajectory_generator import AffordanceMap, ForeseenTrajectory
 from src.simulation.lab_sim import LabSimulator
 from src.simulation.render import object_library as OL
@@ -987,17 +987,20 @@ class LocalClientRunner:
             self.transcriber: AudioTranscriberABC = MockTranscriber()
 
         self.intent_parser: IntentParserABC = MockLLMIntentParser()
-        if gemini_api_key:
-            self.speaker: SpeechSynthesizerABC = GeminiSpeaker(api_key=gemini_api_key)
-            logger.info("LocalClient: Using GeminiSpeaker for voice guidance output.")
-        else:
-            self.speaker: SpeechSynthesizerABC = SystemSpeaker()
+        # Kept only so callers with a handle on it (and the shutdown path) still
+        # work; nothing in the workflow speaks any more. See below.
+        self.speaker: SpeechSynthesizerABC = MockSpeaker()
         self.workflow = WorkflowController(
             foresee_steps=60, wait_user_timeout=2.0, auto_advance=True,
-            # In remote mode the server owns the authoritative phase; the client announces
-            # phase changes itself from the server's snapshot (see _network_step), so the
-            # local WorkflowController must stay silent to avoid double/conflicting speech.
-            speaker=(self.speaker if self.mode != "mock_remote" else None),
+            # NOTHING speaks, in either mode. Spoken guidance was removed for
+            # reasons that apply to every backend, not just Gemini's: it
+            # arrived a second or two after the moment it described and talked
+            # over someone concentrating on a reach. Local mode had kept a
+            # macOS `say` speaker, so the two modes disagreed - a live local
+            # session narrated itself out loud ("Go. Reach for the remote
+            # control now.") while a remote one played a tone. Phase changes
+            # are announced by NotificationSounds in both, below.
+            speaker=None,
             voice_guidance_enabled=True
         )
         self.robot = MockRobotHardware(dof=7)
@@ -2311,21 +2314,23 @@ class LocalClientRunner:
                     if snap["benchmark_summary"]:
                         benchmark_summary = snap["benchmark_summary"]
 
-                    # A short tone on each phase change, rather than a spoken
-                    # sentence. Speech arrived a second or two after the moment
-                    # it described, talked over someone concentrating on a
-                    # reach, and consumed Gemini quota that transcription and
-                    # detection need more. A tone says "something changed"
-                    # without asking to be listened to.
-                    if workflow_phase != self._last_announced_phase:
-                        previous = self._last_announced_phase
-                        self._last_announced_phase = workflow_phase
-                        self._sound_phase_change(workflow_phase, previous)
-
                     if not self._network_got_first_response:
                         T.draw(frame, f"Connecting to {self.server_url or self.config.network.server_host}…",
                                (30, frame.shape[0] // 2), 15, UIH.C["orange"],
                                weight="medium")
+
+                # A short tone on each phase change, rather than a spoken
+                # sentence. Speech arrived a second or two after the moment it
+                # described, talked over someone concentrating on a reach, and
+                # consumed Gemini quota that transcription and detection need
+                # more. A tone says "something changed" without asking to be
+                # listened to. This applies to BOTH modes: it used to sit
+                # inside the remote branch, so a local session got macOS `say`
+                # narrating the workflow instead.
+                if workflow_phase != self._last_announced_phase:
+                    previous = self._last_announced_phase
+                    self._last_announced_phase = workflow_phase
+                    self._sound_phase_change(workflow_phase, previous)
 
                 # Client-side afterimage recording: capture the user's OWN real hand
                 # poses (already tracked locally every frame in both modes) while they
