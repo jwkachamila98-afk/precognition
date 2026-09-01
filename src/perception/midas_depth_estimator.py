@@ -1,4 +1,4 @@
-"""Real monocular metric-ish depth estimation using Intel ISL's MiDaS (small variant).
+"""Real monocular metric-ish depth estimation using Intel ISL's MiDaS.
 
 MiDaS predicts relative inverse depth (disparity) from a single RGB frame using an
 actual trained neural network, rather than a synthetic procedural depth field. Absolute
@@ -23,6 +23,7 @@ the learned wrist bias included.
 
 import logging
 import time
+from typing import Optional
 
 import numpy as np
 
@@ -32,7 +33,7 @@ logger = logging.getLogger(__name__)
 
 
 class MiDaSDepthEstimator(DepthEstimatorABC):
-    """Real single-image depth estimator (MiDaS_small) running on GPU when available."""
+    """Real single-image depth estimator, best available MiDaS variant, GPU when possible."""
 
     # How fast the carried disparity range follows the current frame. Slow
     # enough that a hand crossing the foreground does not rescale the room,
@@ -42,7 +43,23 @@ class MiDaSDepthEstimator(DepthEstimatorABC):
     # fraction of its own value.
     _MAX_RANGE_STEP = 0.05
 
-    def __init__(self, min_depth: float = 0.15, max_depth: float = 1.8) -> None:
+    # Best first. MiDaS_small is midas_v21_small_256 - a 2021 mobile-grade
+    # network taking a 256 px input - and it was the only thing ever loaded
+    # here, on a machine with a 4090 idling at 2% while it ran. Its output is
+    # smooth enough that a desk reconstructs as a relief rather than a plane,
+    # which no amount of correct disparity handling downstream can undo.
+    #
+    # DPT_Large is a few hundred milliseconds on CPU and tens of milliseconds
+    # on this GPU, so on the pod it is close to free; the smaller variants are
+    # here for a laptop, which is also the only place the cost would show.
+    _MODELS = (
+        ("DPT_Large", "dpt_transform"),
+        ("DPT_Hybrid", "dpt_transform"),
+        ("MiDaS_small", "small_transform"),
+    )
+
+    def __init__(self, min_depth: float = 0.15, max_depth: float = 1.8,
+                 model_name: Optional[str] = None) -> None:
         import cv2
         import torch
 
@@ -55,11 +72,24 @@ class MiDaSDepthEstimator(DepthEstimatorABC):
         self._cv2 = cv2
         self._torch = torch
 
-        self.model = torch.hub.load("intel-isl/MiDaS", "MiDaS_small")
-        self.model.to(self.device).eval()
         transforms = torch.hub.load("intel-isl/MiDaS", "transforms")
-        self.transform = transforms.small_transform
-        logger.info(f"MiDaSDepthEstimator: loaded MiDaS_small on device={self.device}")
+        candidates = ([(model_name, "dpt_transform")] if model_name
+                      else list(self._MODELS))
+        last_error: Optional[Exception] = None
+        for name, transform_attr in candidates:
+            try:
+                self.model = torch.hub.load("intel-isl/MiDaS", name)
+                self.model.to(self.device).eval()
+                self.transform = getattr(transforms, transform_attr)
+                self.model_name = name
+                logger.info(f"MiDaSDepthEstimator: loaded {name} on "
+                            f"device={self.device}")
+                return
+            except Exception as exc:                # a weight download can fail
+                last_error = exc
+                logger.warning(f"MiDaSDepthEstimator: could not load {name} "
+                               f"({exc}); trying the next one.")
+        raise RuntimeError(f"no MiDaS model could be loaded: {last_error}")
 
     def estimate_depth(self, image: np.ndarray) -> DepthMap:
         torch = self._torch
